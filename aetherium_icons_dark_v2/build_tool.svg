@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="256" height="256">
+  <defs>
+    <linearGradient id="aetherGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00E5FF" />
+      <stop offset="100%" stop-color="#B388FF" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+  
+  <!-- Outer Ethereal Diamond with Dark Background Fill -->
+  <path d="M50 6 L94 50 L50 94 L6 50 Z" fill="#0A0A10" stroke="url(#aetherGrad)" stroke-width="8" stroke-linejoin="round"/>
+  
+  <!-- Inner Framework -->
+  <path d="M50 22 L78 50 L50 78 L22 50 Z" fill="#14141E" stroke="#B388FF" stroke-width="2" stroke-linejoin="round" opacity="0.6"/>
+  
+  <!-- Icon Core -->
+  <g filter="url(#glow)">
+    
+    <!-- Hammer -->
+    <path d="M64 64 L46 46" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+    <path d="M38 38 L48 48" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round"/>
+    <!-- Wrench -->
+    <path d="M36 64 L54 46" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+    <path d="M52 40 A 8 8 0 1 1 60 48" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"/>
+    
+  </g>
+</svg>

@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Packaged artifacts
+/aetherium.app/
+/dist/
+
+# macOS
+.DS_Store
+*.textClipping
+
+# Editors
+.idea/
+.vscode/
