@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use parking_lot::Mutex;
@@ -48,8 +48,15 @@ pub enum Event {
     /// A file transfer (upload or download) has begun.
     TransferStarted { label: String },
     /// Progress of the active transfer; `total_bytes` is 0 when unknown
-    /// (e.g. downloading a directory).
-    TransferProgress { label: String, done_bytes: u64, total_bytes: u64 },
+    /// (e.g. downloading a directory). `bytes_per_second` and `eta_seconds`
+    /// are smoothed estimates; `eta_seconds` is 0 when unknown.
+    TransferProgress {
+        label: String,
+        done_bytes: u64,
+        total_bytes: u64,
+        bytes_per_second: f64,
+        eta_seconds: u64,
+    },
     /// The transfer finished successfully; the label names the result
     /// (target directory for uploads, saved path for downloads).
     TransferDone { label: String },
@@ -147,8 +154,13 @@ impl SessionHandle {
     }
 }
 
-/// russh client handler. v1 accepts any host key (with a logged warning).
-struct ClientHandler;
+/// russh client handler. Verifies the server's host key against
+/// `~/.ssh/known_hosts`; unknown or mismatched keys are rejected rather than
+/// silently accepted, closing the "accept anything" hole from v1.
+struct ClientHandler {
+    host: String,
+    port: u16,
+}
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
@@ -157,11 +169,35 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        eprintln!(
-            "aetherium: accepting host key without verification (v1): {:?}",
-            server_public_key
-        );
-        Ok(true)
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            eprintln!(
+                "aetherium: rejecting certificate-based host key for {}:{} (unsupported)",
+                self.host, self.port
+            );
+            return Ok(false);
+        };
+        match russh::keys::check_known_hosts(&self.host, self.port, key) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                // Trust-on-first-use: no entry exists yet for this host, so
+                // learn it now. A *changed* key (KeyChanged below) is still
+                // rejected, which is what protects against MITM.
+                if let Err(err) = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, key) {
+                    eprintln!(
+                        "aetherium: could not record host key for {}:{}: {err}",
+                        self.host, self.port
+                    );
+                }
+                Ok(true)
+            }
+            Err(err) => {
+                eprintln!(
+                    "aetherium: host key verification failed for {}:{}: {err}",
+                    self.host, self.port
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -207,7 +243,10 @@ async fn session_loop(
     let mut handle = client::connect(
         config,
         (profile.host.as_str(), profile.port),
-        ClientHandler,
+        ClientHandler {
+            host: profile.host.clone(),
+            port: profile.port,
+        },
     )
     .await
     .with_context(|| format!("connecting to {}:{}", profile.host, profile.port))?;
@@ -427,21 +466,83 @@ const TRANSFER_CHUNK: usize = 64 * 1024;
 
 /// Accumulates bytes moved and reports `TransferProgress` events. Sharing one
 /// accumulator across a whole (possibly recursive) transfer gives smooth
-/// overall progress.
+/// overall progress. Speed and ETA are estimated from a simple moving average
+/// over the last few seconds.
 struct TransferProgress<'a> {
     event_tx: &'a std_mpsc::Sender<Event>,
     label: &'a str,
     done: u64,
     total: u64,
+    started: Instant,
+    /// (timestamp, cumulative done) samples for the last ~3 seconds.
+    samples: Vec<(Instant, u64)>,
 }
 
 impl TransferProgress<'_> {
+    fn new<'a>(event_tx: &'a std_mpsc::Sender<Event>, label: &'a str, total: u64) -> TransferProgress<'a> {
+        let started = Instant::now();
+        TransferProgress {
+            event_tx,
+            label,
+            done: 0,
+            total,
+            started,
+            samples: vec![(started, 0)],
+        }
+    }
+
+    fn speed(&self) -> f64 {
+        let now = Instant::now();
+        // Keep samples from the last 3 seconds.
+        let window_start = now - Duration::from_secs(3);
+        let recent: Vec<_> = self
+            .samples
+            .iter()
+            .copied()
+            .filter(|(t, _)| *t >= window_start)
+            .collect();
+        if recent.len() < 2 {
+            // Fall back to the overall average.
+            let elapsed = now.duration_since(self.started).as_secs_f64();
+            if elapsed > 0.0 {
+                self.done as f64 / elapsed
+            } else {
+                0.0
+            }
+        } else {
+            let (t0, b0) = recent.first().copied().unwrap();
+            let (t1, b1) = recent.last().copied().unwrap();
+            let dt = t1.duration_since(t0).as_secs_f64();
+            if dt > 0.0 {
+                (b1 - b0) as f64 / dt
+            } else {
+                0.0
+            }
+        }
+    }
+
+    fn eta_seconds(&self) -> u64 {
+        if self.total == 0 || self.done >= self.total {
+            return 0;
+        }
+        let speed = self.speed();
+        if speed <= 0.0 {
+            return 0;
+        }
+        let remaining = (self.total - self.done) as f64 / speed;
+        remaining.ceil() as u64
+    }
+
     fn add(&mut self, bytes: u64) {
         self.done += bytes;
+        let now = Instant::now();
+        self.samples.push((now, self.done));
         let _ = self.event_tx.send(Event::TransferProgress {
             label: self.label.to_string(),
             done_bytes: self.done,
             total_bytes: self.total,
+            bytes_per_second: self.speed(),
+            eta_seconds: self.eta_seconds(),
         });
     }
 }
@@ -485,7 +586,7 @@ async fn upload(
     let label = format!("upload {} → {}", local.display(), remote_dir.display());
     let total = local_tree_size(local);
     let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
-    let mut progress = TransferProgress { event_tx, label: &label, done: 0, total };
+    let mut progress = TransferProgress::new(event_tx, &label, total);
     match upload_path(sftp, local, remote_dir, &mut progress).await {
         Ok(()) => {
             let _ = event_tx.send(Event::TransferDone { label });
@@ -594,7 +695,7 @@ async fn download(
         }
     };
     let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
-    let mut progress = TransferProgress { event_tx, label: &label, done: 0, total };
+    let mut progress = TransferProgress::new(event_tx, &label, total);
     match download_path(sftp, remote, &downloads, &mut progress).await {
         Ok(saved) => {
             let _ = event_tx.send(Event::TransferDone {
@@ -709,7 +810,18 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
             .await
             .context("password authentication")?,
         AuthMethod::KeyFile { path, passphrase } => {
-            let path = expand_tilde(path);
+            // An empty path means "use whatever default key exists"; this
+            // mirrors OpenSSH's own fallback behavior.
+            let path = if path.as_os_str().is_empty() {
+                detect_default_ssh_key().ok_or_else(|| {
+                    anyhow!(
+                        "no private key path was set and no default SSH key was found \
+                         (looked for ~/.ssh/id_ed25519, id_rsa, id_ecdsa)"
+                    )
+                })?
+            } else {
+                expand_tilde(path)
+            };
             let key = russh::keys::load_secret_key(&path, passphrase.as_deref())
                 .with_context(|| format!("loading key {}", path.display()))?;
             let hash = handle.best_supported_rsa_hash().await?.flatten();
@@ -762,6 +874,23 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Detect a default SSH private key in the user's `.ssh` directory.
+/// On Windows this checks `%USERPROFILE%\.ssh\`; on Unix, `~/.ssh/`.
+/// Prefers ed25519, then rsa, then ecdsa, matching common OpenSSH defaults.
+fn detect_default_ssh_key() -> Option<PathBuf> {
+    let ssh_dir = dirs::home_dir()?.join(".ssh");
+    if !ssh_dir.is_dir() {
+        return None;
+    }
+    for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
+        let path = ssh_dir.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(unix)]

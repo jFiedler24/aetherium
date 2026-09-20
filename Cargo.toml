@@ -17,6 +17,9 @@ dirs = "7"
 anyhow = "1"
 regex = "1"
 parking_lot = "0.12"
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [profile.dev]
 opt-level = 1

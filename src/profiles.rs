@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::{decrypt, encrypt, get_or_create_encryption_key_at};
+
 /// How to authenticate to the SSH server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -52,26 +54,99 @@ impl Profile {
     }
 }
 
+/// On-disk representation of an authentication method. Secrets are stored
+/// encrypted so `profiles.toml` never contains plaintext passwords or
+/// passphrases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StoredAuthMethod {
+    Password { encrypted_password: String },
+    KeyFile {
+        path: PathBuf,
+        encrypted_passphrase: Option<String>,
+    },
+    Agent,
+}
+
+/// On-disk representation of a profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredProfile {
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    auth: StoredAuthMethod,
+}
+
+fn profile_to_stored(profile: &Profile, config_dir: &std::path::Path) -> Result<StoredProfile> {
+    let key = get_or_create_encryption_key_at(config_dir)?;
+    let auth = match &profile.auth {
+        AuthMethod::Password { password } => StoredAuthMethod::Password {
+            encrypted_password: encrypt(password, &key)?,
+        },
+        AuthMethod::KeyFile { path, passphrase } => StoredAuthMethod::KeyFile {
+            path: path.clone(),
+            encrypted_passphrase: passphrase
+                .as_ref()
+                .map(|p| encrypt(p, &key))
+                .transpose()?,
+        },
+        AuthMethod::Agent => StoredAuthMethod::Agent,
+    };
+    Ok(StoredProfile {
+        name: profile.name.clone(),
+        host: profile.host.clone(),
+        port: profile.port,
+        username: profile.username.clone(),
+        auth,
+    })
+}
+
+fn stored_to_profile(stored: &StoredProfile, config_dir: &std::path::Path) -> Result<Profile> {
+    let key = get_or_create_encryption_key_at(config_dir)?;
+    let auth = match &stored.auth {
+        StoredAuthMethod::Password { encrypted_password } => AuthMethod::Password {
+            password: decrypt(encrypted_password, &key)?,
+        },
+        StoredAuthMethod::KeyFile {
+            path,
+            encrypted_passphrase,
+        } => AuthMethod::KeyFile {
+            path: path.clone(),
+            passphrase: encrypted_passphrase
+                .as_ref()
+                .map(|p| decrypt(p, &key))
+                .transpose()?,
+        },
+        StoredAuthMethod::Agent => AuthMethod::Agent,
+    };
+    Ok(Profile {
+        name: stored.name.clone(),
+        host: stored.host.clone(),
+        port: stored.port,
+        username: stored.username.clone(),
+        auth,
+    })
+}
+
 /// On-disk representation of the profile file.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ProfileFile {
     #[serde(default)]
-    profiles: Vec<Profile>,
+    profiles: Vec<StoredProfile>,
 }
 
-/// The collection of profiles plus the path they persist to.
+/// The collection of profiles plus the paths they persist to.
 pub struct ProfileStore {
     pub profiles: Vec<Profile>,
     path: PathBuf,
+    config_dir: PathBuf,
 }
 
 impl ProfileStore {
     /// Default location: `~/.config/aetherium/profiles.toml`.
     pub fn default_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("aetherium")
-            .join("profiles.toml")
+        crate::crypto::config_dir().join("profiles.toml")
     }
 
     /// Load from the default location, creating an empty store (and parent
@@ -80,11 +155,36 @@ impl ProfileStore {
         Self::load_from(Self::default_path())
     }
 
-    /// Load from an explicit path. Missing files yield an empty store.
+    /// Load from an explicit path. Missing files yield an empty store;
+    /// corrupt files are backed up and ignored.
     pub fn load_from(path: PathBuf) -> Self {
+        let config_dir = path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::crypto::config_dir);
+        Self::load_from_with_config_dir(path, config_dir)
+    }
+
+    /// Load from explicit profile and config paths. The config directory is
+    /// used for the encryption key; this is mainly useful for tests.
+    pub fn load_from_with_config_dir(path: PathBuf, config_dir: PathBuf) -> Self {
         let profiles = match fs::read_to_string(&path) {
             Ok(text) => toml::from_str::<ProfileFile>(&text)
-                .map(|file| file.profiles)
+                .map(|file| {
+                    file.profiles
+                        .iter()
+                        .filter_map(|stored| match stored_to_profile(stored, &config_dir) {
+                            Ok(profile) => Some(profile),
+                            Err(err) => {
+                                eprintln!(
+                                    "aetherium: failed to decrypt profile '{}': {err:#}",
+                                    stored.name
+                                );
+                                None
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_else(|err| {
                     // Keep the corrupt file around for manual recovery.
                     let backup = PathBuf::from(format!("{}.bak", path.display()));
@@ -103,18 +203,27 @@ impl ProfileStore {
                 }),
             Err(_) => Vec::new(),
         };
-        Self { profiles, path }
+        Self {
+            profiles,
+            path,
+            config_dir,
+        }
     }
 
-    /// Persist the profiles to disk (pretty TOML).
+    /// Persist the profiles to disk (pretty TOML). Secrets are encrypted
+    /// before writing.
     pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let file = ProfileFile {
-            profiles: self.profiles.clone(),
-        };
+        let stored: Vec<StoredProfile> = self
+            .profiles
+            .iter()
+            .map(|p| profile_to_stored(p, &self.config_dir))
+            .collect::<Result<Vec<_>>>()
+            .context("encrypting profile secrets")?;
+        let file = ProfileFile { profiles: stored };
         let text = toml::to_string_pretty(&file).context("serializing profiles")?;
         write_private(&self.path, text.as_bytes())
             .with_context(|| format!("writing {}", self.path.display()))?;

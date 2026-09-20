@@ -146,8 +146,8 @@ struct SessionTab {
     connecting_profile: Option<Profile>,
     /// Currently selected tree path; the Download action acts on it.
     tree_selection: Option<PathBuf>,
-    /// Active file transfer: (label, done bytes, total bytes).
-    transfer: Option<(String, u64, u64)>,
+    /// Active file transfer: (label, done bytes, total bytes, bytes/sec, eta seconds).
+    transfer: Option<(String, u64, u64, f64, u64)>,
     /// Remote directories that pending uploads write into; refreshed every
     /// time a transfer completes.
     pending_upload_dirs: Vec<PathBuf>,
@@ -378,10 +378,10 @@ impl RootView {
                 }
             }
             SessionEvent::TransferStarted { label } => {
-                self.tabs[index].transfer = Some((label, 0, 0));
+                self.tabs[index].transfer = Some((label, 0, 0, 0.0, 0));
             }
-            SessionEvent::TransferProgress { label, done_bytes, total_bytes } => {
-                self.tabs[index].transfer = Some((label, done_bytes, total_bytes));
+            SessionEvent::TransferProgress { label, done_bytes, total_bytes, bytes_per_second, eta_seconds } => {
+                self.tabs[index].transfer = Some((label, done_bytes, total_bytes, bytes_per_second, eta_seconds));
             }
             SessionEvent::TransferDone { label } => {
                 let tab = &mut self.tabs[index];
@@ -2100,12 +2100,22 @@ impl RootView {
         };
         // Active transfer progress, shown between the state and the status
         // message.
-        let transfer_text = transfer.as_ref().map(|(label, done, total)| {
+        let transfer_text = transfer.as_ref().map(|(label, done, total, bps, eta)| {
+            let mut parts = Vec::new();
+            parts.push(label.clone());
             if *total > 0 {
-                format!("{label} — {}/{}", format_size(*done), format_size(*total))
+                let pct = (*done as f64 / *total as f64 * 100.0).min(100.0) as u64;
+                parts.push(format!("{}/{} ({}%)", format_size(*done), format_size(*total), pct));
             } else {
-                format!("{label} — {}", format_size(*done))
+                parts.push(format_size(*done));
             }
+            if *bps > 0.0 {
+                parts.push(format!("{}/s", format_size(*bps as u64)));
+            }
+            if *eta > 0 {
+                parts.push(format!("ETA {}", format_duration(*eta)));
+            }
+            parts.join(" — ")
         });
         div()
             .h(px(STATUSBAR_HEIGHT))
@@ -2152,6 +2162,17 @@ fn format_size(size: u64) -> String {
         format!("{}B", size)
     } else {
         format!("{:.1}{}", value, UNITS[unit])
+    }
+}
+
+/// Human-friendly duration in seconds (e.g. `2m 15s`).
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 

@@ -5,6 +5,7 @@
 //! [`assets::EmbeddedAssets`].
 
 mod assets;
+mod crypto;
 mod log_highlight;
 mod profiles;
 mod recents;
