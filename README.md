@@ -1,6 +1,6 @@
 # aetherium
 
-A MobaXterm-style SSH/SFTP client built with **gpui** — the GPU-accelerated UI
+A SSH/SFTP client built with **gpui** — the GPU-accelerated UI
 framework extracted from the [Zed editor](https://zed.dev). Same rendering stack,
 same snappy text layout, same dark aesthetic.
 
