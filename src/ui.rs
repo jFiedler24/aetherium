@@ -94,6 +94,16 @@ fn find_node<'a>(nodes: &'a mut [TreeNode], path: &std::path::Path) -> Option<&'
     at_mut(nodes, &indices)
 }
 
+/// Whether `profile` is missing credentials needed to connect: an empty
+/// username, or (for password auth) an empty password. Key-file and agent
+/// auth don't need a stored password, so they're never flagged here.
+fn needs_login_prompt(profile: &Profile) -> bool {
+    if profile.username.trim().is_empty() {
+        return true;
+    }
+    matches!(&profile.auth, AuthMethod::Password { password } if password.is_empty())
+}
+
 /// Geometry shared between the terminal canvas (which knows its bounds and
 /// cell metrics) and the poll task (which applies resizes).
 #[derive(Clone, Copy)]
@@ -451,18 +461,30 @@ impl RootView {
 
     // --- actions -----------------------------------------------------------
 
-    fn connect_selected(&mut self, cx: &mut Context<Self>) {
+    fn connect_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.selected.and_then(|i| self.store.profiles.get(i)).cloned()
         else {
             self.status = "select a profile first".into();
             cx.notify();
             return;
         };
-        self.connect_profile(profile, cx);
+        self.connect_profile(profile, window, cx);
     }
 
-    /// Open a new shell tab and connect it to `profile`.
-    fn connect_profile(&mut self, profile: Profile, cx: &mut Context<Self>) {
+    /// Open a new shell tab and connect it to `profile`; if the username or
+    /// (for password auth) the password is missing, open the profile form
+    /// instead so the user can fill in credentials before connecting.
+    fn connect_profile(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
+        if needs_login_prompt(&profile) {
+            let editing = self.store.profiles.iter().position(|p| {
+                p.host == profile.host && p.port == profile.port && p.username == profile.username
+            });
+            self.status = format!("enter credentials for {}", profile.summary());
+            self.form = Some(ProfileForm::from_profile(editing, &profile, cx));
+            self.focus_first_form_field(window, cx);
+            cx.notify();
+            return;
+        }
         let terminal = TerminalModel::new(80, 24);
         let session = SessionHandle::spawn(terminal.clone());
         let id = self.alloc_tab_id();
@@ -630,7 +652,7 @@ impl RootView {
             })
             .cloned()
         {
-            self.connect_profile(profile, cx);
+            self.connect_profile(profile, window, cx);
         } else {
             self.form = Some(ProfileForm::from_fields(
                 cx,
@@ -736,7 +758,7 @@ impl RootView {
             return;
         };
         if let Some(profile) = self.store.profiles.get(index).cloned() {
-            self.form = Some(ProfileForm::from_profile(index, &profile, cx));
+            self.form = Some(ProfileForm::from_profile(Some(index), &profile, cx));
             self.focus_first_form_field(window, cx);
             cx.notify();
         }
@@ -930,7 +952,7 @@ impl ProfileForm {
         Self::from_fields(cx, None, AuthKind::Password, "", "", "22", "", "", "", "")
     }
 
-    fn from_profile(index: usize, profile: &Profile, cx: &mut Context<RootView>) -> Self {
+    fn from_profile(index: Option<usize>, profile: &Profile, cx: &mut Context<RootView>) -> Self {
         let (auth_kind, password, key_path, passphrase) = match &profile.auth {
             AuthMethod::Password { password } => {
                 (AuthKind::Password, password.clone(), String::new(), String::new())
@@ -945,7 +967,7 @@ impl ProfileForm {
         };
         Self::from_fields(
             cx,
-            Some(index),
+            index,
             auth_kind,
             &profile.name,
             &profile.host,
@@ -1708,8 +1730,8 @@ impl RootView {
                     "connect",
                     "Connect",
                     cx,
-                    |this, _window, cx| {
-                        this.connect_selected(cx);
+                    |this, window, cx| {
+                        this.connect_selected(window, cx);
                     },
                 )),
             )

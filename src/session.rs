@@ -805,10 +805,17 @@ fn unique_download_path(dir: &std::path::Path, name: &str) -> PathBuf {
 /// server reports full success.
 async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> Result<()> {
     let result = match &profile.auth {
-        AuthMethod::Password { password } => handle
-            .authenticate_password(profile.username.clone(), password.clone())
-            .await
-            .context("password authentication")?,
+        AuthMethod::Password { password } => {
+            // Prefer silent key-based auth (agent, then a default key file);
+            // only send the password if the server still needs it.
+            match try_silent_auth(handle, &profile.username).await {
+                Some(result) => result,
+                None => handle
+                    .authenticate_password(profile.username.clone(), password.clone())
+                    .await
+                    .context("password authentication")?,
+            }
+        }
         AuthMethod::KeyFile { path, passphrase } => {
             // An empty path means "use whatever default key exists"; this
             // mirrors OpenSSH's own fallback behavior.
@@ -891,6 +898,29 @@ fn detect_default_ssh_key() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Best-effort attempts at ssh-agent and default-key auth for a
+/// password-configured profile. Failures here are not fatal — they just mean
+/// the caller should fall back to the stored password — so only a definite
+/// `AuthResult::Success` is reported back.
+async fn try_silent_auth(handle: &mut Handle<ClientHandler>, username: &str) -> Option<AuthResult> {
+    #[cfg(unix)]
+    if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        if let Ok(result @ AuthResult::Success) = authenticate_with_agent(handle, username).await {
+            return Some(result);
+        }
+    }
+    let key_path = detect_default_ssh_key()?;
+    let key = russh::keys::load_secret_key(&key_path, None).ok()?;
+    let hash = handle.best_supported_rsa_hash().await.ok()?.flatten();
+    match handle
+        .authenticate_publickey(username.to_owned(), PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+        .await
+    {
+        Ok(result @ AuthResult::Success) => Some(result),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]

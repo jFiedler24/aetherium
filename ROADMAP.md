@@ -59,11 +59,27 @@ tracks a rolling 3-second sample window to estimate bytes/sec and ETA; the
 - [x] An empty key-file path in a profile now falls back to the detected key
       instead of failing to load.
 
-### 3.2 Cross-session command history
+### 3.2 Login prompt for incomplete credentials — DONE
+
+- [x] `needs_login_prompt()` in [src/ui.rs](src/ui.rs) flags a profile with an
+      empty username, or (for password auth) an empty password.
+- [x] `connect_profile()` now opens the profile form pre-filled instead of
+      connecting blind when credentials are incomplete — matches the recents
+      flow that already did this for unsaved history entries.
+
+### 3.3 Key/agent-first auth fallback — DONE
+
+- [x] For `AuthMethod::Password` profiles, `authenticate()` now tries
+      ssh-agent, then a default key file, silently before sending the stored
+      password — the password is only used if the server still needs it.
+- [x] Explicit `KeyFile`/`Agent` profile selections are unchanged.
+
+### 3.4 Cross-session command history
 
 - [ ] Persist last 200 terminal commands to `~/.config/aetherium/command_history.toml`.
 - [ ] Deduplicate consecutive identical commands.
 - [ ] Bind configurable hotkeys (`Shift+↑` / `Shift+↓`) to recall history in the terminal.
+
 
 ---
 
@@ -97,6 +113,8 @@ tracks a rolling 3-second sample window to estimate bytes/sec and ETA; the
 
 ## 6. Distribution & CI
 
+- [x] Windows executable now embeds an app icon (`icons/aetherium.ico` via
+      `build.rs` + `winresource`); previously the .exe had no icon at all.
 - [ ] Create a separate `release.yml` triggered on `v*` tags.
 - [ ] Build macOS `.dmg` installer in addition to `.app` zip.
 - [ ] Build Windows NSIS installer in addition to portable zip.
@@ -115,6 +133,9 @@ tracks a rolling 3-second sample window to estimate bytes/sec and ETA; the
 | Encrypted password storage | `[x]` | AES-256-GCM, key in `~/.config/aetherium/key` |
 | `known_hosts` verification | `[x]` | Trust-on-first-use + reject changed keys |
 | Auto-detect default SSH keys | `[x]` | `id_ed25519` → `id_rsa` → `id_ecdsa` |
+| Login prompt for missing credentials | `[x]` | Opens profile form instead of connecting blind |
+| Key/agent-first auth fallback | `[x]` | Password only sent if agent/default key fail |
+| Windows .exe icon | `[x]` | Embedded via `build.rs` + `winresource` |
 | Cross-session command history | `[ ]` | Needs terminal input hook |
 | Remote file edit/watch | `[ ]` | Larger backend + UI task |
 | File associations | `[ ]` | Depends on remote-edit |
@@ -122,6 +143,7 @@ tracks a rolling 3-second sample window to estimate bytes/sec and ETA; the
 | Release workflow | `[ ]` | CI-only |
 
 Last updated: 2026-09-20 (encrypted passwords, known_hosts verification, key
-auto-detect, and transfer speed/ETA landed and pass `cargo test --locked`,
-27/27 tests green)
+auto-detect, transfer speed/ETA, login prompt, key/agent-first auth fallback,
+and Windows .exe icon landed and pass `cargo test --locked`, 27/27 tests green)
+
 
