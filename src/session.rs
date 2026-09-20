@@ -721,7 +721,18 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
                 .await
                 .context("publickey authentication")?
         }
-        AuthMethod::Agent => authenticate_with_agent(handle, &profile.username).await?,
+        AuthMethod::Agent => {
+            #[cfg(unix)]
+            {
+                authenticate_with_agent(handle, &profile.username).await?
+            }
+            #[cfg(windows)]
+            {
+                return Err(anyhow!(
+                    "ssh-agent authentication is not supported on Windows yet"
+                ));
+            }
+        }
     };
 
     match result {
@@ -753,6 +764,7 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[cfg(unix)]
 async fn authenticate_with_agent(
     handle: &mut Handle<ClientHandler>,
     username: &str,
