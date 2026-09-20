@@ -32,6 +32,9 @@ pub enum Command {
     Upload { session_id: u64, local: PathBuf, remote_dir: PathBuf },
     /// Download a remote file or directory (recursively) into ~/Downloads.
     Download { session_id: u64, remote: PathBuf },
+    /// Move/rename a remote entry (SFTP `rename`); used by file-tree
+    /// drag-and-drop.
+    Rename { session_id: u64, from: PathBuf, to: PathBuf },
     /// Start `tail -f` on a remote file over a new exec channel, feeding the
     /// given terminal grid (a log-follow tab). `tail_id` identifies the tab.
     TailFile { tail_id: u64, terminal: TerminalModel, path: String },
@@ -60,6 +63,9 @@ pub enum Event {
     /// The transfer finished successfully; the label names the result
     /// (target directory for uploads, saved path for downloads).
     TransferDone { label: String },
+    /// A drag-and-drop move finished; the UI refreshes the directories that
+    /// lost or gained an entry.
+    EntryMoved { from: PathBuf, to: PathBuf },
     Error(String),
     Disconnected,
     /// The `tail -f` channel with the given tab id ended (file closed or the
@@ -146,6 +152,10 @@ impl SessionHandle {
 
     pub fn download(&self, session_id: u64, remote: PathBuf) {
         self.send(Command::Download { session_id, remote });
+    }
+
+    pub fn rename(&self, session_id: u64, from: PathBuf, to: PathBuf) {
+        self.send(Command::Rename { session_id, from, to });
     }
 
     /// Non-blocking: pop one pending event, if any.
@@ -436,6 +446,33 @@ async fn command_loop(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             download(&sftp, &event_tx, &remote).await;
+                        });
+                    }
+                    Some(Command::Rename { session_id, from, to }) => {
+                        // Like transfers, run off the session loop so the
+                        // terminal keeps flowing while the server renames.
+                        let _ = session_id;
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match sftp
+                                .rename(
+                                    from.to_string_lossy().into_owned(),
+                                    to.to_string_lossy().into_owned(),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = event_tx.send(Event::EntryMoved { from, to });
+                                }
+                                Err(err) => {
+                                    let _ = event_tx.send(Event::Error(format!(
+                                        "moving {} to {}: {err}",
+                                        from.display(),
+                                        to.display()
+                                    )));
+                                }
+                            }
                         });
                     }
                     Some(Command::Disconnect) => return Ok(()),

@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -10,10 +11,10 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::{
-    App, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
-    TextRun, UnderlineStyle, Window, canvas, div, fill, font, point, prelude::*, px, rgb, size,
-    svg,
+    App, Bounds, Context, CursorStyle, DragMoveEvent, Entity, ExternalPaths, FocusHandle,
+    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle,
+    ScrollWheelEvent, ShapedLine, SharedString, TextRun, Transformation, UnderlineStyle, Window,
+    canvas, div, fill, font, point, prelude::*, px, radians, rgb, rgba, size, svg,
 };
 use parking_lot::Mutex;
 
@@ -28,7 +29,6 @@ use crate::theme;
 
 const TERMINAL_FONT_SIZE: f32 = 13.0;
 const TERMINAL_LINE_HEIGHT: f32 = TERMINAL_FONT_SIZE * 1.35;
-const SIDEBAR_WIDTH: f32 = 260.0;
 const HEADER_HEIGHT: f32 = 38.0;
 const STATUSBAR_HEIGHT: f32 = 24.0;
 
@@ -92,6 +92,118 @@ fn find_node<'a>(nodes: &'a mut [TreeNode], path: &std::path::Path) -> Option<&'
 
     let indices = index_path(nodes, path)?;
     at_mut(nodes, &indices)
+}
+
+/// Re-list a directory in a tab's tree, showing the loading state.
+fn reload_dir(tab: &mut SessionTab, path: &std::path::Path) {
+    if let Some(node) = find_node(&mut tab.tree, path) {
+        node.loading = true;
+    }
+    if let Some(session) = tab.session.as_ref() {
+        session.list_dir(tab.session_id, path.to_path_buf());
+    }
+}
+
+/// Payload of a drag started on a file-tree row.
+#[derive(Clone)]
+struct DraggedEntry {
+    path: PathBuf,
+    is_dir: bool,
+    name: SharedString,
+}
+
+/// What is currently under the cursor during an internal tree drag, mirroring
+/// Zed's project-panel `DragTarget`.
+#[derive(Clone)]
+enum TreeDragTarget {
+    /// Hovering a row; drops land in the row's directory (or the row's
+    /// parent directory when the row is a file).
+    Row { path: PathBuf, is_dir: bool },
+    /// Hovering the tree background; drops land in the tree root.
+    Background,
+}
+
+/// Which view the sidebar shows.
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarTab {
+    Sessions,
+    Files,
+    Logs,
+}
+
+/// Severity of a tool-log entry.
+#[derive(Clone, Copy, PartialEq)]
+enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One line of the tool log shown in the Logs sidebar tab.
+struct LogEntry {
+    /// Local time of the entry, `HH:MM:SS`.
+    time: String,
+    level: LogLevel,
+    message: String,
+}
+
+/// Maximum number of log entries kept in memory.
+const MAX_LOG_ENTRIES: usize = 1000;
+
+/// Floating drag image shown next to the cursor while dragging a tree entry
+/// (Zed's `DraggedProjectEntryView`).
+struct DraggedEntryView {
+    name: SharedString,
+    is_dir: bool,
+    click_offset: Point<Pixels>,
+}
+
+/// Payload for dragging the sidebar/terminal splitter; the drag image is
+/// empty because the splitter itself follows the cursor.
+struct SplitDrag;
+
+struct SplitDragView;
+
+impl Render for SplitDragView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl Render for DraggedEntryView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .pl(self.click_offset.x + px(12.))
+            .pt(self.click_offset.y + px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .items_center()
+                    .py_1()
+                    .px_2()
+                    .rounded_lg()
+                    .bg(theme::bg())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_md()
+                    .child(
+                        svg()
+                            .path(if self.is_dir {
+                                assets::ICON_CHEVRON_RIGHT
+                            } else {
+                                assets::ICON_FILE
+                            })
+                            .w(px(14.))
+                            .h(px(14.))
+                            .text_color(theme::text_dim()),
+                    )
+                    .child(div().text_sm().child(self.name.clone())),
+            )
+    }
 }
 
 /// Whether `profile` is missing credentials needed to connect: an empty
@@ -215,11 +327,32 @@ pub struct RootView {
     next_tab_id: u64,
     /// Right-click menu in the file tree: click position + file path.
     context_menu: Option<(Point<Pixels>, PathBuf)>,
+    /// Entry under the cursor during an internal file-tree drag.
+    tree_drag_target: Option<TreeDragTarget>,
+    /// Entry being dragged in the file tree (set when a drag starts moving).
+    tree_dragging: Option<DraggedEntry>,
+    /// Which sidebar view is shown.
+    sidebar_tab: SidebarTab,
+    /// Current width of the sidebar, dragged via the splitter.
+    sidebar_width: Pixels,
+    /// Whether file rows show a details column (size).
+    show_file_details: bool,
+    /// The tool's own log (connection issues, transfer errors, …).
+    logs: Vec<LogEntry>,
+    log_scroll: ScrollHandle,
+    /// Set when new log entries arrived (or the tab was opened); the log
+    /// list scrolls to the bottom on the next render.
+    logs_scroll_pending: bool,
+    /// Wake channel shared by all tab terminals: when any terminal becomes
+    /// dirty, the SSH reader thread sends on this to wake the repaint loop
+    /// immediately instead of waiting for a fixed poll tick.
+    terminal_wake_tx: std_mpsc::Sender<()>,
     focus_handle: FocusHandle,
 }
 
 impl RootView {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let (terminal_wake_tx, terminal_wake_rx) = std_mpsc::channel::<()>();
         let view = Self {
             store: ProfileStore::load(),
             selected: None,
@@ -230,9 +363,18 @@ impl RootView {
             active: 0,
             next_tab_id: 0,
             context_menu: None,
+            tree_drag_target: None,
+            tree_dragging: None,
+            sidebar_tab: SidebarTab::Sessions,
+            sidebar_width: px(260.),
+            show_file_details: false,
+            logs: Vec::new(),
+            log_scroll: ScrollHandle::default(),
+            logs_scroll_pending: false,
+            terminal_wake_tx,
             focus_handle: cx.focus_handle(),
         };
-        view.spawn_repaint_loop(cx);
+        view.spawn_repaint_loop(cx, terminal_wake_rx);
         view.spawn_event_loop(cx);
         view
     }
@@ -255,13 +397,21 @@ impl RootView {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
-    /// ~60fps dirty-flag poll: repaint only when a terminal changed.
-    fn spawn_repaint_loop(&self, cx: &mut Context<Self>) {
+    /// Repaint as soon as any terminal wakes us, with a 16ms timer as a
+    /// fallback for periodic bookkeeping (geometry/resize sync) and to catch
+    /// any wake we might have missed. Terminal output wakes instantly, so
+    /// typing echoes with no polling delay.
+    fn spawn_repaint_loop(&self, cx: &mut Context<Self>, wake_rx: std_mpsc::Receiver<()>) {
         cx.spawn(async move |this, cx| {
             loop {
+                // Wait for a terminal wake or the 16ms fallback tick, whichever
+                // comes first.
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
+                // Drain any pending wake signals so a burst of output doesn't
+                // queue up extra repaints.
+                while wake_rx.try_recv().is_ok() {}
                 let result = this.update(cx, |this, cx| {
                     // Apply terminal resizes based on the canvas geometry of
                     // the active tab; inactive grids keep their size and are
@@ -350,7 +500,7 @@ impl RootView {
                 tab.session
                     .as_ref()
                     .expect("shell tab has a session")
-                    .list_dir(session_id, home_dir);
+                    .list_dir(session_id, home_dir.clone());
                 // Remember the session in the recent-sessions list.
                 let profile = tab.connecting_profile.take();
                 if let Some(profile) = profile {
@@ -363,8 +513,14 @@ impl RootView {
                     });
                     if let Err(err) = self.recents.save() {
                         eprintln!("zedterm: failed to save recents: {err:#}");
+                        self.log(LogLevel::Warn, format!("failed to save recents: {err:#}"));
                     }
                 }
+                let label = Self::tab_log_label(&self.tabs[index]);
+                self.log(
+                    LogLevel::Info,
+                    format!("{label}: connected (home: {})", home_dir.display()),
+                );
             }
             SessionEvent::DirListing { session_id, path, entries } => {
                 let tab = &mut self.tabs[index];
@@ -388,7 +544,9 @@ impl RootView {
                 }
             }
             SessionEvent::TransferStarted { label } => {
-                self.tabs[index].transfer = Some((label, 0, 0, 0.0, 0));
+                self.tabs[index].transfer = Some((label.clone(), 0, 0, 0.0, 0));
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Info, format!("{tab_label}: {label}"));
             }
             SessionEvent::TransferProgress { label, done_bytes, total_bytes, bytes_per_second, eta_seconds } => {
                 self.tabs[index].transfer = Some((label, done_bytes, total_bytes, bytes_per_second, eta_seconds));
@@ -396,7 +554,7 @@ impl RootView {
             SessionEvent::TransferDone { label } => {
                 let tab = &mut self.tabs[index];
                 tab.transfer = None;
-                tab.status = label;
+                tab.status = label.clone();
                 // Refresh every directory that pending uploads write into.
                 let dirs = std::mem::take(&mut tab.pending_upload_dirs);
                 let session_id = tab.session_id;
@@ -408,13 +566,43 @@ impl RootView {
                         session.list_dir(session_id, dir.clone());
                     }
                 }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Info, format!("{tab_label}: {label}"));
+            }
+            SessionEvent::EntryMoved { from, to } => {
+                let tab = &mut self.tabs[index];
+                tab.status = format!("moved {} → {}", from.display(), to.display());
+                if tab.tree_selection.as_ref() == Some(&from) {
+                    tab.tree_selection = Some(to.clone());
+                }
+                self.tree_drag_target = None;
+                self.tree_dragging = None;
+                // Refresh both the directory that lost the entry and the one
+                // that gained it (the moved subtree reloads collapsed).
+                let old_parent = from.parent().map(PathBuf::from);
+                let new_parent = to.parent().map(PathBuf::from);
+                if let Some(parent) = old_parent.as_ref() {
+                    reload_dir(tab, parent);
+                }
+                if let Some(parent) = new_parent.as_ref() {
+                    if old_parent.as_ref() != Some(parent) {
+                        reload_dir(tab, parent);
+                    }
+                }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(
+                    LogLevel::Info,
+                    format!("{tab_label}: moved {} → {}", from.display(), to.display()),
+                );
             }
             SessionEvent::Error(message) => {
                 let tab = &mut self.tabs[index];
-                tab.status = message;
+                tab.status = message.clone();
                 if tab.state == ConnState::Connecting {
                     tab.state = ConnState::Disconnected;
                 }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Error, format!("{tab_label}: {message}"));
             }
             SessionEvent::Disconnected => {
                 let tab_id = self.tabs[index].id;
@@ -427,6 +615,8 @@ impl RootView {
                 tab.transfer = None;
                 tab.pending_upload_dirs.clear();
                 tab.connecting_profile = None;
+                self.tree_drag_target = None;
+                self.tree_dragging = None;
                 // Drop the old session's output; focus stays on the sidebar.
                 tab.terminal.reset();
                 // The tail channels die with the connection; mark the log
@@ -439,12 +629,18 @@ impl RootView {
                         }
                     }
                 }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Warn, format!("{tab_label}: disconnected"));
             }
             SessionEvent::TailEnded { tab_id } => {
                 self.end_log_tab(tab_id, "tail ended");
+                let label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Info, format!("{label}: tail ended"));
             }
             SessionEvent::TailError { tab_id, message } => {
-                self.end_log_tab(tab_id, message);
+                self.end_log_tab(tab_id, message.clone());
+                let label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Error, format!("{label}: {message}"));
             }
         }
     }
@@ -486,8 +682,13 @@ impl RootView {
             return;
         }
         let terminal = TerminalModel::new(80, 24);
+        terminal.set_wake_channel(Some(self.terminal_wake_tx.clone()));
         let session = SessionHandle::spawn(terminal.clone());
         let id = self.alloc_tab_id();
+        self.log(
+            LogLevel::Info,
+            format!("connecting to {}…", profile.summary()),
+        );
         let tab = SessionTab {
             id,
             kind: TabKind::Shell,
@@ -529,6 +730,7 @@ impl RootView {
         let parent_index = self.active;
         let id = self.alloc_tab_id();
         let terminal = TerminalModel::new(80, 24);
+        terminal.set_wake_channel(Some(self.terminal_wake_tx.clone()));
         self.tabs[parent_index]
             .session
             .as_ref()
@@ -579,6 +781,8 @@ impl RootView {
         }
         self.active = index;
         self.context_menu = None;
+        self.tree_drag_target = None;
+        self.tree_dragging = None;
         self.tabs[index].terminal_focus_pending = true;
         cx.notify();
     }
@@ -945,6 +1149,176 @@ impl RootView {
         }
         cx.notify();
     }
+
+    /// Reset internal file-tree drag state (called on drop and when a drag
+    /// ends without one).
+    fn clear_tree_drag(&mut self, cx: &mut Context<Self>) {
+        if self.tree_drag_target.take().is_some() || self.tree_dragging.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Short label identifying a tab in log messages.
+    fn tab_log_label(tab: &SessionTab) -> String {
+        if let Some(profile) = tab.profile.as_ref() {
+            return profile.summary();
+        }
+        match &tab.kind {
+            TabKind::Log { remote_path, .. } => format!("tail {}", remote_path.display()),
+            TabKind::Shell => "session".to_string(),
+        }
+    }
+
+    /// Append a line to the tool log (the Logs sidebar tab). Connection
+    /// issues, transfer errors, move failures, etc. all land here.
+    fn log(&mut self, level: LogLevel, message: impl Into<String>) {
+        let time = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.logs.push(LogEntry {
+            time,
+            level,
+            message: message.into(),
+        });
+        if self.logs.len() > MAX_LOG_ENTRIES {
+            let excess = self.logs.len() - MAX_LOG_ENTRIES;
+            self.logs.drain(0..excess);
+        }
+        self.logs_scroll_pending = true;
+    }
+
+    /// Directory to highlight while dragging, mirroring Zed's
+    /// `highlight_entry_for_selection_drag`: directories highlight
+    /// themselves, files highlight their parent, and hovering the entry's
+    /// own parent (or its sibling files) highlights nothing. The background
+    /// highlights the tree root unless the entry already lives there.
+    fn tree_drop_highlight(&self, dragged: &DraggedEntry, target: &TreeDragTarget) -> Option<PathBuf> {
+        let root = self.active_tab()?.root_path.clone()?;
+        let (hover, hover_is_dir) = match target {
+            TreeDragTarget::Background => {
+                let already_at_root = dragged.path.parent() == Some(root.as_path());
+                return (!already_at_root).then_some(root);
+            }
+            TreeDragTarget::Row { path, is_dir } => (path.clone(), *is_dir),
+        };
+        let dragged_parent = dragged.path.parent();
+        if dragged_parent == Some(hover.as_path()) {
+            return None;
+        }
+        if !hover_is_dir && dragged_parent.is_some() && dragged_parent == hover.parent() {
+            return None;
+        }
+        if hover_is_dir {
+            Some(hover)
+        } else {
+            hover.parent().map(PathBuf::from)
+        }
+    }
+
+    /// Move a dragged entry via SFTP rename. `target` is the row (or tree
+    /// background) the entry was dropped on; directories drop into
+    /// themselves, files drop into their parent directory.
+    fn drop_tree_entry(
+        &mut self,
+        dragged: DraggedEntry,
+        target: TreeDragTarget,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_tree_drag(cx);
+        let connected = self
+            .active_tab()
+            .is_some_and(|tab| tab.state == ConnState::Connected);
+        if !connected {
+            self.status = "not connected".into();
+            cx.notify();
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(root) = tab.root_path.clone() else {
+            return;
+        };
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
+        let session_id = tab.session_id;
+        let target_dir = match &target {
+            TreeDragTarget::Background => root,
+            TreeDragTarget::Row { path, is_dir } => {
+                if *is_dir {
+                    path.clone()
+                } else {
+                    path.parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| root.clone())
+                }
+            }
+        };
+        if dragged.is_dir && target_dir.starts_with(dragged.path.as_path()) {
+            self.status = "cannot move a directory into itself".into();
+            cx.notify();
+            return;
+        }
+        if dragged.path.parent() == Some(target_dir.as_path()) {
+            return; // already in that directory
+        }
+        let to = target_dir.join(dragged.name.as_ref());
+        self.active_tab_mut()
+            .expect("checked above")
+            .status = format!("moving {} → {}", dragged.path.display(), to.display());
+        session.rename(session_id, dragged.path.clone(), to);
+        cx.notify();
+    }
+
+    /// Zed auto-expands a collapsed directory that is hovered during a drag;
+    /// expand after a short delay if the cursor is still over it.
+    fn schedule_drag_expand(
+        &mut self,
+        path: PathBuf,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let collapsed_dir = self
+            .active_tab_mut()
+            .and_then(|tab| {
+                let node = find_node(&mut tab.tree, &path)?;
+                (node.entry.is_dir && !node.expanded).then_some(())
+            })
+            .is_some();
+        if !collapsed_dir {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            this.update_in(cx, move |this, window, cx| {
+                let still_hovering = matches!(
+                    &this.tree_drag_target,
+                    Some(TreeDragTarget::Row { path: p, .. }) if *p == path
+                ) && bounds.contains(&window.mouse_position());
+                if !still_hovering {
+                    return;
+                }
+                if let Some(tab) = this.active_tab_mut() {
+                    if let Some(node) = find_node(&mut tab.tree, &path) {
+                        if node.entry.is_dir && !node.expanded {
+                            node.expanded = true;
+                            if node.children.is_none() {
+                                node.loading = true;
+                                if let Some(session) = tab.session.as_ref() {
+                                    session.list_dir(tab.session_id, path.clone());
+                                }
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
 }
 
 impl ProfileForm {
@@ -1013,15 +1387,45 @@ impl ProfileForm {
 
 // --- terminal colors --------------------------------------------------------
 
-/// Alacritty's default dark palette.
+/// Zed default-dark terminal palette: the `terminal_ansi_*` colors of Zed's
+/// built-in theme (MIT-licensed), transcribed from Zed's color scales. The
+/// black/white scales are alpha ramps that Zed composites over the terminal
+/// background; the alpha is kept so the rendering matches. Normal colors are
+/// scale step 11, bright colors step 10, dim colors step 9.
 const ANSI_NORMAL: [u32; 8] = [
-    0x1d1f21, 0xcc6666, 0xb5bd68, 0xf0c674, 0x81a2be, 0xb294bb, 0x8abeb7, 0xc5c8c6,
+    0x000000f2, // black
+    0xff9592ff, // red
+    0x3dd68cff, // green
+    0xf5e147ff, // yellow
+    0x70b8ffff, // blue
+    0xbaa7ffff, // magenta
+    0x4ccce6ff, // cyan
+    0xeeeeecff, // white
 ];
 const ANSI_BRIGHT: [u32; 8] = [
-    0x666666, 0xd54e53, 0xb9ca4a, 0xe7c547, 0x7aa6da, 0xc397d8, 0x70c0b1, 0xeaeaea,
+    0x000000e6, // bright black
+    0xec5d5eff, // bright red
+    0x33b074ff, // bright green
+    0xffff57ff, // bright yellow
+    0x3b9effff, // bright blue
+    0x7d66d9ff, // bright magenta
+    0x23afd0ff, // bright cyan
+    0xb5b3adff, // bright white
 ];
-const TERM_FG: u32 = 0xc5c8c6;
-const TERM_BG: u32 = 0x1d1f21;
+const ANSI_DIM: [u32; 8] = [
+    0x000000cc, // dim black
+    0xe5484dff, // dim red
+    0x30a46cff, // dim green
+    0xffe629ff, // dim yellow
+    0x0090ffff, // dim blue
+    0x6e56cfff, // dim magenta
+    0x00a2c7ff, // dim cyan
+    0x7c7b74ff, // dim white
+];
+/// Default terminal foreground (`terminal_foreground`, white scale step 12).
+const TERM_FG: u32 = 0xfffffff2;
+/// Default terminal background (`terminal_background` = theme background).
+const TERM_BG: u32 = 0x22252bff;
 
 fn hex(value: u32) -> Hsla {
     rgb(value).into()
@@ -1034,8 +1438,8 @@ fn rgb_to_hsla(color: Rgb) -> Hsla {
 /// 256-color lookup: 0-15 palette, 16-231 cube, 232-255 grayscale.
 fn indexed_color(index: u8) -> Hsla {
     match index {
-        0..=7 => hex(ANSI_NORMAL[index as usize]),
-        8..=15 => hex(ANSI_BRIGHT[index as usize - 8]),
+        0..=7 => rgba(ANSI_NORMAL[index as usize]).into(),
+        8..=15 => rgba(ANSI_BRIGHT[index as usize - 8]).into(),
         16..=231 => {
             let idx = index - 16;
             let r = idx / 36;
@@ -1052,42 +1456,43 @@ fn indexed_color(index: u8) -> Hsla {
 }
 
 fn named_color(color: NamedColor, dim: bool) -> Hsla {
-    let value = match color {
-        NamedColor::Foreground => TERM_FG,
-        NamedColor::Background => TERM_BG,
-        NamedColor::Black => ANSI_NORMAL[0],
-        NamedColor::Red => ANSI_NORMAL[1],
-        NamedColor::Green => ANSI_NORMAL[2],
-        NamedColor::Yellow => ANSI_NORMAL[3],
-        NamedColor::Blue => ANSI_NORMAL[4],
-        NamedColor::Magenta => ANSI_NORMAL[5],
-        NamedColor::Cyan => ANSI_NORMAL[6],
-        NamedColor::White => ANSI_NORMAL[7],
-        NamedColor::BrightBlack => ANSI_BRIGHT[0],
-        NamedColor::BrightRed => ANSI_BRIGHT[1],
-        NamedColor::BrightGreen => ANSI_BRIGHT[2],
-        NamedColor::BrightYellow => ANSI_BRIGHT[3],
-        NamedColor::BrightBlue => ANSI_BRIGHT[4],
-        NamedColor::BrightMagenta => ANSI_BRIGHT[5],
-        NamedColor::BrightCyan => ANSI_BRIGHT[6],
-        NamedColor::BrightWhite => ANSI_BRIGHT[7],
-        NamedColor::DimBlack => ANSI_NORMAL[0],
-        NamedColor::DimRed => ANSI_NORMAL[1],
-        NamedColor::DimGreen => ANSI_NORMAL[2],
-        NamedColor::DimYellow => ANSI_NORMAL[3],
-        NamedColor::DimBlue => ANSI_NORMAL[4],
-        NamedColor::DimMagenta => ANSI_NORMAL[5],
-        NamedColor::DimCyan => ANSI_NORMAL[6],
-        NamedColor::DimWhite => ANSI_NORMAL[7],
+    fn palette(colors: &[u32; 8], index: usize, dim: bool) -> Hsla {
+        rgba(if dim { ANSI_DIM[index] } else { colors[index] }).into()
+    }
+    match color {
+        NamedColor::Foreground => {
+            rgba(if dim { 0xffffffcc } else { TERM_FG }).into()
+        }
+        NamedColor::Background => rgba(TERM_BG).into(),
+        NamedColor::BrightForeground => rgba(0xffffffe6).into(),
+        NamedColor::Black => palette(&ANSI_NORMAL, 0, dim),
+        NamedColor::Red => palette(&ANSI_NORMAL, 1, dim),
+        NamedColor::Green => palette(&ANSI_NORMAL, 2, dim),
+        NamedColor::Yellow => palette(&ANSI_NORMAL, 3, dim),
+        NamedColor::Blue => palette(&ANSI_NORMAL, 4, dim),
+        NamedColor::Magenta => palette(&ANSI_NORMAL, 5, dim),
+        NamedColor::Cyan => palette(&ANSI_NORMAL, 6, dim),
+        NamedColor::White => palette(&ANSI_NORMAL, 7, dim),
+        NamedColor::BrightBlack => palette(&ANSI_BRIGHT, 0, false),
+        NamedColor::BrightRed => palette(&ANSI_BRIGHT, 1, false),
+        NamedColor::BrightGreen => palette(&ANSI_BRIGHT, 2, false),
+        NamedColor::BrightYellow => palette(&ANSI_BRIGHT, 3, false),
+        NamedColor::BrightBlue => palette(&ANSI_BRIGHT, 4, false),
+        NamedColor::BrightMagenta => palette(&ANSI_BRIGHT, 5, false),
+        NamedColor::BrightCyan => palette(&ANSI_BRIGHT, 6, false),
+        NamedColor::BrightWhite => palette(&ANSI_BRIGHT, 7, false),
+        NamedColor::DimBlack => rgba(ANSI_DIM[0]).into(),
+        NamedColor::DimRed => rgba(ANSI_DIM[1]).into(),
+        NamedColor::DimGreen => rgba(ANSI_DIM[2]).into(),
+        NamedColor::DimYellow => rgba(ANSI_DIM[3]).into(),
+        NamedColor::DimBlue => rgba(ANSI_DIM[4]).into(),
+        NamedColor::DimMagenta => rgba(ANSI_DIM[5]).into(),
+        NamedColor::DimCyan => rgba(ANSI_DIM[6]).into(),
+        NamedColor::DimWhite => rgba(ANSI_DIM[7]).into(),
         // Cursor color and dim/bright foreground/background variants fall
         // back to the defaults.
-        _ => TERM_FG,
-    };
-    let mut hsla = hex(value);
-    if dim {
-        hsla.l *= 0.66;
+        _ => rgba(TERM_FG).into(),
     }
-    hsla
 }
 
 /// Resolve a cell's foreground/background to concrete colors.
@@ -1704,14 +2109,97 @@ impl RootView {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let content = match self.sidebar_tab {
+            SidebarTab::Sessions => self.render_sessions(cx),
+            SidebarTab::Files => self.render_active_files(cx),
+            SidebarTab::Logs => self.render_logs(cx),
+        };
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width)
             .h_full()
             .bg(theme::panel())
-            .border_r_1()
-            .border_color(theme::border())
             .flex()
             .flex_col()
+            .child(self.render_sidebar_tabs(cx))
+            .child(content)
+            .into_any_element()
+    }
+
+    /// Draggable splitter between the sidebar and the terminal.
+    fn render_split_handle(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("sidebar-split")
+            .w(px(4.))
+            .h_full()
+            .flex_none()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .hover(|style| style.bg(theme::border()))
+            .active(|style| style.bg(theme::accent()))
+            .on_drag(SplitDrag, |_, _, _, cx| cx.new(|_| SplitDragView))
+            .on_drag_move::<SplitDrag>(cx.listener(
+                |this, event: &DragMoveEvent<SplitDrag>, _, cx| {
+                    // The content row starts at the window's left edge, so the
+                    // mouse position maps directly onto the sidebar width.
+                    this.sidebar_width = (event.event.position.x - px(2.)).clamp(
+                        px(180.),
+                        px(640.),
+                    );
+                    cx.notify();
+                },
+            ))
+            .into_any_element()
+    }
+
+    /// Tab switcher at the top of the sidebar: Sessions / Files / Logs.
+    fn render_sidebar_tabs(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active = self.sidebar_tab;
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .pt_2()
+            .border_b_1()
+            .border_color(theme::border());
+        for (tab, label) in [
+            (SidebarTab::Sessions, "Sessions"),
+            (SidebarTab::Files, "Files"),
+            (SidebarTab::Logs, "Logs"),
+        ] {
+            let is_active = tab == active;
+            bar = bar.child(
+                div()
+                    .id(SharedString::from(format!("sidebar-tab-{label}")))
+                    .flex_1()
+                    .py(px(5.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_center()
+                    .text_color(if is_active { theme::text() } else { theme::text_dim() })
+                    .when(is_active, |item| item.bg(theme::selection()))
+                    .when(!is_active, |item| item.hover(|style| style.bg(theme::hover())))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sidebar_tab = tab;
+                        if tab == SidebarTab::Logs {
+                            this.logs_scroll_pending = true;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        bar.into_any_element()
+    }
+
+    /// The Sessions sidebar tab: saved profiles + recent connections.
+    fn render_sessions(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .child(
                 div()
                     .px_2()
@@ -1737,9 +2225,99 @@ impl RootView {
             )
             .child(section_label("RECENT SESSIONS"))
             .child(self.render_recents(cx))
-            .child(section_label("FILES"))
-            .child(self.render_active_files(cx))
             .into_any_element()
+    }
+
+    /// The Logs sidebar tab: the tool's own log — connection issues,
+    /// transfer/move errors, tail problems, and other failures.
+    fn render_logs(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.logs_scroll_pending {
+            self.log_scroll.scroll_to_bottom();
+            self.logs_scroll_pending = false;
+        }
+        let mut section = div().flex().flex_col().flex_1().min_h(px(0.));
+        section = section.child(
+            div()
+                .px_2()
+                .pb_1()
+                .pt_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .text_color(theme::text_dim())
+                        .child(format!("TOOL LOG — {} entries", self.logs.len())),
+                )
+                .child(header_button("log-clear", "clear", cx, |this, _window, cx| {
+                    this.logs.clear();
+                    cx.notify();
+                })),
+        );
+        if self.logs.is_empty() {
+            return section
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_color(theme::text_dim())
+                        .child("no log entries yet — connection and transfer issues show up here"),
+                )
+                .into_any_element();
+        }
+        let mut list = div()
+            .id("log-list")
+            .track_scroll(&self.log_scroll)
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px_2()
+            .pb_2();
+        for entry in &self.logs {
+            let (tag, color) = match entry.level {
+                LogLevel::Info => ("INFO", theme::text_dim()),
+                LogLevel::Warn => ("WARN", theme::warning()),
+                LogLevel::Error => ("ERROR", theme::danger()),
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::text_dim())
+                            .child(entry.time.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(color)
+                            .child(tag),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(theme::text())
+                            .child(entry.message.clone()),
+                    ),
+            );
+        }
+        section.child(list).into_any_element()
     }
 
     /// The FILES sidebar section: session header (profile, download,
@@ -1784,6 +2362,7 @@ impl RootView {
                     .as_ref()
                     .map(|profile| profile.summary())
                     .unwrap_or_default();
+                let show_details = self.show_file_details;
                 section = section
                     .child(
                         div()
@@ -1810,6 +2389,33 @@ impl RootView {
                                     this.download_selected(cx);
                                 },
                             ))
+                            // Toggle the file-details column (sizes).
+                            .child(
+                                div()
+                                    .id("tab-details")
+                                    .child("≡")
+                                    .bg(if show_details {
+                                        theme::selection()
+                                    } else {
+                                        theme::button()
+                                    })
+                                    .text_color(if show_details {
+                                        theme::text()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .hover(|style| style.bg(theme::button_hover()))
+                                    .active(|style| style.opacity(0.8))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_file_details = !this.show_file_details;
+                                        cx.notify();
+                                    })),
+                            )
                             .child(header_button(
                                 "tab-disconnect",
                                 "⏻",
@@ -1967,6 +2573,11 @@ impl RootView {
             Some(tab) => (&tab.tree, tab.tree_selection.clone(), tab.state == ConnState::Connected),
             None => (&empty, None, false),
         };
+        // Directory highlighted as the current drop target during a drag.
+        let drag_highlight = match (self.tree_dragging.as_ref(), self.tree_drag_target.as_ref()) {
+            (Some(dragged), Some(target)) => self.tree_drop_highlight(dragged, target),
+            _ => None,
+        };
         if tree.is_empty() {
             rows.push(
                 div()
@@ -1977,7 +2588,15 @@ impl RootView {
                     .into_any_element(),
             );
         } else {
-            render_tree_rows(tree, 0, tree_selection.as_ref(), cx, &mut rows);
+            render_tree_rows(
+                tree,
+                0,
+                tree_selection.as_ref(),
+                drag_highlight.as_ref(),
+                self.show_file_details,
+                cx,
+                &mut rows,
+            );
         }
         div()
             .flex_1()
@@ -1988,8 +2607,9 @@ impl RootView {
             .flex_col()
             // Dropping OS files onto the tree background uploads them into
             // the remote home directory; dropping onto a directory row
-            // targets that directory instead (handled per row).
-            .can_drop(|value, _, _| value.is::<ExternalPaths>())
+            // targets that directory instead (handled per row). Dropping a
+            // dragged tree entry onto the background moves it into the root.
+            .can_drop(|value, _, _| value.is::<ExternalPaths>() || value.is::<DraggedEntry>())
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 let paths = paths.paths().to_vec();
                 let root = this.active_tab().and_then(|tab| tab.root_path.clone());
@@ -2001,7 +2621,25 @@ impl RootView {
                     }
                 }
             }))
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::hover()))
+            .on_drop(cx.listener(|this, dragged: &DraggedEntry, _, cx| {
+                this.drop_tree_entry(dragged.clone(), TreeDragTarget::Background, cx);
+            }))
+            .on_drag_move::<DraggedEntry>(cx.listener(
+                |this, event: &DragMoveEvent<DraggedEntry>, _, cx| {
+                    let is_current = matches!(this.tree_drag_target, Some(TreeDragTarget::Background));
+                    if event.bounds.contains(&event.event.position) {
+                        if !is_current {
+                            this.tree_dragging = Some(event.drag(cx).clone());
+                            this.tree_drag_target = Some(TreeDragTarget::Background);
+                            cx.notify();
+                        }
+                    } else if is_current {
+                        this.tree_drag_target = None;
+                        cx.notify();
+                    }
+                },
+            ))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::drop_target()))
             .children(rows)
             .into_any_element()
     }
@@ -2203,40 +2841,109 @@ fn render_tree_rows(
     nodes: &[TreeNode],
     depth: usize,
     selected: Option<&PathBuf>,
+    drag_highlight: Option<&PathBuf>,
+    show_details: bool,
     cx: &mut Context<RootView>,
     rows: &mut Vec<gpui::AnyElement>,
 ) {
     for node in nodes {
         let path = node.entry.path.clone();
+        let is_dir = node.entry.is_dir;
         let is_selected = selected == Some(&node.entry.path);
-        let icon = if node.entry.is_dir {
-            if node.loading {
-                "▸ …"
-            } else if node.expanded {
-                "▾"
-            } else {
-                "▸"
-            }
-        } else {
-            "•"
-        };
+        let highlighted = is_dir && drag_highlight == Some(&node.entry.path);
+        let row_path = path.clone();
+        let drag_move_path = path.clone();
+        let external_drop_path = path.clone();
+        let tree_drop_path = path.clone();
+
         rows.push(
             div()
                 .id(SharedString::from(format!("tree:{}", node.entry.path.display())))
+                .h(px(24.))
+                .ml(px(4. + depth as f32 * 14.))
+                .mr(px(4.))
+                .px(px(6.))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_1()
-                .px_2()
-                .py(px(1.))
-                .pl(px(8. + depth as f32 * 14.))
-                .cursor_pointer()
                 .rounded_sm()
+                .cursor_pointer()
                 .when(is_selected, |row| row.bg(theme::selection()))
-                .hover(|row| row.bg(theme::hover()))
+                .when(!is_selected, |row| row.hover(|row| row.bg(theme::hover())))
+                .when(highlighted, |row| row.bg(theme::drop_target()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_tree_node(path.clone(), cx);
                 }))
+                // Start dragging this entry; a small label follows the cursor
+                // (Zed's project-panel drag image).
+                .on_drag(
+                    DraggedEntry {
+                        path: row_path.clone(),
+                        is_dir,
+                        name: node.entry.name.clone().into(),
+                    },
+                    |drag, click_offset, _window, cx| {
+                        cx.new(|_| DraggedEntryView {
+                            name: drag.name.clone(),
+                            is_dir: drag.is_dir,
+                            click_offset,
+                        })
+                    },
+                )
+                .on_drag_move::<DraggedEntry>(cx.listener(
+                    move |this, event: &DragMoveEvent<DraggedEntry>, window, cx| {
+                        let is_current = matches!(
+                            &this.tree_drag_target,
+                            Some(TreeDragTarget::Row { path, .. }) if path == &drag_move_path
+                        );
+                        if !event.bounds.contains(&event.event.position) {
+                            // The row that set the target also clears it once
+                            // the cursor leaves (Zed clears per entry).
+                            if is_current {
+                                this.tree_drag_target = None;
+                                cx.notify();
+                            }
+                            return;
+                        }
+                        if is_current {
+                            return;
+                        }
+                        this.tree_dragging = Some(event.drag(cx).clone());
+                        this.tree_drag_target = Some(TreeDragTarget::Row {
+                            path: drag_move_path.clone(),
+                            is_dir,
+                        });
+                        cx.notify();
+                        this.schedule_drag_expand(drag_move_path.clone(), event.bounds, window, cx);
+                    },
+                ))
+                // Directory rows accept OS file drops and upload into that
+                // directory (recursively); file rows accept them into the
+                // file's parent directory.
+                .can_drop(|value, _, _| value.is::<ExternalPaths>() || value.is::<DraggedEntry>())
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                    let target = if is_dir {
+                        external_drop_path.clone()
+                    } else {
+                        external_drop_path
+                            .parent()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| external_drop_path.clone())
+                    };
+                    this.upload_dropped_paths(&paths.paths().to_vec(), target, cx);
+                }))
+                .on_drop(cx.listener(move |this, dragged: &DraggedEntry, _, cx| {
+                    this.drop_tree_entry(
+                        dragged.clone(),
+                        TreeDragTarget::Row {
+                            path: tree_drop_path.clone(),
+                            is_dir,
+                        },
+                        cx,
+                    );
+                }))
+                .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::drop_target()))
                 // Right-click a file for the context menu (e.g. tail -f).
                 .when(!node.entry.is_dir, |row| {
                     let menu_path = node.entry.path.clone();
@@ -2251,35 +2958,50 @@ fn render_tree_rows(
                         }),
                     )
                 })
-                // Directory rows accept OS file drops and upload into that
-                // directory (recursively).
-                .when(node.entry.is_dir, |row| {
-                    let target = node.entry.path.clone();
-                    row.can_drop(|value, _, _| value.is::<ExternalPaths>())
-                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                            let paths = paths.paths().to_vec();
-                            this.upload_dropped_paths(&paths, target.clone(), cx);
-                        }))
-                        .drag_over::<ExternalPaths>(|style, _, _, _| {
-                            style.bg(theme::selection())
-                        })
-                })
                 .child(
-                    div()
-                        .w(px(16.))
-                        .text_color(theme::text_dim())
-                        .child(icon.to_string()),
+                    // Leading glyph: disclosure chevron for directories, a
+                    // file icon for files (Zed project-panel layout).
+                    if is_dir {
+                        svg()
+                            .path(assets::ICON_CHEVRON_RIGHT)
+                            .w(px(14.))
+                            .h(px(14.))
+                            .text_color(theme::text_dim())
+                            .when(node.expanded, |icon| {
+                                icon.with_transformation(Transformation::rotate(radians(
+                                    std::f32::consts::FRAC_PI_2,
+                                )))
+                            })
+                            .into_any_element()
+                    } else {
+                        svg()
+                            .path(assets::ICON_FILE)
+                            .w(px(14.))
+                            .h(px(14.))
+                            .text_color(theme::text_dim())
+                            .into_any_element()
+                    },
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
                         .truncate()
-                        .when(!node.entry.is_dir, |name| name.text_color(theme::text_dim()))
+                        .text_color(theme::text())
                         .child(node.entry.name.clone()),
                 )
-                .when(!node.entry.is_dir, |row| {
+                .when(node.loading, |row| {
                     row.child(
                         div()
-                            .flex_1()
+                            .text_xs()
+                            .text_color(theme::text_dim())
+                            .child("…"),
+                    )
+                })
+                .when(show_details && !is_dir, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
                             .text_xs()
                             .text_color(theme::text_dim())
                             .child(format_size(node.entry.size)),
@@ -2289,7 +3011,7 @@ fn render_tree_rows(
         );
         if node.expanded {
             if let Some(children) = node.children.as_ref() {
-                render_tree_rows(children, depth + 1, selected, cx, rows);
+                render_tree_rows(children, depth + 1, selected, drag_highlight, show_details, cx, rows);
             }
         }
     }
@@ -2303,6 +3025,12 @@ impl Focusable for RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A drag that ends outside the tree (no drop) leaves no event behind;
+        // heal stale drag-hover state once gpui reports the drag is over.
+        if self.tree_drag_target.is_some() && !cx.has_active_drag() {
+            self.tree_drag_target = None;
+            self.tree_dragging = None;
+        }
         // Deferred focus requests: session events arrive without a `Window`,
         // so they set a flag that is applied here on the next frame.
         let active = self.active;
@@ -2321,6 +3049,7 @@ impl Render for RootView {
             .bg(theme::bg())
             .text_color(theme::text())
             .text_size(px(13.))
+            .font_family(theme::FONT_UI)
             .child(self.render_header(cx))
             .child(self.render_tab_bar(cx));
 
@@ -2336,6 +3065,7 @@ impl Render for RootView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(self.render_sidebar(cx))
+                    .child(self.render_split_handle(cx))
                     .child(self.render_terminal(cx)),
             )
             .child(self.render_statusbar(cx));

@@ -89,6 +89,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64",
+ "chrono",
  "dirs 7.0.0",
  "gpui",
  "parking_lot",

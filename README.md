@@ -10,8 +10,18 @@ same snappy text layout, same dark aesthetic.
 
 - **Multiple tabs** — every connection opens in its own tab with an independent
   SSH session, terminal, and file tree; switch or close tabs from the tab bar.
-- **Remote file tree** (left sidebar) — browses the SSH host over SFTP with lazy
-  directory expansion, dirs-first sorting and file sizes.
+- **Sidebar tabs** — the left sidebar switches between **Sessions** (profiles +
+  recents), **Files** (the remote file browser, full height), and **Logs** (the
+  tool's own log). Drag the splitter between sidebar and terminal to resize.
+- **Remote file tree** (Files tab) — browses the SSH host over SFTP with lazy
+  directory expansion, dirs-first sorting and Zed-style drag & drop: drag entries
+  onto directories (or the background) to move them remotely via SFTP rename,
+  with drop-target highlighting and auto-expanding folders; dragging OS files in
+  uploads them. The **≡** button toggles a details column with file sizes.
+- **Tool log** (Logs tab) — every connection event and failure collected in one
+  place with timestamps: connect/disconnect, authentication and SFTP errors
+  (e.g. permission denied), upload/download/rename results, tail failures.
+  Keeps the last 1000 entries; auto-scrolls to the newest.
 - **Remote terminal** (right pane) — real PTY shell (`xterm-256color`) rendered on a
   GPU canvas via `alacritty_terminal` grid + gpui text shaping. Full color support
   (16/256/truecolor), bold/dim/inverse/hidden attributes, block/beam/underline cursor.
@@ -33,8 +43,27 @@ same snappy text layout, same dark aesthetic.
   **⇩** to save it to `~/Downloads` (collision-safe). Live progress in the
   status bar. Uses gpui's cross-platform drop API, so the same code works on
   X11, macOS and Windows backends.
+- **Remote file moves** — drag a tree entry onto a directory row to move it there;
+  dropping on a file row or the tree background moves it into that directory or the
+  tree root. Moves run as SFTP renames; both affected directories refresh
+  afterwards.
 - **Auth methods** — password, key file (with optional passphrase), ssh-agent.
-- Zed-dark theme, monospace typography, ~60fps terminal repaints only when dirty.
+- Zed's default dark theme and Zed Sans/Mono typography, ~60fps terminal
+  repaints only when dirty.
+
+## Theme & fonts
+
+The UI colors are transcribed 1:1 from Zed's built-in default dark theme and
+its `terminal_ansi_*` palette (Zed is MIT-licensed; the values live in
+`src/main.rs` / `src/ui.rs` next to the code that uses them).
+
+Fonts are referenced by name — **Zed Sans** (UI) and **Zed Mono** (terminal) —
+and fall back to system fonts when not installed. Zed's fonts are licensed
+under the SIL Open Font License 1.1, which permits this use. They ship inside
+Zed itself, so for the exact Zed look copy the font files from a Zed
+installation (e.g. `Zed.app/Contents/Resources` on macOS) or install them
+system-wide. aetherium also loads every `.ttf`/`.otf`/`.ttc` found in
+`~/.config/aetherium/fonts/` on startup, so dropping the files there works too.
 
 ## Tech stack
 

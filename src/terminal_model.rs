@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -17,13 +18,31 @@ use parking_lot::Mutex;
 /// Channel used to push user/input bytes towards the SSH session thread.
 pub type PtyWriter = tokio::sync::mpsc::UnboundedSender<Vec<u8>>;
 
+/// Handle the UI registers on the model so the SSH reader thread can wake the
+/// repaint loop the moment new output arrives (instead of waiting for the
+/// next fixed-interval poll).
+type WakeSender = std_mpsc::Sender<()>;
+
 /// Proxy installed inside the `Term`; it receives terminal events (title
 /// changes, bells, OSC replies to write back to the PTY, ...) and marks the
 /// UI dirty so the next frame picks the change up.
 #[derive(Clone)]
 pub struct UiProxy {
     dirty: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<WakeSender>>>,
     pty_writer: Arc<Mutex<Option<PtyWriter>>>,
+}
+
+impl UiProxy {
+    fn set_dirty(&self) {
+        // Only wake when transitioning from clear to set; otherwise the
+        // repaint loop would get a wake per feed during a burst.
+        if !self.dirty.swap(true, Ordering::AcqRel) {
+            if let Some(wake) = self.wake.lock().as_ref() {
+                let _ = wake.send(());
+            }
+        }
+    }
 }
 
 impl EventListener for UiProxy {
@@ -34,7 +53,7 @@ impl EventListener for UiProxy {
                 let _ = writer.send(text.into_bytes());
             }
         }
-        self.dirty.store(true, Ordering::Release);
+        self.set_dirty();
     }
 }
 
@@ -47,6 +66,7 @@ impl EventListener for UiProxy {
 pub struct TerminalModel {
     pub term: Arc<FairMutex<Term<UiProxy>>>,
     dirty: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<WakeSender>>>,
     pty_writer: Arc<Mutex<Option<PtyWriter>>>,
     parser: Arc<Mutex<ansi::Processor>>,
 }
@@ -54,9 +74,11 @@ pub struct TerminalModel {
 impl TerminalModel {
     pub fn new(columns: usize, screen_lines: usize) -> Self {
         let dirty = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(Mutex::new(None));
         let pty_writer = Arc::new(Mutex::new(None));
         let proxy = UiProxy {
             dirty: dirty.clone(),
+            wake: wake.clone(),
             pty_writer: pty_writer.clone(),
         };
         let size = TermSize::new(columns.max(1), screen_lines.max(1));
@@ -64,9 +86,17 @@ impl TerminalModel {
         Self {
             term: Arc::new(FairMutex::new(term)),
             dirty,
+            wake,
             pty_writer,
             parser: Arc::new(Mutex::new(ansi::Processor::new())),
         }
+    }
+
+    /// Register (or clear) a wake channel that receives a notification every
+    /// time the terminal goes from clean to dirty. Called by the UI at tab
+    /// creation; `None` disables wakeups.
+    pub fn set_wake_channel(&self, wake: Option<WakeSender>) {
+        *self.wake.lock() = wake;
     }
 
     /// Feed raw bytes coming from the SSH channel into the terminal.
@@ -78,7 +108,16 @@ impl TerminalModel {
             let mut term = self.term.lock();
             self.parser.lock().advance(&mut *term, bytes);
         }
-        self.dirty.store(true, Ordering::Release);
+        self.set_dirty();
+    }
+
+    /// Set the dirty flag and wake the UI if it transitioned from clear.
+    fn set_dirty(&self) {
+        if !self.dirty.swap(true, Ordering::AcqRel) {
+            if let Some(wake) = self.wake.lock().as_ref() {
+                let _ = wake.send(());
+            }
+        }
     }
 
     /// Read and clear the dirty flag.
@@ -100,7 +139,7 @@ impl TerminalModel {
     /// Mark the UI dirty (e.g. after a display scroll that bypasses the
     /// terminal's own event stream).
     pub fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::Release);
+        self.set_dirty();
     }
 
     /// Reset to a blank terminal, preserving size and the PTY wiring. Used
@@ -111,13 +150,14 @@ impl TerminalModel {
             let size = TermSize::new(term.columns(), term.screen_lines());
             let proxy = UiProxy {
                 dirty: self.dirty.clone(),
+                wake: self.wake.clone(),
                 pty_writer: self.pty_writer.clone(),
             };
             *term = Term::new(Config::default(), &size, proxy);
         }
         // Drop any half-consumed escape sequence from the previous session.
         *self.parser.lock() = ansi::Processor::new();
-        self.dirty.store(true, Ordering::Release);
+        self.set_dirty();
     }
 
     /// Resize the grid; returns true if the size actually changed.
@@ -130,7 +170,7 @@ impl TerminalModel {
         }
         term.resize(TermSize::new(columns, screen_lines));
         drop(term);
-        self.dirty.store(true, Ordering::Release);
+        self.set_dirty();
         true
     }
 

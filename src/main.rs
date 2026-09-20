@@ -15,58 +15,73 @@ mod text_field;
 mod ui;
 
 /// Zed-like dark theme constants.
+///
+/// All colors are transcribed from Zed's built-in default dark theme
+/// (`fallback_themes.rs` in zed's `theme` crate, MIT-licensed).
 pub(crate) mod theme {
-    use gpui::{Hsla, rgb};
+    use gpui::{Hsla, hsla};
 
-    /// Monospace font family; the platform font database falls back to the
-    /// system mono font when Zed Plex Mono is not installed.
-    pub const FONT_MONO: &str = "Zed Plex Mono";
+    /// UI font family; matches Zed's default. Falls back to the system UI
+    /// font when Zed's fonts are not installed — drop the OFL-licensed
+    /// `Zed Sans`/`Zed Mono` files into `~/.config/aetherium/fonts/` to make
+    /// the app use them without a system-wide install.
+    pub const FONT_UI: &str = "Zed Sans";
+    /// Monospace font family for the terminal; matches Zed's default.
+    pub const FONT_MONO: &str = "Zed Mono";
 
-    /// Window / terminal-area background.
+    /// Window / terminal background (`background`).
     pub fn bg() -> Hsla {
-        rgb(0x1e1e20).into()
+        hsla(215. / 360., 0.12, 0.15, 1.)
     }
-    /// Panels (header, sidebar, status bar).
+    /// Panels (header, sidebar, status bar) — `panel_background`.
     pub fn panel() -> Hsla {
-        rgb(0x28292d).into()
+        hsla(215. / 360., 0.12, 0.15, 1.)
     }
-    /// Borders between panels.
+    /// Borders between panels (`border_variant`).
     pub fn border() -> Hsla {
-        rgb(0x3a3b40).into()
+        hsla(228. / 360., 0.08, 0.25, 1.)
     }
-    /// Primary text.
+    /// Primary text (`text`).
     pub fn text() -> Hsla {
-        rgb(0xd7d8da).into()
+        hsla(221. / 360., 0.11, 0.86, 1.)
     }
-    /// Secondary text.
+    /// Secondary text (`text_muted`).
     pub fn text_dim() -> Hsla {
-        rgb(0x8b8d94).into()
+        hsla(218. / 360., 0.07, 0.46, 1.)
     }
-    /// Muted blue accent (selection, cursor, brand).
+    /// Accent blue (`icon_accent`).
     pub fn accent() -> Hsla {
-        rgb(0x4876d6).into()
+        hsla(207.8 / 360., 0.81, 0.66, 1.)
     }
-    /// Selected list-row background.
+    /// Selected list-row background (`element_selected`).
     pub fn selection() -> Hsla {
-        rgb(0x33415e).into()
+        hsla(224. / 360., 0.113, 0.261, 1.)
     }
-    /// Hover highlight.
+    /// Hover highlight (`element_hover`).
     pub fn hover() -> Hsla {
-        rgb(0x32343a).into()
+        hsla(225. / 360., 0.118, 0.267, 1.)
     }
-    /// Buttons.
+    /// Drop-target highlight while dragging over the file tree
+    /// (`drop_target_background`).
+    pub fn drop_target() -> Hsla {
+        hsla(220. / 360., 0.083, 0.214, 1.)
+    }
+    /// Buttons (`element_background`).
     pub fn button() -> Hsla {
-        rgb(0x3a3b40).into()
+        hsla(223. / 360., 0.13, 0.21, 1.)
     }
     pub fn button_hover() -> Hsla {
-        rgb(0x4a4b52).into()
+        hsla(225. / 360., 0.118, 0.267, 1.)
     }
-    /// Status colors.
+    /// Status colors (the accent hues of the default dark theme).
     pub fn success() -> Hsla {
-        rgb(0x6fbf73).into()
+        hsla(95. / 360., 0.38, 0.62, 1.)
     }
     pub fn warning() -> Hsla {
-        rgb(0xd8a657).into()
+        hsla(39. / 360., 0.67, 0.69, 1.)
+    }
+    pub fn danger() -> Hsla {
+        hsla(355. / 360., 0.65, 0.65, 1.)
     }
 }
 
@@ -80,6 +95,8 @@ fn main() {
     Application::new()
         .with_assets(assets::EmbeddedAssets)
         .run(|cx: &mut App| {
+        // Optional user fonts (e.g. Zed Sans/Mono) from the config dir.
+        assets::load_user_fonts(cx);
         // Key bindings for the text fields (profile form).
         cx.bind_keys([
             KeyBinding::new("backspace", text_field::Backspace, Some("TextField")),
