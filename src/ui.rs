@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -11,10 +10,11 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::{
-    App, Bounds, Context, CursorStyle, DragMoveEvent, Entity, ExternalPaths, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle,
-    ScrollWheelEvent, ShapedLine, SharedString, TextRun, Transformation, UnderlineStyle, Window,
-    canvas, div, fill, font, point, prelude::*, px, radians, rgb, rgba, size, svg,
+    App, Bounds, Context, CursorStyle, DragMoveEvent, Entity, ExternalDragPayload, ExternalPaths,
+    FileDragPaths, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    Point, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextRun, Transformation,
+    UnderlineStyle, Window, canvas, div, fill, font, point, prelude::*, px, radians, rgb, rgba,
+    size, svg,
 };
 use parking_lot::Mutex;
 
@@ -24,7 +24,7 @@ use crate::profiles::{AuthMethod, Profile, ProfileStore};
 use crate::recents::{RecentEntry, RecentStore, now_unix, relative_time};
 use crate::session::{Command as SessionCommand, Event as SessionEvent, FileEntry, SessionHandle};
 use crate::terminal_model::TerminalModel;
-use crate::text_field::TextField;
+use crate::text_field::{Backtab, Tab, TextField};
 use crate::theme;
 
 const TERMINAL_FONT_SIZE: f32 = 13.0;
@@ -346,13 +346,19 @@ pub struct RootView {
     /// Wake channel shared by all tab terminals: when any terminal becomes
     /// dirty, the SSH reader thread sends on this to wake the repaint loop
     /// immediately instead of waiting for a fixed poll tick.
-    terminal_wake_tx: std_mpsc::Sender<()>,
+    terminal_wake_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Cache of remote→local temp paths for drag-out. Populated by
+    /// `SessionEvent::TempDownloadReady` after a background SFTP download.
+    /// Wrapped in `Arc<Mutex>` because the `external_drag_payload` closure
+    /// needs to read it without holding `&mut self`.
+    temp_download_cache: Arc<Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
     focus_handle: FocusHandle,
 }
 
 impl RootView {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let (terminal_wake_tx, terminal_wake_rx) = std_mpsc::channel::<()>();
+        let (terminal_wake_tx, terminal_wake_rx) =
+            tokio::sync::mpsc::unbounded_channel::<()>();
         let view = Self {
             store: ProfileStore::load(),
             selected: None,
@@ -372,6 +378,7 @@ impl RootView {
             log_scroll: ScrollHandle::default(),
             logs_scroll_pending: false,
             terminal_wake_tx,
+            temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             focus_handle: cx.focus_handle(),
         };
         view.spawn_repaint_loop(cx, terminal_wake_rx);
@@ -401,14 +408,20 @@ impl RootView {
     /// fallback for periodic bookkeeping (geometry/resize sync) and to catch
     /// any wake we might have missed. Terminal output wakes instantly, so
     /// typing echoes with no polling delay.
-    fn spawn_repaint_loop(&self, cx: &mut Context<Self>, wake_rx: std_mpsc::Receiver<()>) {
+    fn spawn_repaint_loop(
+        &self,
+        cx: &mut Context<Self>,
+        mut wake_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
         cx.spawn(async move |this, cx| {
             loop {
                 // Wait for a terminal wake or the 16ms fallback tick, whichever
                 // comes first.
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                let tick = cx.background_executor().timer(Duration::from_millis(16));
+                tokio::select! {
+                    _ = tick => {}
+                    _ = wake_rx.recv() => {}
+                }
                 // Drain any pending wake signals so a burst of output doesn't
                 // queue up extra repaints.
                 while wake_rx.try_recv().is_ok() {}
@@ -617,6 +630,10 @@ impl RootView {
                 tab.connecting_profile = None;
                 self.tree_drag_target = None;
                 self.tree_dragging = None;
+                self.temp_download_cache.lock().retain(|_, local| {
+                    // Clean up temp files for this session's downloads.
+                    !local.starts_with(std::env::temp_dir().join("aetherium"))
+                });
                 // Drop the old session's output; focus stays on the sidebar.
                 tab.terminal.reset();
                 // The tail channels die with the connection; mark the log
@@ -631,6 +648,9 @@ impl RootView {
                 }
                 let tab_label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Warn, format!("{tab_label}: disconnected"));
+            }
+            SessionEvent::TempDownloadReady { remote, local } => {
+                self.temp_download_cache.lock().insert(remote, local);
             }
             SessionEvent::TailEnded { tab_id } => {
                 self.end_log_tab(tab_id, "tail ended");
@@ -972,7 +992,7 @@ impl RootView {
     fn focus_first_form_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(form) = self.form.as_ref() {
             let handle = form.name.read(cx).focus_handle(cx);
-            window.focus(&handle);
+            window.focus(&handle, cx);
         }
     }
 
@@ -1029,6 +1049,39 @@ impl RootView {
     fn cancel_form(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         cx.notify();
+    }
+
+    /// Move focus to the next/previous text field of the open profile form
+    /// (Tab / Shift+Tab), following the visual row order and wrapping around
+    /// at both ends.
+    fn form_tab(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let mut fields = vec![
+            form.name.clone(),
+            form.host.clone(),
+            form.port.clone(),
+            form.username.clone(),
+        ];
+        match form.auth_kind {
+            AuthKind::Password => fields.push(form.password.clone()),
+            AuthKind::KeyFile => {
+                fields.push(form.key_path.clone());
+                fields.push(form.passphrase.clone());
+            }
+            AuthKind::Agent => {}
+        }
+        let current = fields
+            .iter()
+            .position(|field| field.focus_handle(cx).is_focused(window));
+        let next = match current {
+            Some(index) if backwards => (index + fields.len() - 1) % fields.len(),
+            Some(index) => (index + 1) % fields.len(),
+            None => 0,
+        };
+        let focus_handle = fields[next].focus_handle(cx);
+        window.focus(&focus_handle, cx);
     }
 
     fn on_terminal_key_down(
@@ -1735,7 +1788,7 @@ impl RootView {
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                 if let Some(tab) = this.active_tab() {
-                    window.focus(&tab.focus_handle);
+                    window.focus(&tab.focus_handle, cx);
                 }
                 cx.notify();
             }))
@@ -1771,7 +1824,7 @@ impl RootView {
                         }
                         for (origin, line) in prepaint.lines {
                             let line_height = prepaint_line_height();
-                            let _ = line.paint(origin, line_height, window, cx);
+                            let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
                         }
                         if let Some(cursor) = prepaint.cursor {
                             window.paint_quad(cursor);
@@ -2588,12 +2641,16 @@ impl RootView {
                     .into_any_element(),
             );
         } else {
+            let tab = self.active_tab();
             render_tree_rows(
                 tree,
                 0,
                 tree_selection.as_ref(),
                 drag_highlight.as_ref(),
                 self.show_file_details,
+                tab.and_then(|t| t.session.as_ref()),
+                tab.map(|t| t.session_id).unwrap_or(0),
+                self.temp_download_cache.clone(),
                 cx,
                 &mut rows,
             );
@@ -2716,6 +2773,14 @@ impl RootView {
             .flex()
             .flex_col()
             .gap_2()
+            // Tab / Shift+Tab move focus between the form's text fields; the
+            // actions bubble up here from whichever field is focused.
+            .on_action(cx.listener(|this, _: &Tab, window, cx| {
+                this.form_tab(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Backtab, window, cx| {
+                this.form_tab(true, window, cx);
+            }))
             .child(
                 div()
                     .font_weight(gpui::FontWeight::BOLD)
@@ -2843,6 +2908,9 @@ fn render_tree_rows(
     selected: Option<&PathBuf>,
     drag_highlight: Option<&PathBuf>,
     show_details: bool,
+    session: Option<&SessionHandle>,
+    session_id: u64,
+    temp_download_cache: Arc<Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
     cx: &mut Context<RootView>,
     rows: &mut Vec<gpui::AnyElement>,
 ) {
@@ -2855,6 +2923,7 @@ fn render_tree_rows(
         let drag_move_path = path.clone();
         let external_drop_path = path.clone();
         let tree_drop_path = path.clone();
+        let temp_download_cache = temp_download_cache.clone();
 
         rows.push(
             div()
@@ -2876,21 +2945,59 @@ fn render_tree_rows(
                     this.toggle_tree_node(path.clone(), cx);
                 }))
                 // Start dragging this entry; a small label follows the cursor
-                // (Zed's project-panel drag image).
+                // (Zed's project-panel drag image). Files also start a
+                // background temp download so drag-out can offer a real local
+                // path when the pointer leaves the window.
                 .on_drag(
                     DraggedEntry {
                         path: row_path.clone(),
                         is_dir,
                         name: node.entry.name.clone().into(),
                     },
-                    |drag, click_offset, _window, cx| {
-                        cx.new(|_| DraggedEntryView {
-                            name: drag.name.clone(),
-                            is_dir: drag.is_dir,
-                            click_offset,
-                        })
+                    {
+                        let remote_for_download = row_path.clone();
+                        let session_for_download = session.cloned();
+                        let session_id = session_id;
+                        move |drag, click_offset, _window, cx| {
+                            // Kick off a temp download in the background so
+                            // the file is (hopefully) ready by the time the
+                            // drag leaves the window.
+                            if !drag.is_dir {
+                                if let Some(session) = session_for_download.as_ref() {
+                                    session.download_to_temp(
+                                        session_id,
+                                        remote_for_download.clone(),
+                                    );
+                                }
+                            }
+                            cx.new(|_| DraggedEntryView {
+                                name: drag.name.clone(),
+                                is_dir: drag.is_dir,
+                                click_offset,
+                            })
+                        }
                     },
                 )
+                // When the drag leaves the window, offer the local temp path
+                // to the OS as a native file drag. Only works if the
+                // background download has already finished.
+                .external_drag_payload({
+                    let cache = temp_download_cache.clone();
+                    move |drag: &DraggedEntry, _window, _cx| {
+                        if drag.is_dir {
+                            return None;
+                        }
+                        cache
+                            .lock()
+                            .get(&drag.path)
+                            .map(|local| {
+                                ExternalDragPayload::Files(FileDragPaths::new([(
+                                    local.clone(),
+                                    false,
+                                )]))
+                            })
+                    }
+                })
                 .on_drag_move::<DraggedEntry>(cx.listener(
                     move |this, event: &DragMoveEvent<DraggedEntry>, window, cx| {
                         let is_current = matches!(
@@ -3011,7 +3118,18 @@ fn render_tree_rows(
         );
         if node.expanded {
             if let Some(children) = node.children.as_ref() {
-                render_tree_rows(children, depth + 1, selected, drag_highlight, show_details, cx, rows);
+                render_tree_rows(
+                    children,
+                    depth + 1,
+                    selected,
+                    drag_highlight,
+                    show_details,
+                    session,
+                    session_id,
+                    temp_download_cache,
+                    cx,
+                    rows,
+                );
             }
         }
     }
@@ -3038,7 +3156,7 @@ impl Render for RootView {
             if tab.terminal_focus_pending {
                 tab.terminal_focus_pending = false;
                 let focus_handle = tab.focus_handle.clone();
-                window.focus(&focus_handle);
+                window.focus(&focus_handle, cx);
             }
         }
         let mut root = div()

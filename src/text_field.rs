@@ -160,7 +160,7 @@ impl TextField {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.move_to(self.index_for_mouse_position(event.position), cx);
     }
 
@@ -489,8 +489,15 @@ impl Element for TextElement {
         );
 
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
 
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
@@ -532,8 +539,11 @@ impl Render for TextField {
     }
 }
 
-// Actions bound in `main.rs` under the "TextField" key context.
+// Actions bound in `main.rs` under the "TextField" key context. Tab/Backtab
+// move focus between the profile form's fields and are handled by the form
+// container (the fields themselves have no handler, so the actions bubble up
+// the dispatch path).
 gpui::actions!(
     text_field,
-    [Backspace, Delete, Left, Right, Home, End, Paste]
+    [Backspace, Delete, Left, Right, Home, End, Paste, Tab, Backtab]
 );

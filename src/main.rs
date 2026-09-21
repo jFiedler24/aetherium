@@ -86,13 +86,13 @@ pub(crate) mod theme {
 }
 
 use gpui::{
-    App, Application, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
+    App, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
 };
 
 use crate::ui::RootView;
 
 fn main() {
-    Application::new()
+    gpui_platform::application()
         .with_assets(assets::EmbeddedAssets)
         .run(|cx: &mut App| {
         // Optional user fonts (e.g. Zed Sans/Mono) from the config dir.
@@ -107,6 +107,8 @@ fn main() {
             KeyBinding::new("end", text_field::End, Some("TextField")),
             KeyBinding::new("ctrl-v", text_field::Paste, Some("TextField")),
             KeyBinding::new("cmd-v", text_field::Paste, Some("TextField")),
+            KeyBinding::new("tab", text_field::Tab, Some("TextField")),
+            KeyBinding::new("shift-tab", text_field::Backtab, Some("TextField")),
         ]);
 
         let bounds = Bounds {

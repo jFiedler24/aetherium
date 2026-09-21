@@ -18,6 +18,7 @@ use russh::keys::PrivateKeyWithHashAlg;
 use russh::{ChannelMsg, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 use crate::profiles::{AuthMethod, Profile};
 use crate::terminal_model::TerminalModel;
@@ -32,6 +33,10 @@ pub enum Command {
     Upload { session_id: u64, local: PathBuf, remote_dir: PathBuf },
     /// Download a remote file or directory (recursively) into ~/Downloads.
     Download { session_id: u64, remote: PathBuf },
+    /// Download a remote file to a temp directory for drag-out. The UI is
+    /// notified via `Event::TempDownloadReady` when the file is available
+    /// locally.
+    DownloadToTemp { session_id: u64, remote: PathBuf },
     /// Move/rename a remote entry (SFTP `rename`); used by file-tree
     /// drag-and-drop.
     Rename { session_id: u64, from: PathBuf, to: PathBuf },
@@ -66,6 +71,8 @@ pub enum Event {
     /// A drag-and-drop move finished; the UI refreshes the directories that
     /// lost or gained an entry.
     EntryMoved { from: PathBuf, to: PathBuf },
+    /// A remote file was downloaded to a local temp path for drag-out.
+    TempDownloadReady { remote: PathBuf, local: PathBuf },
     Error(String),
     Disconnected,
     /// The `tail -f` channel with the given tab id ended (file closed or the
@@ -152,6 +159,11 @@ impl SessionHandle {
 
     pub fn download(&self, session_id: u64, remote: PathBuf) {
         self.send(Command::Download { session_id, remote });
+    }
+
+    /// Download a remote file to a temp directory for drag-out.
+    pub fn download_to_temp(&self, session_id: u64, remote: PathBuf) {
+        self.send(Command::DownloadToTemp { session_id, remote });
     }
 
     pub fn rename(&self, session_id: u64, from: PathBuf, to: PathBuf) {
@@ -448,6 +460,14 @@ async fn command_loop(
                             download(&sftp, &event_tx, &remote).await;
                         });
                     }
+                    Some(Command::DownloadToTemp { session_id, remote }) => {
+                        let _ = session_id;
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            download_to_temp(&sftp, &event_tx, &remote).await;
+                        });
+                    }
                     Some(Command::Rename { session_id, from, to }) => {
                         // Like transfers, run off the session loop so the
                         // terminal keeps flowing while the server renames.
@@ -742,6 +762,107 @@ async fn download(
         Err(err) => {
             let _ = event_tx.send(Event::Error(format!(
                 "downloading {}: {err:#}",
+                remote.display()
+            )));
+        }
+    }
+}
+
+/// Download a remote file to the OS temp directory so it can be dragged out
+/// of the app. Only files are supported (directories are too slow to stage).
+async fn download_to_temp(
+    sftp: &russh_sftp::client::SftpSession,
+    event_tx: &std_mpsc::Sender<Event>,
+    remote: &std::path::Path,
+) {
+    let metadata = match sftp.metadata(remote.to_string_lossy().into_owned()).await {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            let _ = event_tx.send(Event::Error(format!(
+                "temp download: stating {}: {err}",
+                remote.display()
+            )));
+            return;
+        }
+    };
+    if metadata.is_dir() {
+        let _ = event_tx.send(Event::Error(
+            "temp download: directories are not supported".into(),
+        ));
+        return;
+    }
+
+    let name = remote
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    let temp_dir = std::env::temp_dir().join("aetherium");
+    if let Err(err) = std::fs::create_dir_all(&temp_dir) {
+        let _ = event_tx.send(Event::Error(format!(
+            "temp download: creating {}: {err}",
+            temp_dir.display()
+        )));
+        return;
+    }
+    // Unique subdirectory per file to avoid collisions.
+    let local_dir = temp_dir.join(Uuid::new_v4().to_string());
+    if let Err(err) = std::fs::create_dir_all(&local_dir) {
+        let _ = event_tx.send(Event::Error(format!(
+            "temp download: creating {}: {err}",
+            local_dir.display()
+        )));
+        return;
+    }
+    let local = local_dir.join(&name);
+
+    let label = format!("staging {}", remote.display());
+    let total = metadata.len();
+    let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
+    let mut progress = TransferProgress::new(event_tx, &label, total);
+
+    let result = async {
+        let mut local_file = std::fs::File::create(&local)
+            .with_context(|| format!("creating {}", local.display()))?;
+        let mut remote_file = sftp
+            .open(remote.to_string_lossy().into_owned())
+            .await
+            .with_context(|| format!("opening remote {}", remote.display()))?;
+        let mut buffer = vec![0u8; TRANSFER_CHUNK];
+        loop {
+            let read = remote_file
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("reading remote {}", remote.display()))?;
+            if read == 0 {
+                break;
+            }
+            use std::io::Write as _;
+            local_file
+                .write_all(&buffer[..read])
+                .with_context(|| format!("writing {}", local.display()))?;
+            progress.add(read as u64);
+        }
+        remote_file
+            .close()
+            .await
+            .with_context(|| format!("closing remote {}", remote.display()))?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            let _ = event_tx.send(Event::TransferDone {
+                label: format!("staged {}", name),
+            });
+            let _ = event_tx.send(Event::TempDownloadReady {
+                remote: remote.to_path_buf(),
+                local,
+            });
+        }
+        Err(err) => {
+            let _ = event_tx.send(Event::Error(format!(
+                "temp download {}: {err:#}",
                 remote.display()
             )));
         }

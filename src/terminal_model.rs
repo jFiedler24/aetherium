@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc as std_mpsc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -18,10 +17,11 @@ use parking_lot::Mutex;
 /// Channel used to push user/input bytes towards the SSH session thread.
 pub type PtyWriter = tokio::sync::mpsc::UnboundedSender<Vec<u8>>;
 
-/// Handle the UI registers on the model so the SSH reader thread can wake the
-/// repaint loop the moment new output arrives (instead of waiting for the
-/// next fixed-interval poll).
-type WakeSender = std_mpsc::Sender<()>;
+/// Async channel the UI registers on the model so the SSH reader thread can
+/// wake the repaint loop the moment new output arrives (instead of waiting
+/// for the next fixed-interval poll). Unbounded: `send` is synchronous and
+/// never blocks the reader thread.
+type WakeSender = tokio::sync::mpsc::UnboundedSender<()>;
 
 /// Proxy installed inside the `Term`; it receives terminal events (title
 /// changes, bells, OSC replies to write back to the PTY, ...) and marks the
