@@ -7,8 +7,8 @@ build = "build.rs"
 [dependencies]
 # x11 deps only compile on Linux, windows-manifest only acts on Windows,
 # so one feature set covers all three desktop platforms.
-gpui = { git = "https://github.com/zed-industries/zed.git", branch = "main", default-features = false, features = ["x11", "windows-manifest"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed.git", branch = "main" }
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "main", default-features = false, features = ["x11", "windows-manifest", "font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", branch = "main", features = ["font-kit", "x11"] }
 russh = "0.63.3"
 russh-sftp = "3.0.0"
 alacritty_terminal = "0.26.0"
@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 dirs = "7"
 anyhow = "1"
+log = "0.4"
 regex = "1"
 parking_lot = "0.12"
 aes-gcm = "0.10"

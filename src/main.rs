@@ -91,7 +91,25 @@ use gpui::{
 
 use crate::ui::RootView;
 
+/// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
+/// errors) are visible when running the binary directly.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        eprintln!("[{}] {}", record.level(), record.args());
+    }
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
+
 fn main() {
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
     gpui_platform::application()
         .with_assets(assets::EmbeddedAssets)
         .run(|cx: &mut App| {

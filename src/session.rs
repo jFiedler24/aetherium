@@ -72,7 +72,10 @@ pub enum Event {
     /// lost or gained an entry.
     EntryMoved { from: PathBuf, to: PathBuf },
     /// A remote file was downloaded to a local temp path for drag-out.
-    TempDownloadReady { remote: PathBuf, local: PathBuf },
+    /// Staging is silent: unlike real transfers it never emits
+    /// `TransferStarted`/`TransferProgress`/`TransferDone`, so it can't
+    /// disturb the shared transfer progress UI.
+    TempDownloadReady { session_id: u64, remote: PathBuf, local: PathBuf },
     Error(String),
     Disconnected,
     /// The `tail -f` channel with the given tab id ended (file closed or the
@@ -461,11 +464,10 @@ async fn command_loop(
                         });
                     }
                     Some(Command::DownloadToTemp { session_id, remote }) => {
-                        let _ = session_id;
                         let sftp = sftp.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            download_to_temp(&sftp, &event_tx, &remote).await;
+                            download_to_temp(&sftp, &event_tx, session_id, &remote).await;
                         });
                     }
                     Some(Command::Rename { session_id, from, to }) => {
@@ -773,6 +775,7 @@ async fn download(
 async fn download_to_temp(
     sftp: &russh_sftp::client::SftpSession,
     event_tx: &std_mpsc::Sender<Event>,
+    session_id: u64,
     remote: &std::path::Path,
 ) {
     let metadata = match sftp.metadata(remote.to_string_lossy().into_owned()).await {
@@ -815,11 +818,11 @@ async fn download_to_temp(
     }
     let local = local_dir.join(&name);
 
-    let label = format!("staging {}", remote.display());
-    let total = metadata.len();
-    let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
-    let mut progress = TransferProgress::new(event_tx, &label, total);
+    log::info!("drag-out: downloading {} → {}", remote.display(), local.display());
 
+    // Deliberately silent: staging must not touch the shared transfer
+    // progress UI (a drag is not a user-requested transfer). Failures still
+    // surface through Event::Error.
     let result = async {
         let mut local_file = std::fs::File::create(&local)
             .with_context(|| format!("creating {}", local.display()))?;
@@ -840,7 +843,6 @@ async fn download_to_temp(
             local_file
                 .write_all(&buffer[..read])
                 .with_context(|| format!("writing {}", local.display()))?;
-            progress.add(read as u64);
         }
         remote_file
             .close()
@@ -852,15 +854,16 @@ async fn download_to_temp(
 
     match result {
         Ok(()) => {
-            let _ = event_tx.send(Event::TransferDone {
-                label: format!("staged {}", name),
-            });
+            log::info!("drag-out: staged {} → {}", remote.display(), local.display());
             let _ = event_tx.send(Event::TempDownloadReady {
+                session_id,
                 remote: remote.to_path_buf(),
                 local,
             });
         }
         Err(err) => {
+            // Drop the partially staged file; nothing will ever reference it.
+            let _ = std::fs::remove_dir_all(&local_dir);
             let _ = event_tx.send(Event::Error(format!(
                 "temp download {}: {err:#}",
                 remote.display()

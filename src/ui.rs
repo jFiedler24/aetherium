@@ -347,11 +347,18 @@ pub struct RootView {
     /// dirty, the SSH reader thread sends on this to wake the repaint loop
     /// immediately instead of waiting for a fixed poll tick.
     terminal_wake_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    /// Cache of remote→local temp paths for drag-out. Populated by
-    /// `SessionEvent::TempDownloadReady` after a background SFTP download.
-    /// Wrapped in `Arc<Mutex>` because the `external_drag_payload` closure
-    /// needs to read it without holding `&mut self`.
-    temp_download_cache: Arc<Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
+    /// Cache of (session, remote path) → local temp path for drag-out.
+    /// Populated by `SessionEvent::TempDownloadReady` after a background SFTP
+    /// download. Wrapped in `Arc<Mutex>` because the `external_drag_payload`
+    /// closure needs to read it without holding `&mut self`. Entries are
+    /// deleted (and their files removed) when the drag ends inside the app,
+    /// when the session disconnects or its tab closes, and every staged file
+    /// is purged on the next app launch.
+    temp_download_cache: Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>,
+    /// (session, remote path) pairs staged via the context menu's
+    /// "Open in VS Code" entry: when the staging download finishes, the
+    /// local temp file is handed to VS Code.
+    pending_vscode_open: Vec<(u64, PathBuf)>,
     focus_handle: FocusHandle,
 }
 
@@ -359,9 +366,12 @@ impl RootView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (terminal_wake_tx, terminal_wake_rx) =
             tokio::sync::mpsc::unbounded_channel::<()>();
+        let store = ProfileStore::load();
+        // Pre-select the first profile so Connect works with one click.
+        let selected = (!store.profiles.is_empty()).then_some(0);
         let view = Self {
-            store: ProfileStore::load(),
-            selected: None,
+            store,
+            selected,
             form: None,
             recents: RecentStore::load(),
             status: "not connected".to_string(),
@@ -379,8 +389,12 @@ impl RootView {
             logs_scroll_pending: false,
             terminal_wake_tx,
             temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_vscode_open: Vec::new(),
             focus_handle: cx.focus_handle(),
         };
+        // Purge staging leftovers from previous runs (drag-out cancels,
+        // interrupted transfers). The directory is private to this app.
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aetherium"));
         view.spawn_repaint_loop(cx, terminal_wake_rx);
         view.spawn_event_loop(cx);
         view
@@ -534,6 +548,7 @@ impl RootView {
                     LogLevel::Info,
                     format!("{label}: connected (home: {})", home_dir.display()),
                 );
+                log::info!("connect: {label} connected (home: {})", home_dir.display());
             }
             SessionEvent::DirListing { session_id, path, entries } => {
                 let tab = &mut self.tabs[index];
@@ -616,9 +631,11 @@ impl RootView {
                 }
                 let tab_label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Error, format!("{tab_label}: {message}"));
+                log::warn!("session: {tab_label}: {message}");
             }
             SessionEvent::Disconnected => {
                 let tab_id = self.tabs[index].id;
+                let session_id = self.tabs[index].session_id;
                 let tab = &mut self.tabs[index];
                 tab.state = ConnState::Disconnected;
                 tab.status = "disconnected".to_string();
@@ -630,12 +647,11 @@ impl RootView {
                 tab.connecting_profile = None;
                 self.tree_drag_target = None;
                 self.tree_dragging = None;
-                self.temp_download_cache.lock().retain(|_, local| {
-                    // Clean up temp files for this session's downloads.
-                    !local.starts_with(std::env::temp_dir().join("aetherium"))
-                });
                 // Drop the old session's output; focus stays on the sidebar.
                 tab.terminal.reset();
+                // Drag-out staging for this session is useless now; delete
+                // the staged files (uuid dirs under the temp area).
+                self.purge_staged_for(session_id);
                 // The tail channels die with the connection; mark the log
                 // tabs that rode on it.
                 for child in &mut self.tabs {
@@ -648,9 +664,39 @@ impl RootView {
                 }
                 let tab_label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Warn, format!("{tab_label}: disconnected"));
+                log::info!("session: {tab_label} disconnected");
             }
-            SessionEvent::TempDownloadReady { remote, local } => {
-                self.temp_download_cache.lock().insert(remote, local);
+            SessionEvent::TempDownloadReady {
+                session_id,
+                remote,
+                local,
+            } => {
+                let mut cache = self.temp_download_cache.lock();
+                if let Some(old) = cache.insert((session_id, remote.clone()), local.clone()) {
+                    // Superseded staging of the same file: drop the old copy.
+                    if let Some(dir) = old.parent() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+                drop(cache);
+                log::info!("drag-out: staged {} (session {session_id})", remote.display());
+                self.tabs[index].status = format!("staged {} for drag-out", remote.display());
+                // A "Open in VS Code" request is satisfied by the same
+                // staging download.
+                let key = (session_id, remote.clone());
+                if self.pending_vscode_open.contains(&key) {
+                    self.pending_vscode_open.retain(|pending| *pending != key);
+                    match Self::launch_vscode(&local) {
+                        Ok(()) => {
+                            self.tabs[index].status =
+                                format!("opened {} in VS Code", remote.display());
+                        }
+                        Err(err) => {
+                            log::warn!("vscode: {err:#}");
+                            self.tabs[index].status = format!("VS Code: {err:#}");
+                        }
+                    }
+                }
             }
             SessionEvent::TailEnded { tab_id } => {
                 self.end_log_tab(tab_id, "tail ended");
@@ -678,12 +724,19 @@ impl RootView {
     // --- actions -----------------------------------------------------------
 
     fn connect_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.profiles.is_empty() {
+            // Nothing to connect to yet — offer the profile form instead of
+            // an easy-to-miss status message.
+            self.open_new_profile_form(window, cx);
+            return;
+        }
         let Some(profile) = self.selected.and_then(|i| self.store.profiles.get(i)).cloned()
         else {
             self.status = "select a profile first".into();
             cx.notify();
             return;
         };
+        log::info!("connect: connecting to {}", profile.summary());
         self.connect_profile(profile, window, cx);
     }
 
@@ -695,6 +748,7 @@ impl RootView {
             let editing = self.store.profiles.iter().position(|p| {
                 p.host == profile.host && p.port == profile.port && p.username == profile.username
             });
+            log::info!("connect: {} needs credentials, opening the form", profile.summary());
             self.status = format!("enter credentials for {}", profile.summary());
             self.form = Some(ProfileForm::from_profile(editing, &profile, cx));
             self.focus_first_form_field(window, cx);
@@ -846,6 +900,11 @@ impl RootView {
                 }
             }
         }
+        if matches!(self.tabs[index].kind, TabKind::Shell) {
+            // The tab (and its event receiver) goes away, so no Disconnected
+            // event will arrive to clean up drag-out staging — do it here.
+            self.purge_staged_for(self.tabs[index].session_id);
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -957,6 +1016,48 @@ impl RootView {
             session.download(tab.session_id, remote);
         }
         cx.notify();
+    }
+
+    /// Stage a remote file locally and open the temp copy in VS Code.
+    /// (Remote editing with write-back is a separate, larger feature — this
+    /// opens a local snapshot.)
+    fn open_in_vscode(&mut self, remote: PathBuf, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        let connected = self
+            .active_tab()
+            .is_some_and(|tab| tab.state == ConnState::Connected);
+        if !connected {
+            self.status = "not connected".into();
+            cx.notify();
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let session = tab.session.clone();
+        let session_id = tab.session_id;
+        let key = (session_id, remote.clone());
+        if !self.pending_vscode_open.contains(&key) {
+            self.pending_vscode_open.push(key);
+        }
+        log::info!("vscode: staging {}", remote.display());
+        if let Some(session) = session {
+            session.download_to_temp(session_id, remote.clone());
+        }
+        self.status = format!("staging {} for VS Code…", remote.display());
+        cx.notify();
+    }
+
+    /// Launch VS Code on a local file (best effort; error if it's missing).
+    fn launch_vscode(local: &std::path::Path) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("open")
+            .args(["-a", "Visual Studio Code"])
+            .arg(local)
+            .spawn();
+        #[cfg(not(target_os = "macos"))]
+        let result = std::process::Command::new("code").arg(local).spawn();
+        result.map(|_| ()).map_err(|err| err.into())
     }
 
     /// Disconnect the active shell tab (the tab itself stays open).
@@ -1211,6 +1312,21 @@ impl RootView {
         }
     }
 
+    /// Delete all drag-out staging files cached for `session_id` (the uuid
+    /// temp dirs) and drop their cache entries.
+    fn purge_staged_for(&self, session_id: u64) {
+        self.temp_download_cache.lock().retain(|(sid, _), local| {
+            if *sid == session_id {
+                if let Some(dir) = local.parent() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Short label identifying a tab in log messages.
     fn tab_log_label(tab: &SessionTab) -> String {
         if let Some(profile) = tab.profile.as_ref() {
@@ -1247,11 +1363,19 @@ impl RootView {
         let root = self.active_tab()?.root_path.clone()?;
         let (hover, hover_is_dir) = match target {
             TreeDragTarget::Background => {
+                // Reject the same cases the drop itself rejects.
+                let into_own_subtree =
+                    dragged.is_dir && root.starts_with(dragged.path.as_path());
                 let already_at_root = dragged.path.parent() == Some(root.as_path());
-                return (!already_at_root).then_some(root);
+                return (!into_own_subtree && !already_at_root).then_some(root);
             }
             TreeDragTarget::Row { path, is_dir } => (path.clone(), *is_dir),
         };
+        // Don't advertise drops the move would reject: a directory can't be
+        // dropped onto itself or into its own subtree.
+        if dragged.is_dir && hover.starts_with(dragged.path.as_path()) {
+            return None;
+        }
         let dragged_parent = dragged.path.parent();
         if dragged_parent == Some(hover.as_path()) {
             return None;
@@ -1276,6 +1400,18 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         self.clear_tree_drag(cx);
+        // The drag ended inside the app, so the staged temp copy (files are
+        // pre-downloaded for drag-out when a drag starts) is dead weight.
+        if !dragged.is_dir {
+            if let Some(tab) = self.active_tab() {
+                let key = (tab.session_id, dragged.path.clone());
+                if let Some(local) = self.temp_download_cache.lock().remove(&key) {
+                    if let Some(dir) = local.parent() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+            }
+        }
         let connected = self
             .active_tab()
             .is_some_and(|tab| tab.state == ConnState::Connected);
@@ -2910,7 +3046,7 @@ fn render_tree_rows(
     show_details: bool,
     session: Option<&SessionHandle>,
     session_id: u64,
-    temp_download_cache: Arc<Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
+    temp_download_cache: Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>,
     cx: &mut Context<RootView>,
     rows: &mut Vec<gpui::AnyElement>,
 ) {
@@ -2964,6 +3100,10 @@ fn render_tree_rows(
                             // drag leaves the window.
                             if !drag.is_dir {
                                 if let Some(session) = session_for_download.as_ref() {
+                                    log::info!(
+                                        "drag-out: staging {} for session {session_id}",
+                                        remote_for_download.display()
+                                    );
                                     session.download_to_temp(
                                         session_id,
                                         remote_for_download.clone(),
@@ -2983,19 +3123,38 @@ fn render_tree_rows(
                 // background download has already finished.
                 .external_drag_payload({
                     let cache = temp_download_cache.clone();
-                    move |drag: &DraggedEntry, _window, _cx| {
+                    let weak_root = cx.weak_entity();
+                    move |drag: &DraggedEntry, _window, cx| {
                         if drag.is_dir {
                             return None;
                         }
-                        cache
+                        let payload = cache
                             .lock()
-                            .get(&drag.path)
+                            .get(&(session_id, drag.path.clone()))
                             .map(|local| {
                                 ExternalDragPayload::Files(FileDragPaths::new([(
                                     local.clone(),
                                     false,
                                 )]))
-                            })
+                            });
+                        log::info!(
+                            "drag-out: resolve {} (session {session_id}) → {}",
+                            drag.path.display(),
+                            if payload.is_some() { "hit" } else { "miss" }
+                        );
+                        if payload.is_none() {
+                            // The pointer left the window before the staging
+                            // download finished. gpui resolves the payload
+                            // only once, so a retry is the only recourse —
+                            // say so instead of failing silently.
+                            let name = drag.name.to_string();
+                            let _ = weak_root.update(cx, |this, cx| {
+                                this.status =
+                                    format!("still staging {name} — retry the drag in a moment");
+                                cx.notify();
+                            });
+                        }
+                        payload
                     }
                 })
                 .on_drag_move::<DraggedEntry>(cx.listener(
@@ -3191,6 +3350,9 @@ impl Render for RootView {
         // Right-click context menu from the file tree, painted above
         // everything else: a transparent layer to dismiss, then the menu.
         if let Some((position, path)) = self.context_menu.clone() {
+            // The tail -f closure captures `path` by move; the other items
+            // get their own clone.
+            let vscode_path = path.clone();
             root = root
                 .child(
                     div()
@@ -3242,6 +3404,37 @@ impl Render for RootView {
                                 ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_log_tab(path.clone(), cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("context-menu-download")
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::text())
+                                .hover(|item| item.bg(theme::selection()))
+                                .child("Download")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.context_menu = None;
+                                    this.download_selected(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("context-menu-vscode")
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::text())
+                                .hover(|item| item.bg(theme::selection()))
+                                .child("Open in VS Code")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_in_vscode(vscode_path.clone(), cx);
                                 })),
                         ),
                 );
