@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Direction, Line, Point};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::term::test::TermSize;
@@ -69,6 +71,9 @@ pub struct TerminalModel {
     wake: Arc<Mutex<Option<WakeSender>>>,
     pty_writer: Arc<Mutex<Option<PtyWriter>>>,
     parser: Arc<Mutex<ansi::Processor>>,
+    /// Keystrokes echoed into the grid ahead of the server; the matching
+    /// server echo is dropped in `feed` so input never appears twice.
+    pending_echo: Arc<Mutex<Vec<u8>>>,
 }
 
 impl TerminalModel {
@@ -89,6 +94,7 @@ impl TerminalModel {
             wake,
             pty_writer,
             parser: Arc::new(Mutex::new(ansi::Processor::new())),
+            pending_echo: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -104,7 +110,53 @@ impl TerminalModel {
         if bytes.is_empty() {
             return;
         }
+        // Drop the prefix the server is echoing back of locally echoed
+        // keystrokes — those bytes are already on screen.
+        let unconfirmed = {
+            let mut pending = self.pending_echo.lock();
+            let mut skip = 0;
+            while skip < bytes.len() && skip < pending.len() && bytes[skip] == pending[skip] {
+                skip += 1;
+            }
+            pending.drain(..skip);
+            bytes.len() - skip
+        };
+        if unconfirmed == 0 {
+            return;
+        }
         {
+            let mut term = self.term.lock();
+            self.parser
+                .lock()
+                .advance(&mut *term, &bytes[bytes.len() - unconfirmed..]);
+        }
+        self.set_dirty();
+    }
+
+    /// Whether the server is expected to echo these keystrokes back verbatim:
+    /// printable ASCII only. Escape sequences and control keys are consumed
+    /// by the remote application, which often doesn't echo them at all.
+    fn is_echoable_input(bytes: &[u8]) -> bool {
+        !bytes.is_empty() && bytes.iter().all(|byte| (0x20..=0x7e).contains(byte))
+    }
+
+    /// Echo printable keystrokes into the grid immediately so typing feels
+    /// instant even on high-latency links; the server's identical echo is
+    /// deduplicated on arrival in `feed`. Primary screen only — full-screen
+    /// applications manage their own display and usually don't echo input.
+    pub fn echo_input(&self, bytes: &[u8]) {
+        if !Self::is_echoable_input(bytes) {
+            return;
+        }
+        {
+            let mut pending = self.pending_echo.lock();
+            if pending.len() + bytes.len() > 1024 {
+                // No matching echo is arriving (e.g. a password prompt with
+                // the remote echo disabled) — stop tracking before this
+                // grows without bound.
+                pending.clear();
+            }
+            pending.extend_from_slice(bytes);
             let mut term = self.term.lock();
             self.parser.lock().advance(&mut *term, bytes);
         }
@@ -157,6 +209,7 @@ impl TerminalModel {
         }
         // Drop any half-consumed escape sequence from the previous session.
         *self.parser.lock() = ansi::Processor::new();
+        self.pending_echo.lock().clear();
         self.set_dirty();
     }
 
@@ -172,6 +225,57 @@ impl TerminalModel {
         drop(term);
         self.set_dirty();
         true
+    }
+
+    /// Begin a mouse selection at a grid point. Alacritty's point space:
+    /// line 0 is the *bottom* visible row, negative lines are scrollback,
+    /// so callers convert a row-from-top with `row - display_offset`.
+    /// `side` is which half of the cell the cursor sits in (it decides
+    /// whether the boundary cell is included).
+    pub fn selection_start(&self, line: i32, col: usize, side: Direction) {
+        let mut term = self.term.lock();
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(line), Column(col)),
+            side,
+        ));
+        self.set_dirty();
+    }
+
+    /// Extend the active selection to a grid point (mouse drag).
+    pub fn selection_update(&self, line: i32, col: usize, side: Direction) {
+        let mut term = self.term.lock();
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(Point::new(Line(line), Column(col)), side);
+        }
+        self.set_dirty();
+    }
+
+    /// End the active selection: a click without a drag selects nothing.
+    pub fn selection_end(&self) {
+        let mut term = self.term.lock();
+        if term.selection.as_ref().is_some_and(|selection| selection.is_empty()) {
+            term.selection = None;
+        }
+        self.set_dirty();
+    }
+
+    /// Whether a (possibly still-empty, in-progress) selection exists; used
+    /// to decide if a drag should extend it.
+    pub fn has_selection(&self) -> bool {
+        self.term.lock().selection.is_some()
+    }
+
+    /// The selected text, if any: lines joined with newlines, trailing
+    /// whitespace on each line trimmed by alacritty.
+    pub fn selected_text(&self) -> Option<String> {
+        let term = self.term.lock();
+        let text = term.selection_to_string()?;
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     pub fn columns(&self) -> usize {
@@ -347,6 +451,38 @@ mod tests {
             to_bytes(&plain("é", Some("é"))),
             Some("é".as_bytes().to_vec())
         );
+    }
+
+    /// Extract a screen line's text the way the renderer does.
+    fn visible_line(model: &TerminalModel, line: i32) -> String {
+        let term = model.term.lock();
+        let mut text = String::new();
+        for indexed in term.renderable_content().display_iter {
+            if indexed.point.line.0 == line {
+                text.push(indexed.cell.c);
+            }
+        }
+        text.trim_end().to_string()
+    }
+
+    #[test]
+    fn local_echo_dedupes_server_echo() {
+        let model = TerminalModel::new(80, 24);
+        // The server's identical echo is dropped: the text shows once.
+        model.echo_input(b"abc");
+        model.feed(b"abc");
+        assert_eq!(visible_line(&model, 0), "abc");
+        // A partial echo match strips only what arrived; the rest stays
+        // pending and is not printed again.
+        model.echo_input(b"xy");
+        model.feed(b"x");
+        assert_eq!(visible_line(&model, 0), "abcxy");
+        // Data that is not an echo at all renders as-is.
+        model.feed(b"Z>");
+        assert_eq!(visible_line(&model, 0), "abcxyZ>");
+        // Control sequences are never locally echoed.
+        model.echo_input(b"\x1b[A");
+        assert_eq!(model.pending_echo.lock().len(), 1);
     }
 
     #[test]
@@ -542,5 +678,79 @@ mod tests {
         assert!(model.resize(0, 0));
         assert_eq!(model.columns(), 1);
         assert_eq!(model.screen_lines(), 1);
+    }
+
+    #[test]
+    fn selection_extracts_multiline_text() {
+        let model = TerminalModel::new(80, 24);
+        model.feed(b"first line\r\nsecond line\r\nthird line");
+        // Rows from top: 0="first line", 1="second line", 2="third line".
+        // Unscrolled, grid line == row from top (bottom-origin space is
+        // shifted by -display_offset only when the view is scrolled).
+        model.selection_start(0, 0, Direction::Left);
+        model.selection_update(1, 5, Direction::Left);
+        let text = model.selected_text().expect("selection extracts");
+        assert!(text.contains("first line"), "got {text:?}");
+        // Ends where it was dragged: the second line is cut at column 5.
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "first line");
+        assert_eq!(lines[1], "secon", "got {text:?}");
+        // A head sitting in the right half of the end cell includes it.
+        model.selection_update(1, 5, Direction::Right);
+        let text = model.selected_text().expect("selection extracts");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "second", "got {text:?}");
+        // Dragging above the anchor crosses it: the range normalizes and the
+        // selection expands upward from the anchor instead of shrinking. The
+        // head's side cuts the boundary: Right half of the 'r' cell leaves
+        // 'r' out (cut after the cell), Left half includes it.
+        model.selection_start(1, 5, Direction::Left);
+        model.selection_update(0, 2, Direction::Right);
+        let text = model.selected_text().expect("selection extracts");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "st line", "got {text:?}");
+        assert_eq!(lines[1], "secon", "got {text:?}");
+        model.selection_update(0, 2, Direction::Left);
+        let text = model.selected_text().expect("selection extracts");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "rst line", "got {text:?}");
+    }
+
+    #[test]
+    fn selection_survives_scrolling_the_view() {
+        use alacritty_terminal::grid::Scroll;
+        let model = TerminalModel::new(10, 4);
+        model.feed(b"aaa\r\nbbb\r\nccc\r\nddd\r\neee\r\nfff");
+        // Row 2 from the top is "eee" (visible rows: ccc ddd eee fff).
+        model.selection_start(2, 0, Direction::Left);
+        model.selection_update(2, 2, Direction::Right);
+        assert_eq!(model.selected_text().as_deref(), Some("eee"));
+        // Scroll the view up: the selection must stay anchored to the same
+        // content (alacritty rotates it), not stick to the viewport row.
+        model.term.lock().scroll_display(Scroll::Delta(2));
+        assert_eq!(model.selected_text().as_deref(), Some("eee"));
+        // And after scrolling back down it is still the same text.
+        model.term.lock().scroll_display(Scroll::Delta(-2));
+        assert_eq!(model.selected_text().as_deref(), Some("eee"));
+    }
+
+    #[test]
+    fn click_without_drag_selects_nothing() {
+        let model = TerminalModel::new(80, 24);
+        model.feed(b"hello");
+        model.selection_start(0, 1, Direction::Left);
+        assert!(model.has_selection());
+        model.selection_end();
+        assert!(!model.has_selection());
+        assert_eq!(model.selected_text(), None);
+    }
+
+    #[test]
+    fn whitespace_only_selection_copies_nothing() {
+        let model = TerminalModel::new(80, 24);
+        model.feed(b"ab");
+        model.selection_start(0, 5, Direction::Left);
+        model.selection_update(0, 9, Direction::Left);
+        assert_eq!(model.selected_text(), None);
     }
 }

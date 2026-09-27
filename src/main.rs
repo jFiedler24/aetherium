@@ -53,6 +53,10 @@ pub(crate) mod theme {
     pub fn accent() -> Hsla {
         hsla(207.8 / 360., 0.81, 0.66, 1.)
     }
+    /// Terminal/editor cursor (`players.local.cursor` of Zed's default dark).
+    pub fn cursor() -> Hsla {
+        hsla(216. / 360., 0.71, 0.53, 1.)
+    }
     /// Selected list-row background (`element_selected`).
     pub fn selection() -> Hsla {
         hsla(224. / 360., 0.113, 0.261, 1.)
@@ -89,7 +93,7 @@ use gpui::{
     App, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
 };
 
-use crate::ui::RootView;
+use crate::ui::{CancelDelete, ConfirmDelete, DeleteEntry, RootView};
 
 /// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
 /// errors) are visible when running the binary directly.
@@ -127,6 +131,15 @@ fn main() {
             KeyBinding::new("cmd-v", text_field::Paste, Some("TextField")),
             KeyBinding::new("tab", text_field::Tab, Some("TextField")),
             KeyBinding::new("shift-tab", text_field::Backtab, Some("TextField")),
+        ]);
+        // File-tree shortcuts: Delete/Backspace ask to delete the selected
+        // entry; while the confirmation dialog is up, Enter confirms and
+        // Escape cancels.
+        cx.bind_keys([
+            KeyBinding::new("delete", DeleteEntry, Some("FileTree")),
+            KeyBinding::new("backspace", DeleteEntry, Some("FileTree")),
+            KeyBinding::new("enter", ConfirmDelete, Some("FileTree")),
+            KeyBinding::new("escape", CancelDelete, Some("FileTree")),
         ]);
 
         let bounds = Bounds {

@@ -40,6 +40,9 @@ pub enum Command {
     /// Move/rename a remote entry (SFTP `rename`); used by file-tree
     /// drag-and-drop.
     Rename { session_id: u64, from: PathBuf, to: PathBuf },
+    /// Permanently delete a remote entry. Directories are deleted
+    /// recursively (children first); there is no trash over SFTP.
+    Delete { session_id: u64, path: PathBuf },
     /// Start `tail -f` on a remote file over a new exec channel, feeding the
     /// given terminal grid (a log-follow tab). `tail_id` identifies the tab.
     TailFile { tail_id: u64, terminal: TerminalModel, path: String },
@@ -71,6 +74,8 @@ pub enum Event {
     /// A drag-and-drop move finished; the UI refreshes the directories that
     /// lost or gained an entry.
     EntryMoved { from: PathBuf, to: PathBuf },
+    /// A remote entry was deleted; the UI refreshes the parent directory.
+    EntryDeleted { path: PathBuf },
     /// A remote file was downloaded to a local temp path for drag-out.
     /// Staging is silent: unlike real transfers it never emits
     /// `TransferStarted`/`TransferProgress`/`TransferDone`, so it can't
@@ -171,6 +176,10 @@ impl SessionHandle {
 
     pub fn rename(&self, session_id: u64, from: PathBuf, to: PathBuf) {
         self.send(Command::Rename { session_id, from, to });
+    }
+
+    pub fn delete(&self, session_id: u64, path: PathBuf) {
+        self.send(Command::Delete { session_id, path });
     }
 
     /// Non-blocking: pop one pending event, if any.
@@ -492,6 +501,26 @@ async fn command_loop(
                                         "moving {} to {}: {err}",
                                         from.display(),
                                         to.display()
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                    Some(Command::Delete { session_id, path }) => {
+                        // Like transfers, run off the session loop so the
+                        // terminal keeps flowing while the server deletes.
+                        let _ = session_id;
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match delete_remote(&sftp, &path).await {
+                                Ok(()) => {
+                                    let _ = event_tx.send(Event::EntryDeleted { path });
+                                }
+                                Err(err) => {
+                                    let _ = event_tx.send(Event::Error(format!(
+                                        "deleting {}: {err:#}",
+                                        path.display()
                                     )));
                                 }
                             }
@@ -870,6 +899,38 @@ async fn download_to_temp(
             )));
         }
     }
+}
+
+/// Delete a remote entry. Directories go recursively (children first)
+/// because SFTP only offers flat `remove`/`rmdir`.
+async fn delete_remote(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &std::path::Path,
+) -> Result<()> {
+    let metadata = sftp
+        .metadata(remote.to_string_lossy().into_owned())
+        .await
+        .with_context(|| format!("stating remote {}", remote.display()))?;
+    if metadata.is_dir() {
+        let entries = sftp
+            .read_dir(remote.to_string_lossy().into_owned())
+            .await
+            .with_context(|| format!("listing remote {}", remote.display()))?;
+        for entry in entries {
+            if entry.file_name() == "." || entry.file_name() == ".." {
+                continue;
+            }
+            Box::pin(delete_remote(sftp, std::path::Path::new(&entry.path()))).await?;
+        }
+        sftp.remove_dir(remote.to_string_lossy().into_owned())
+            .await
+            .with_context(|| format!("removing directory {}", remote.display()))?;
+    } else {
+        sftp.remove_file(remote.to_string_lossy().into_owned())
+            .await
+            .with_context(|| format!("removing {}", remote.display()))?;
+    }
+    Ok(())
 }
 
 async fn download_path(

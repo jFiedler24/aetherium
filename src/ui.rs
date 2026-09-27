@@ -6,15 +6,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::Direction;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::{
-    App, Bounds, Context, CursorStyle, DragMoveEvent, Entity, ExternalDragPayload, ExternalPaths,
-    FileDragPaths, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Point, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextRun, Transformation,
-    UnderlineStyle, Window, canvas, div, fill, font, point, prelude::*, px, radians, rgb, rgba,
-    size, svg,
+    App, Bounds, BorderStyle, ClipboardItem, Context, CursorStyle, DispatchPhase, DragMoveEvent,
+    Entity, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Hsla,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle,
+    ScrollWheelEvent, ShapedLine, SharedString, TextRun, Transformation, UnderlineStyle, Window,
+    canvas, div, fill, font, outline, point, prelude::*, px, radians, rgb, rgba, size, svg,
 };
 use parking_lot::Mutex;
 
@@ -28,7 +29,8 @@ use crate::text_field::{Backtab, Tab, TextField};
 use crate::theme;
 
 const TERMINAL_FONT_SIZE: f32 = 13.0;
-const TERMINAL_LINE_HEIGHT: f32 = TERMINAL_FONT_SIZE * 1.35;
+/// Line height tracks the (zoomable) font size with this ratio.
+const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.35;
 const HEADER_HEIGHT: f32 = 38.0;
 const STATUSBAR_HEIGHT: f32 = 24.0;
 
@@ -268,6 +270,10 @@ struct SessionTab {
     connecting_profile: Option<Profile>,
     /// Currently selected tree path; the Download action acts on it.
     tree_selection: Option<PathBuf>,
+    /// Focus handle for the file tree. Rows focus it on click, so tree
+    /// shortcuts (Delete/Backspace) dispatch to the tree only while it has
+    /// focus; the terminal keeps receiving keys otherwise.
+    tree_focus_handle: FocusHandle,
     /// Active file transfer: (label, done bytes, total bytes, bytes/sec, eta seconds).
     transfer: Option<(String, u64, u64, f64, u64)>,
     /// Remote directories that pending uploads write into; refreshed every
@@ -327,6 +333,10 @@ pub struct RootView {
     next_tab_id: u64,
     /// Right-click menu in the file tree: click position + file path.
     context_menu: Option<(Point<Pixels>, PathBuf)>,
+    /// Delete confirmation dialog: the path awaiting a final "Delete" click.
+    /// Deleting is permanent over SFTP (no trash), so both the Delete key
+    /// and the context menu ask first.
+    confirm_delete: Option<PathBuf>,
     /// Entry under the cursor during an internal file-tree drag.
     tree_drag_target: Option<TreeDragTarget>,
     /// Entry being dragged in the file tree (set when a drag starts moving).
@@ -359,6 +369,13 @@ pub struct RootView {
     /// "Open in VS Code" entry: when the staging download finishes, the
     /// local temp file is handed to VS Code.
     pending_vscode_open: Vec<(u64, PathBuf)>,
+    /// Instant local echo of printable keystrokes (the server's identical
+    /// echo is deduplicated on arrival) — the fix for typing lag on
+    /// high-latency links. Toggleable from the header.
+    local_echo: bool,
+    /// Zoomable terminal font size (cmd +/-, cmd+wheel); the grid re-measures
+    /// and the PTY resizes automatically.
+    terminal_font_size: f32,
     focus_handle: FocusHandle,
 }
 
@@ -379,6 +396,7 @@ impl RootView {
             active: 0,
             next_tab_id: 0,
             context_menu: None,
+            confirm_delete: None,
             tree_drag_target: None,
             tree_dragging: None,
             sidebar_tab: SidebarTab::Sessions,
@@ -390,6 +408,8 @@ impl RootView {
             terminal_wake_tx,
             temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_vscode_open: Vec::new(),
+            local_echo: true,
+            terminal_font_size: TERMINAL_FONT_SIZE,
             focus_handle: cx.focus_handle(),
         };
         // Purge staging leftovers from previous runs (drag-out cancels,
@@ -623,6 +643,34 @@ impl RootView {
                     format!("{tab_label}: moved {} → {}", from.display(), to.display()),
                 );
             }
+            SessionEvent::EntryDeleted { path } => {
+                // A staged temp copy of the deleted file is useless now;
+                // drop it like a drag that ended inside the app.
+                let session_id = self.tabs[index].session_id;
+                if let Some(local) = self
+                    .temp_download_cache
+                    .lock()
+                    .remove(&(session_id, path.clone()))
+                {
+                    if let Some(dir) = local.parent() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+                let tab = &mut self.tabs[index];
+                tab.status = format!("deleted {}", path.display());
+                if tab.tree_selection.as_ref() == Some(&path) {
+                    tab.tree_selection = None;
+                }
+                // Refresh the directory that contained the entry.
+                if let Some(parent) = path.parent().map(PathBuf::from) {
+                    reload_dir(tab, &parent);
+                }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(
+                    LogLevel::Info,
+                    format!("{tab_label}: deleted {}", path.display()),
+                );
+            }
             SessionEvent::Error(message) => {
                 let tab = &mut self.tabs[index];
                 tab.status = message.clone();
@@ -652,6 +700,8 @@ impl RootView {
                 // Drag-out staging for this session is useless now; delete
                 // the staged files (uuid dirs under the temp area).
                 self.purge_staged_for(session_id);
+                // The confirmation dialog (if up) outlived its session.
+                self.confirm_delete = None;
                 // The tail channels die with the connection; mark the log
                 // tabs that rode on it.
                 for child in &mut self.tabs {
@@ -779,6 +829,7 @@ impl RootView {
             geometry: Arc::new(Mutex::new(None)),
             connecting_profile: Some(profile.clone()),
             tree_selection: None,
+            tree_focus_handle: cx.focus_handle(),
             transfer: None,
             pending_upload_dirs: Vec::new(),
             highlighter: None,
@@ -838,6 +889,7 @@ impl RootView {
             geometry: Arc::new(Mutex::new(None)),
             connecting_profile: None,
             tree_selection: None,
+            tree_focus_handle: cx.focus_handle(),
             transfer: None,
             pending_upload_dirs: Vec::new(),
             highlighter: Some(Arc::new(LogHighlighter::load())),
@@ -1018,6 +1070,99 @@ impl RootView {
         cx.notify();
     }
 
+    /// Ask before deleting `remote`: deleting is permanent over SFTP (no
+    /// trash), so both the context menu and the Delete key end up here
+    /// first, at the confirmation dialog.
+    fn ask_delete(&mut self, remote: PathBuf, cx: &mut Context<Self>) {
+        let (connected, root) = match self.active_tab() {
+            Some(tab) => (tab.state == ConnState::Connected, tab.root_path.clone()),
+            None => return,
+        };
+        if !connected {
+            self.status = "connect before deleting files".into();
+            cx.notify();
+            return;
+        }
+        if root.as_ref() == Some(&remote) {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.status = "refusing to delete the home directory".into();
+            }
+            cx.notify();
+            return;
+        }
+        self.context_menu = None;
+        self.confirm_delete = Some(remote);
+        cx.notify();
+    }
+
+    /// Actually delete `remote` (the dialog's Delete button and its Enter
+    /// shortcut): dismisses the dialog and sends the backend command.
+    fn delete_remote_confirmed(&mut self, remote: PathBuf, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        let (session, session_id) = match self.active_tab() {
+            Some(tab) => (tab.session.clone(), tab.session_id),
+            None => return,
+        };
+        let Some(session) = session else {
+            self.status = "not connected".into();
+            cx.notify();
+            return;
+        };
+        session.delete(session_id, remote.clone());
+        if let Some(tab) = self.active_tab_mut() {
+            tab.status = format!("deleting {} …", remote.display());
+        }
+        cx.notify();
+    }
+
+    fn on_delete_entry(
+        &mut self,
+        _: &DeleteEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirm_delete.is_some() {
+            // The confirmation is already up; don't stack another.
+            return;
+        }
+        let Some(remote) = self.active_tab().and_then(|tab| tab.tree_selection.clone()) else {
+            self.status = "select a file in the tree first".into();
+            cx.notify();
+            return;
+        };
+        self.ask_delete(remote, cx);
+    }
+
+    fn on_cancel_delete(
+        &mut self,
+        _: &CancelDelete,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirm_delete.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn on_confirm_delete(
+        &mut self,
+        _: &ConfirmDelete,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(remote) = self.confirm_delete.clone() {
+            self.delete_remote_confirmed(remote, cx);
+        }
+    }
+
+    /// Focus the active tab's file tree (row clicks do this so the Delete
+    /// key dispatches to the tree rather than whatever had focus before).
+    fn focus_file_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self.active_tab().map(|tab| tab.tree_focus_handle.clone()) {
+            window.focus(&handle, cx);
+        }
+    }
+
     /// Stage a remote file locally and open the temp copy in VS Code.
     /// (Remote editing with write-back is a separate, larger feature — this
     /// opens a local snapshot.)
@@ -1191,6 +1336,30 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Font zoom: cmd +/- / cmd 0 (like Zed's terminal). Handled before
+        // the tab borrow; these keys never reach the PTY.
+        let zoom_mods = &event.keystroke.modifiers;
+        if zoom_mods.platform && !zoom_mods.control && !zoom_mods.alt {
+            match event.keystroke.key.as_str() {
+                "=" | "+" => {
+                    self.zoom_terminal(1.0, cx);
+                    return;
+                }
+                "-" | "_" => {
+                    self.zoom_terminal(-1.0, cx);
+                    return;
+                }
+                "0" => {
+                    self.terminal_font_size = TERMINAL_FONT_SIZE;
+                    for tab in &self.tabs {
+                        tab.terminal.mark_dirty();
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -1212,6 +1381,23 @@ impl RootView {
                 cx.notify();
                 return;
             }
+        }
+
+        // Copy: cmd-c (macOS) / ctrl-shift-c. Copies the selection; the
+        // keystroke never reaches the PTY (ctrl-shift-c would otherwise
+        // send ^C). Placed before the read-only check so log tabs, whose
+        // whole point is reading, are copyable too.
+        let copy = keystroke.key == "c" && ((mods.control && mods.shift) || mods.platform);
+        if copy {
+            if let Some(text) = terminal.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                let len = text.len() as u64;
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.status = format!("copied {}", format_size(len));
+                }
+            }
+            cx.notify();
+            return;
         }
 
         // Log-follow tabs are read-only views of `tail -f` output.
@@ -1248,6 +1434,13 @@ impl RootView {
 
         let mode = *terminal.term.lock().mode();
         if let Some(bytes) = TerminalModel::keystroke_to_bytes(keystroke, mode) {
+            // Instant local echo on the primary screen (full-screen apps
+            // don't echo input); the server's identical echo is dropped on
+            // arrival. Echo before sending so the dedupe is always armed in
+            // time, even on fast links.
+            if self.local_echo && !mode.contains(TermMode::ALT_SCREEN) {
+                terminal.echo_input(&bytes);
+            }
             if let Some(session) = tab.session.as_ref() {
                 session.input(bytes);
             }
@@ -1262,6 +1455,21 @@ impl RootView {
             tab.terminal.term.lock().scroll_display(Scroll::Bottom);
             tab.terminal.mark_dirty();
         }
+    }
+
+    /// Zoom the terminal font by `delta` pixels (cmd +/-, cmd+wheel), clamped
+    /// to a sane range. The grid re-measures on the next frame and the PTY
+    /// resize follows via the repaint loop's geometry check.
+    fn zoom_terminal(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let new_size = (self.terminal_font_size + delta).clamp(8.0, 32.0);
+        if (new_size - self.terminal_font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.terminal_font_size = new_size;
+        for tab in &self.tabs {
+            tab.terminal.mark_dirty();
+        }
+        cx.notify();
     }
 
     fn toggle_tree_node(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1735,17 +1943,41 @@ struct RowRun {
 struct TerminalPrepaint {
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     backgrounds: Vec<gpui::PaintQuad>,
-    cursor: Option<gpui::PaintQuad>,
+    cursor: Option<TerminalCursor>,
 }
+
+/// Zed-style terminal cursor: a quad over the cursor cell (filled, or an
+/// outline when hollow) and, for a focused block cursor, the glyph under the
+/// cursor repainted in the terminal background color on top of the quad.
+struct TerminalCursor {
+    origin: Point<Pixels>,
+    quad: gpui::PaintQuad,
+    block_text: Option<ShapedLine>,
+}
+
+/// A run of selected cells on one terminal row: (row, start_col, span).
+type SelectionSegment = (usize, usize, usize);
 
 /// Collect styled runs for every visible row of the terminal.
 fn collect_runs(
     terminal: &TerminalModel,
     highlighter: Option<&LogHighlighter>,
-) -> (Vec<Vec<RowRun>>, Option<(usize, usize, CursorShape)>) {
+) -> (
+    Vec<Vec<RowRun>>,
+    Option<(usize, usize, CursorShape, char)>,
+    Vec<SelectionSegment>,
+) {
     let term = terminal.term.lock();
     let content = term.renderable_content();
     let screen_lines = term.screen_lines();
+    // alacritty's display points are negative for scrollback rows; shift
+    // them into row-from-top space so scrolled-up views render correctly
+    // (and selections map straight onto painted rows).
+    let display_offset = content.display_offset as i32;
+    let selection_range = term
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.to_range(&*term));
     let cursor = if content.mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0 {
         Some((
             content.cursor.point.line.0.max(0) as usize,
@@ -1755,6 +1987,9 @@ fn collect_runs(
     } else {
         None
     };
+    // Character under the cursor (for the block cursor's glyph); default to
+    // whitespace so an empty cell still gets a full-width block.
+    let mut cursor_char = ' ';
 
     // For log highlighting: rebuild each visual row's text, then precompute
     // per-row segments as char ranges with their colors.
@@ -1764,7 +1999,7 @@ fn collect_runs(
         let mut row_texts: Vec<String> = (0..screen_lines).map(|_| String::new()).collect();
         let text_content = term.renderable_content();
         for indexed in text_content.display_iter {
-            let line = indexed.point.line.0;
+            let line = indexed.point.line.0 + display_offset;
             if line < 0 || line as usize >= screen_lines {
                 continue;
             }
@@ -1789,9 +2024,10 @@ fn collect_runs(
     let mut rows: Vec<Vec<RowRun>> = (0..screen_lines).map(|_| Vec::new()).collect();
     // Char index within each row, for mapping highlight segments onto cells.
     let mut row_char_ix: Vec<usize> = vec![0; screen_lines];
+    let mut selection: Vec<SelectionSegment> = Vec::new();
     for indexed in content.display_iter {
         let cell: &Cell = indexed.cell;
-        let line = indexed.point.line.0;
+        let line = indexed.point.line.0 + display_offset;
         if line < 0 || line as usize >= screen_lines {
             continue;
         }
@@ -1801,16 +2037,36 @@ fn collect_runs(
         let is_spacer = cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
-        let row = &mut rows[line as usize];
+        let row = line as usize;
         let col = indexed.point.column.0;
-        let line = line as usize;
-        let char_ix = row_char_ix[line];
+        // Extend/merge the selection overlay for this cell. The hidden
+        // cursor shape skips alacritty's "don't select at a block cursor"
+        // boundary rule, which only matters for inverse-video rendering.
+        if let Some(range) = selection_range {
+            if range.contains_cell(&indexed, indexed.point, CursorShape::Hidden) {
+                if let Some((seg_row, seg_start, seg_span)) = selection.last_mut() {
+                    if *seg_row == row && *seg_start + *seg_span == col {
+                        *seg_span += 1;
+                        continue;
+                    }
+                }
+                selection.push((row, col, 1));
+            }
+        }
+        // Capture the glyph under the cursor, including the leading cell of a
+        // wide char whose spacer occupies the cursor column.
+        if let Some((cursor_line, cursor_col, _)) = cursor {
+            if row == cursor_line && !is_spacer && (col == cursor_col || col + 1 == cursor_col) {
+                cursor_char = cell.c;
+            }
+        }
+        let char_ix = row_char_ix[row];
         if !is_spacer {
-            row_char_ix[line] += 1;
+            row_char_ix[row] += 1;
         }
         let (mut fg, bg) = cell_colors(cell);
         let mut bold = flags.contains(Flags::BOLD);
-        if let Some(segments) = row_highlights.get(line) {
+        if let Some(segments) = row_highlights.get(row) {
             if let Some((_, _, highlight_fg, highlight_bold)) = segments
                 .iter()
                 .find(|(start, end, _, _)| char_ix >= *start && char_ix < *end)
@@ -1837,7 +2093,8 @@ fn collect_runs(
         let italic = flags.contains(Flags::ITALIC);
         let strikethrough = flags.contains(Flags::STRIKEOUT);
 
-        let mergeable = row.last().is_some_and(|last| {
+        let runs = &mut rows[row];
+        let mergeable = runs.last().is_some_and(|last| {
             last.bold == bold
                 && last.italic == italic
                 && last.strikethrough == strikethrough
@@ -1848,13 +2105,13 @@ fn collect_runs(
         });
 
         if mergeable {
-            let last = row.last_mut().unwrap();
+            let last = runs.last_mut().unwrap();
             last.span_cols += 1;
             if !is_spacer {
                 last.text.push(cell.c);
             }
         } else {
-            row.push(RowRun {
+            runs.push(RowRun {
                 start_col: col,
                 span_cols: 1,
                 text: if is_spacer {
@@ -1871,7 +2128,11 @@ fn collect_runs(
             });
         }
     }
-    (rows, cursor)
+    (
+        rows,
+        cursor.map(|(line, col, shape)| (line, col, shape, cursor_char)),
+        selection,
+    )
 }
 
 fn colors_equal(a: Hsla, b: Hsla) -> bool {
@@ -1898,7 +2159,9 @@ impl RootView {
         let terminal = tab.terminal.clone();
         let geometry = tab.geometry.clone();
         let focus_handle = tab.focus_handle.clone();
+        let canvas_focus = focus_handle.clone();
         let highlighter = tab.highlighter.clone();
+        let terminal_font_size = self.terminal_font_size;
 
         div()
             .flex_1()
@@ -1908,12 +2171,23 @@ impl RootView {
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(Self::on_terminal_key_down))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                // cmd+wheel zooms the terminal font (like Zed); a plain wheel
+                // scrolls the scrollback.
+                if event.modifiers.platform {
+                    let pixel_delta = event.delta.pixel_delta(px(20.));
+                    let steps = (f32::from(pixel_delta.y) / 20.).round();
+                    if steps != 0.0 {
+                        this.zoom_terminal(steps, cx);
+                    }
+                    return;
+                }
                 // Positive y is wheel-up; alacritty scrolls into the
                 // scrollback history for positive deltas, so pass it through.
                 // `Scroll::Delta` is whole lines (i32); approximate the pixel
                 // delta against the cell height.
-                let pixel_delta = event.delta.pixel_delta(px(TERMINAL_LINE_HEIGHT));
-                let lines = (f32::from(pixel_delta.y) / TERMINAL_LINE_HEIGHT).round() as i32;
+                let line_height = this.terminal_font_size * TERMINAL_LINE_HEIGHT_RATIO;
+                let pixel_delta = event.delta.pixel_delta(px(line_height));
+                let lines = (f32::from(pixel_delta.y) / line_height).round() as i32;
                 if lines != 0 {
                     if let Some(tab) = this.active_tab() {
                         tab.terminal.term.lock().scroll_display(Scroll::Delta(lines));
@@ -1922,9 +2196,22 @@ impl RootView {
                     }
                 }
             }))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 if let Some(tab) = this.active_tab() {
                     window.focus(&tab.focus_handle, cx);
+                    // Begin a selection (a plain click clears the old one and
+                    // selects nothing — `selection_end` drops empty ranges).
+                    if let Some(geometry) = tab.geometry.lock().as_ref().copied() {
+                        let (line, col, side) =
+                            terminal_grid_point(&tab.terminal, geometry, event.position);
+                        tab.terminal.selection_start(line, col, side);
+                    }
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if let Some(tab) = this.active_tab() {
+                    tab.terminal.selection_end();
                 }
                 cx.notify();
             }))
@@ -1946,24 +2233,70 @@ impl RootView {
             .child(
                 canvas(
                     move |bounds, window, _cx| {
+                        let focused = canvas_focus.is_focused(window);
+                        // Window-level mouse move (Zed's terminal does the
+                        // same): with the button held and this terminal
+                        // focused, extend the selection even when the cursor
+                        // leaves the terminal bounds. The registration only
+                        // lives for the next frame, so it is renewed on
+                        // every prepaint.
+                        window.on_mouse_event({
+                            let terminal = terminal.clone();
+                            let geometry = geometry.clone();
+                            let canvas_focus = canvas_focus.clone();
+                            move |event: &MouseMoveEvent, phase, window, _cx| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.pressed_button != Some(MouseButton::Left)
+                                    || !canvas_focus.is_focused(window)
+                                    || !terminal.has_selection()
+                                {
+                                    return;
+                                }
+                                let Some(geo) = geometry.lock().as_ref().copied() else {
+                                    return;
+                                };
+                                let (line, col, side) =
+                                    terminal_grid_point(&terminal, geo, event.position);
+                                terminal.selection_update(line, col, side);
+                            }
+                        });
                         terminal_prepaint(
                             bounds,
                             window,
                             &terminal,
                             &geometry,
                             highlighter.as_deref(),
+                            focused,
+                            terminal_font_size,
                         )
                     },
                     move |_bounds, prepaint, window, cx| {
                         for quad in prepaint.backgrounds {
                             window.paint_quad(quad);
                         }
+                        let line_height = prepaint_line_height(terminal_font_size);
                         for (origin, line) in prepaint.lines {
-                            let line_height = prepaint_line_height();
-                            let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+                            let _ = line.paint(
+                                origin,
+                                line_height,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
                         }
                         if let Some(cursor) = prepaint.cursor {
-                            window.paint_quad(cursor);
+                            window.paint_quad(cursor.quad);
+                            if let Some(block_text) = cursor.block_text {
+                                let _ = block_text.paint(
+                                    cursor.origin,
+                                    line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }
                         }
                     },
                 )
@@ -1972,8 +2305,51 @@ impl RootView {
     }
 }
 
-fn prepaint_line_height() -> Pixels {
-    px(TERMINAL_LINE_HEIGHT)
+fn prepaint_line_height(font_size: f32) -> Pixels {
+    px(font_size * TERMINAL_LINE_HEIGHT_RATIO)
+}
+
+/// Convert a window-space mouse position to an alacritty grid point plus
+/// which half of the cell it sits in (that decides whether a selection
+/// boundary includes the cell). Same mapping as Zed's terminal:
+/// `line = row_from_top - display_offset`; negative lines are scrollback.
+fn terminal_grid_point(
+    terminal: &TerminalModel,
+    geometry: TermGeometry,
+    position: Point<Pixels>,
+) -> (i32, usize, Direction) {
+    let rel = position - geometry.bounds.origin;
+    let x = f32::from(rel.x);
+    let y = f32::from(rel.y);
+    let cell_width = f32::from(geometry.cell_width);
+    let line_height = f32::from(geometry.line_height);
+    let term = terminal.term.lock();
+    let display_offset = term.renderable_content().display_offset as i32;
+    let rows = term.screen_lines() as i32;
+    let last_col = term.columns() as i32 - 1;
+
+    let mut col = (x / cell_width).floor() as i32;
+    let mut row = (y / line_height).floor() as i32;
+    let mut side = if col >= 0 && x / cell_width - col as f32 > 0.5 {
+        Direction::Right
+    } else {
+        Direction::Left
+    };
+    if col > last_col {
+        col = last_col.max(0);
+        side = Direction::Right;
+    } else if col < 0 {
+        col = 0;
+        side = Direction::Left;
+    }
+    if row > rows - 1 {
+        row = (rows - 1).max(0);
+        side = Direction::Right;
+    } else if row < 0 {
+        row = 0;
+        side = Direction::Left;
+    }
+    (row - display_offset, col as usize, side)
 }
 
 fn terminal_prepaint(
@@ -1982,10 +2358,12 @@ fn terminal_prepaint(
     terminal: &TerminalModel,
     geometry: &Arc<Mutex<Option<TermGeometry>>>,
     highlighter: Option<&LogHighlighter>,
+    focused: bool,
+    font_size: f32,
 ) -> TerminalPrepaint {
     let font = font(theme::FONT_MONO);
-    let font_size = px(TERMINAL_FONT_SIZE);
-    let line_height = prepaint_line_height();
+    let font_size = px(font_size);
+    let line_height = prepaint_line_height(font_size.into());
 
     // Measure a monospace cell from a probe string.
     let probe = "0000000000";
@@ -2010,7 +2388,7 @@ fn terminal_prepaint(
         line_height,
     });
 
-    let (rows, cursor) = collect_runs(terminal, highlighter);
+    let (rows, cursor, selection) = collect_runs(terminal, highlighter);
     let default_bg = hex(TERM_BG);
 
     let mut lines = Vec::new();
@@ -2060,20 +2438,88 @@ fn terminal_prepaint(
         }
     }
 
-    let cursor = cursor.map(|(line, col, shape)| {
+    // Selection overlay: translucent quads over the selected cells, above
+    // cell backgrounds but below the text (Zed's terminal paints the same
+    // way).
+    let selection_color = Hsla {
+        a: 0.5,
+        ..theme::selection()
+    };
+    for (row, start_col, span) in selection {
+        let x = bounds.left() + cell_width * start_col as f32;
+        let y = bounds.top() + line_height * row as f32;
+        backgrounds.push(fill(
+            Bounds::new(point(x, y), size(cell_width * span as f32, line_height)),
+            selection_color,
+        ));
+    }
+
+    // Zed's terminal cursor (terminal_view/src/terminal_element.rs): the quad
+    // covers the cursor cell; a focused block cursor additionally repaints
+    // the glyph underneath in the terminal background color on top of it.
+    let cursor = cursor.map(|(line, col, shape, cursor_char)| {
         let origin = point(
-            bounds.left() + cell_width * col as f32,
-            bounds.top() + line_height * line as f32,
+            bounds.left() + (cell_width * col as f32).floor(),
+            bounds.top() + (line_height * line as f32).floor(),
         );
-        let cursor_bounds = match shape {
-            CursorShape::Underline => Bounds::new(
-                point(origin.x, origin.y + line_height - px(2.)),
-                size(cell_width, px(2.)),
-            ),
-            CursorShape::Beam => Bounds::new(origin, size(px(2.), line_height)),
-            _ => Bounds::new(origin, size(cell_width, line_height)),
+        let color = theme::cursor();
+
+        let block_text = if focused && shape == CursorShape::Block {
+            let text = cursor_char.to_string();
+            let len = text.len();
+            Some(window.text_system().shape_line(
+                text.into(),
+                font_size,
+                &[TextRun {
+                    len,
+                    font: font.clone(),
+                    color: hex(TERM_BG),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            ))
+        } else {
+            None
         };
-        fill(cursor_bounds, theme::accent())
+
+        // Whitespace keeps the plain cell width; other characters cover at
+        // least their cell (more for wide glyphs).
+        let width = if cursor_char.is_whitespace() {
+            cell_width
+        } else {
+            block_text
+                .as_ref()
+                .map(|text| text.width.max(cell_width))
+                .unwrap_or(cell_width)
+        };
+
+        // Every shape becomes a hollow outline when the terminal is unfocused.
+        let hollow = !focused || shape == CursorShape::HollowBlock;
+        let cursor_bounds = if hollow {
+            Bounds::new(origin, size(width, line_height))
+        } else {
+            match shape {
+                CursorShape::Underline => Bounds::new(
+                    point(origin.x, origin.y + line_height - px(2.)),
+                    size(width, px(2.)),
+                ),
+                CursorShape::Beam => Bounds::new(origin, size(px(2.), line_height)),
+                _ => Bounds::new(origin, size(width, line_height)),
+            }
+        };
+        let snapped = window.pixel_snap_bounds(cursor_bounds);
+        let quad = if hollow {
+            outline(snapped, color, BorderStyle::Solid)
+        } else {
+            fill(snapped, color)
+        };
+        TerminalCursor {
+            origin,
+            quad,
+            block_text,
+        }
     });
 
     TerminalPrepaint {
@@ -2151,6 +2597,7 @@ impl RootView {
             .and_then(|i| self.store.profiles.get(i))
             .map(|p| format!("{} — {}", p.name, p.summary()))
             .unwrap_or_else(|| "no profile selected".to_string());
+        let echo_label = if self.local_echo { "echo: on" } else { "echo: off" };
 
         div()
             .h(px(HEADER_HEIGHT))
@@ -2197,6 +2644,15 @@ impl RootView {
             }))
             .child(header_button("delete-profile", "Delete", cx, |this, _window, cx| {
                 this.delete_selected_profile(cx)
+            }))
+            .child(header_button("toggle-echo", echo_label, cx, |this, _window, cx| {
+                this.local_echo = !this.local_echo;
+                this.status = if this.local_echo {
+                    "local echo on".into()
+                } else {
+                    "local echo off".into()
+                };
+                cx.notify();
             }))
             .into_any_element()
     }
@@ -2758,9 +3214,14 @@ impl RootView {
     fn render_file_tree(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut rows = Vec::new();
         let empty: Vec<TreeNode> = Vec::new();
-        let (tree, tree_selection, connected) = match self.active_tab() {
-            Some(tab) => (&tab.tree, tab.tree_selection.clone(), tab.state == ConnState::Connected),
-            None => (&empty, None, false),
+        let (tree, tree_selection, connected, tree_focus) = match self.active_tab() {
+            Some(tab) => (
+                &tab.tree,
+                tab.tree_selection.clone(),
+                tab.state == ConnState::Connected,
+                Some(tab.tree_focus_handle.clone()),
+            ),
+            None => (&empty, None, false, None),
         };
         // Directory highlighted as the current drop target during a drag.
         let drag_highlight = match (self.tree_dragging.as_ref(), self.tree_drag_target.as_ref()) {
@@ -2798,6 +3259,17 @@ impl RootView {
             .overflow_scroll()
             .flex()
             .flex_col()
+            // Focus + key context for tree shortcuts (Delete/Backspace ask to
+            // delete the selection, Enter/Escape answer the confirmation).
+            // Only present for a real tab so the keys never dispatch here
+            // when there is no tree.
+            .when_some(tree_focus, |div, handle| {
+                div.track_focus(&handle)
+                    .key_context("FileTree")
+                    .on_action(cx.listener(Self::on_delete_entry))
+                    .on_action(cx.listener(Self::on_cancel_delete))
+                    .on_action(cx.listener(Self::on_confirm_delete))
+            })
             // Dropping OS files onto the tree background uploads them into
             // the remote home directory; dropping onto a directory row
             // targets that directory instead (handled per row). Dropping a
@@ -3077,7 +3549,8 @@ fn render_tree_rows(
                 .when(is_selected, |row| row.bg(theme::selection()))
                 .when(!is_selected, |row| row.hover(|row| row.bg(theme::hover())))
                 .when(highlighted, |row| row.bg(theme::drop_target()))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.focus_file_tree(window, cx);
                     this.toggle_tree_node(path.clone(), cx);
                 }))
                 // Start dragging this entry; a small label follows the cursor
@@ -3215,7 +3688,8 @@ fn render_tree_rows(
                     let menu_path = node.entry.path.clone();
                     row.on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.focus_file_tree(window, cx);
                             if let Some(tab) = this.active_tab_mut() {
                                 tab.tree_selection = Some(menu_path.clone());
                             }
@@ -3327,6 +3801,27 @@ impl Render for RootView {
             .text_color(theme::text())
             .text_size(px(13.))
             .font_family(theme::FONT_UI)
+            // Fallback for Escape/Enter while the delete confirmation is up
+            // and the file tree does not have focus (a handled FileTree key
+            // binding never reaches this listener).
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if this.confirm_delete.is_none() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.confirm_delete = None;
+                        cx.notify();
+                    }
+                    "enter" => {
+                        let remote = this.confirm_delete.clone();
+                        if let Some(remote) = remote {
+                            this.delete_remote_confirmed(remote, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }))
             .child(self.render_header(cx))
             .child(self.render_tab_bar(cx));
 
@@ -3353,6 +3848,7 @@ impl Render for RootView {
             // The tail -f closure captures `path` by move; the other items
             // get their own clone.
             let vscode_path = path.clone();
+            let delete_path = path.clone();
             root = root
                 .child(
                     div()
@@ -3436,10 +3932,138 @@ impl Render for RootView {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_in_vscode(vscode_path.clone(), cx);
                                 })),
+                        )
+                        .child(
+                            div()
+                                .id("context-menu-delete")
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::danger())
+                                .hover(|item| item.bg(theme::selection()))
+                                .child("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.context_menu = None;
+                                    this.ask_delete(delete_path.clone(), cx);
+                                })),
                         ),
                 );
+        }
+
+        // Delete confirmation dialog, painted above everything (like the
+        // context menu). Clicking anywhere outside the panel, Escape or the
+        // Cancel button dismisses; the Delete button (or Enter) confirms.
+        // The panel swallows mouse-downs so button clicks don't bubble to
+        // the overlay and cancel the dialog mid-press.
+        if let Some(remote) = self.confirm_delete.clone() {
+            let name = remote
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| remote.display().to_string());
+            root = root.child(
+                div()
+                    .id("delete-dialog")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::black().opacity(0.4))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.confirm_delete = None;
+                        cx.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                        this.confirm_delete = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id("delete-dialog-panel")
+                            .w(px(320.))
+                            .bg(theme::panel())
+                            .border_1()
+                            .border_color(theme::border())
+                            .rounded_md()
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .shadow_md()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }))
+                            .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::text())
+                                    .child(format!("Delete “{name}” permanently?")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_dim())
+                                    .child("This cannot be undone. Directories go recursively."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("delete-dialog-cancel")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_color(theme::text())
+                                            .hover(|button| button.bg(theme::hover()))
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.confirm_delete = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child({
+                                        let remote = remote.clone();
+                                        div()
+                                            .id("delete-dialog-confirm")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .bg(theme::danger())
+                                            .text_color(gpui::white())
+                                            .hover(|button| button.opacity(0.9))
+                                            .child("Delete")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_remote_confirmed(remote.clone(), cx);
+                                            }))
+                                    }),
+                            ),
+                    ),
+            );
         }
 
         root
     }
 }
+
+// Actions bound in `main.rs` under the "FileTree" key context. DeleteEntry
+// asks to delete the selected entry; while the confirmation is up, Enter
+// confirms and Escape cancels. Handlers live on the file-tree container.
+gpui::actions!(file_tree, [DeleteEntry, CancelDelete, ConfirmDelete]);
