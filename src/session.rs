@@ -43,6 +43,10 @@ pub enum Command {
     /// Permanently delete a remote entry. Directories are deleted
     /// recursively (children first); there is no trash over SFTP.
     Delete { session_id: u64, path: PathBuf },
+    /// Create an empty remote file.
+    CreateFile { session_id: u64, path: PathBuf },
+    /// Create a remote directory.
+    CreateDir { session_id: u64, path: PathBuf },
     /// Start `tail -f` on a remote file over a new exec channel, feeding the
     /// given terminal grid (a log-follow tab). `tail_id` identifies the tab.
     TailFile { tail_id: u64, terminal: TerminalModel, path: String },
@@ -76,6 +80,8 @@ pub enum Event {
     EntryMoved { from: PathBuf, to: PathBuf },
     /// A remote entry was deleted; the UI refreshes the parent directory.
     EntryDeleted { path: PathBuf },
+    /// A remote entry was created; the UI refreshes the parent directory.
+    EntryCreated { parent: PathBuf },
     /// A remote file was downloaded to a local temp path for drag-out.
     /// Staging is silent: unlike real transfers it never emits
     /// `TransferStarted`/`TransferProgress`/`TransferDone`, so it can't
@@ -180,6 +186,14 @@ impl SessionHandle {
 
     pub fn delete(&self, session_id: u64, path: PathBuf) {
         self.send(Command::Delete { session_id, path });
+    }
+
+    pub fn create_file(&self, session_id: u64, path: PathBuf) {
+        self.send(Command::CreateFile { session_id, path });
+    }
+
+    pub fn create_dir(&self, session_id: u64, path: PathBuf) {
+        self.send(Command::CreateDir { session_id, path });
     }
 
     /// Non-blocking: pop one pending event, if any.
@@ -520,6 +534,53 @@ async fn command_loop(
                                 Err(err) => {
                                     let _ = event_tx.send(Event::Error(format!(
                                         "deleting {}: {err:#}",
+                                        path.display()
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                    Some(Command::CreateFile { session_id, path }) => {
+                        let _ = session_id;
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = match sftp
+                                .create(path.to_string_lossy().into_owned())
+                                .await
+                            {
+                                Ok(file) => file.close().await.map_err(|err| anyhow::anyhow!(err)),
+                                Err(err) => Err(anyhow::anyhow!(err)),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    let _ = event_tx.send(Event::EntryCreated {
+                                        parent: path.parent().map(PathBuf::from).unwrap_or_default(),
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = event_tx.send(Event::Error(format!(
+                                        "creating {}: {err:#}",
+                                        path.display()
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                    Some(Command::CreateDir { session_id, path }) => {
+                        let _ = session_id;
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match sftp.create_dir(path.to_string_lossy().into_owned()).await {
+                                Ok(()) => {
+                                    let _ = event_tx.send(Event::EntryCreated {
+                                        parent: path.parent().map(PathBuf::from).unwrap_or_default(),
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = event_tx.send(Event::Error(format!(
+                                        "creating {}: {err:#}",
                                         path.display()
                                     )));
                                 }

@@ -319,6 +319,16 @@ struct ProfileForm {
     passphrase: Entity<TextField>,
 }
 
+/// Inline text editor in the file tree: renames an entry (`target = Some`)
+/// or creates a new file/dir inside `parent` (`target = None`). Enter
+/// submits, Escape cancels; both are raw keys handled by the row container.
+struct TreeEditor {
+    target: Option<PathBuf>,
+    parent: PathBuf,
+    is_dir: bool,
+    field: Entity<TextField>,
+}
+
 pub struct RootView {
     store: ProfileStore,
     selected: Option<usize>,
@@ -337,6 +347,8 @@ pub struct RootView {
     /// Deleting is permanent over SFTP (no trash), so both the Delete key
     /// and the context menu ask first.
     confirm_delete: Option<PathBuf>,
+    /// Inline rename/create editor in the file tree, if one is open.
+    tree_editor: Option<TreeEditor>,
     /// Entry under the cursor during an internal file-tree drag.
     tree_drag_target: Option<TreeDragTarget>,
     /// Entry being dragged in the file tree (set when a drag starts moving).
@@ -397,6 +409,7 @@ impl RootView {
             next_tab_id: 0,
             context_menu: None,
             confirm_delete: None,
+            tree_editor: None,
             tree_drag_target: None,
             tree_dragging: None,
             sidebar_tab: SidebarTab::Sessions,
@@ -671,6 +684,16 @@ impl RootView {
                     format!("{tab_label}: deleted {}", path.display()),
                 );
             }
+            SessionEvent::EntryCreated { parent } => {
+                let tab = &mut self.tabs[index];
+                tab.status = format!("created {}", parent.display());
+                reload_dir(tab, &parent);
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(
+                    LogLevel::Info,
+                    format!("{tab_label}: created something in {}", parent.display()),
+                );
+            }
             SessionEvent::Error(message) => {
                 let tab = &mut self.tabs[index];
                 tab.status = message.clone();
@@ -702,6 +725,7 @@ impl RootView {
                 self.purge_staged_for(session_id);
                 // The confirmation dialog (if up) outlived its session.
                 self.confirm_delete = None;
+                self.tree_editor = None;
                 // The tail channels die with the connection; mark the log
                 // tabs that rode on it.
                 for child in &mut self.tabs {
@@ -907,6 +931,8 @@ impl RootView {
         }
         self.active = index;
         self.context_menu = None;
+        self.confirm_delete = None;
+        self.tree_editor = None;
         self.tree_drag_target = None;
         self.tree_dragging = None;
         self.tabs[index].terminal_focus_pending = true;
@@ -1091,6 +1117,7 @@ impl RootView {
             return;
         }
         self.context_menu = None;
+        self.tree_editor = None;
         self.confirm_delete = Some(remote);
         cx.notify();
     }
@@ -1136,9 +1163,15 @@ impl RootView {
     fn on_cancel_delete(
         &mut self,
         _: &CancelDelete,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Escape: close the inline rename/create editor first; otherwise
+        // dismiss the delete confirmation.
+        if self.tree_editor.is_some() {
+            self.cancel_tree_editor(window, cx);
+            return;
+        }
         if self.confirm_delete.take().is_some() {
             cx.notify();
         }
@@ -1147,9 +1180,15 @@ impl RootView {
     fn on_confirm_delete(
         &mut self,
         _: &ConfirmDelete,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Enter: submit the inline rename/create editor when one is open;
+        // otherwise confirm the delete dialog.
+        if self.tree_editor.is_some() {
+            self.submit_tree_editor(window, cx);
+            return;
+        }
         if let Some(remote) = self.confirm_delete.clone() {
             self.delete_remote_confirmed(remote, cx);
         }
@@ -1161,6 +1200,227 @@ impl RootView {
         if let Some(handle) = self.active_tab().map(|tab| tab.tree_focus_handle.clone()) {
             window.focus(&handle, cx);
         }
+    }
+
+    /// Spawn a fresh backend for the active tab and connect it again with
+    /// its original profile. Phone sessions drop constantly; this is the
+    /// one-click way back.
+    fn reconnect_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.is_log() || tab.state != ConnState::Disconnected {
+            return;
+        }
+        let Some(profile) = tab.profile.clone() else {
+            return;
+        };
+        let old_session_id = tab.session_id;
+        let terminal = tab.terminal.clone();
+        terminal.reset();
+        let session = SessionHandle::spawn(terminal);
+        session.connect(profile.clone());
+        let tab = self.active_tab_mut().expect("checked above");
+        tab.session = Some(session);
+        tab.session_id += 1;
+        tab.state = ConnState::Connecting;
+        tab.status = format!("reconnecting to {}…", profile.summary());
+        tab.tree.clear();
+        tab.root_path = None;
+        tab.tree_selection = None;
+        tab.transfer = None;
+        tab.terminal_focus_pending = true;
+        // Drag-out staging belonged to the dead session.
+        self.purge_staged_for(old_session_id);
+        let label = Self::tab_log_label(&self.tabs[self.active]);
+        self.log(LogLevel::Info, format!("{label}: reconnecting"));
+        cx.notify();
+    }
+
+    /// Open the inline editor renaming `path`.
+    fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_editor.is_some() {
+            return;
+        }
+        let (parent, name) = match self.active_tab() {
+            Some(tab) => {
+                if tab.state != ConnState::Connected {
+                    self.status = "connect before renaming files".into();
+                    cx.notify();
+                    return;
+                }
+                if tab.root_path.as_ref() == Some(&path) {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.status = "cannot rename the home directory".into();
+                    }
+                    cx.notify();
+                    return;
+                }
+                let parent = match path.parent().map(PathBuf::from) {
+                    Some(parent) => parent,
+                    None => return,
+                };
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (parent, name)
+            }
+            None => return,
+        };
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(cx, "name");
+            field.set_text(name, cx);
+            field
+        });
+        self.tree_editor = Some(TreeEditor {
+            target: Some(path),
+            parent,
+            is_dir: false,
+            field: field.clone(),
+        });
+        window.focus(&field.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Open the inline editor creating a new file (`is_dir = false`) or
+    /// folder inside the selected directory — or the home directory when
+    /// nothing is selected.
+    fn start_create(&mut self, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_editor.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.state != ConnState::Connected {
+            self.status = "connect before creating files".into();
+            cx.notify();
+            return;
+        }
+        // Parent: the selected directory, the selected file's directory, or
+        // the home directory.
+        let (root, selection) = (tab.root_path.clone(), tab.tree_selection.clone());
+        let tab_mut = self.active_tab_mut().expect("checked above");
+        let parent = match selection {
+            Some(path) => {
+                let is_dir = find_node(&mut tab_mut.tree, &path)
+                    .map(|node| node.entry.is_dir)
+                    .unwrap_or(false);
+                if is_dir {
+                    path
+                } else {
+                    path.parent().map(PathBuf::from).unwrap_or(path)
+                }
+            }
+            None => match root {
+                Some(root) => root,
+                None => return,
+            },
+        };
+        // Show the editor row: the parent must be expanded with its
+        // children loaded (or loading) on screen.
+        let session = tab_mut.session.clone();
+        let session_id = tab_mut.session_id;
+        if let Some(node) = find_node(&mut tab_mut.tree, &parent) {
+            node.expanded = true;
+            if node.children.is_none() {
+                node.loading = true;
+                if let Some(session) = session {
+                    session.list_dir(session_id, parent.clone());
+                }
+            }
+        }
+        let placeholder = if is_dir { "new folder" } else { "new file" };
+        let field = cx.new(|cx| TextField::new(cx, placeholder));
+        self.tree_editor = Some(TreeEditor {
+            target: None,
+            parent,
+            is_dir,
+            field: field.clone(),
+        });
+        window.focus(&field.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Enter in the inline editor: validate the name and send the backend
+    /// command (rename or create).
+    fn submit_tree_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.tree_editor.take() else {
+            return;
+        };
+        // Enter can also arrive through the IME text path; flatten it away.
+        let name = editor
+            .field
+            .read(cx)
+            .text()
+            .trim()
+            .replace(['\n', '\r'], "");
+        self.focus_file_tree(window, cx);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
+        let session_id = tab.session_id;
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.status = "invalid name".into();
+            }
+            cx.notify();
+            return;
+        }
+        match &editor.target {
+            Some(from) => {
+                let to = editor.parent.join(&name);
+                if to == *from {
+                    return; // unchanged: nothing to do
+                }
+                let from = from.clone();
+                session.rename(session_id, from.clone(), to.clone());
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.status = format!("renaming {} → {} …", from.display(), to.display());
+                }
+            }
+            None => {
+                let path = editor.parent.join(&name);
+                if editor.is_dir {
+                    session.create_dir(session_id, path.clone());
+                } else {
+                    session.create_file(session_id, path.clone());
+                }
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.status = format!("creating {} …", path.display());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Escape in the inline editor: dismiss without doing anything.
+    fn cancel_tree_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_editor.take().is_some() {
+            self.focus_file_tree(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn on_rename_entry(
+        &mut self,
+        _: &RenameEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tree_editor.is_some() {
+            return;
+        }
+        let Some(remote) = self.active_tab().and_then(|tab| tab.tree_selection.clone()) else {
+            self.status = "select a file in the tree first".into();
+            cx.notify();
+            return;
+        };
+        self.start_rename(remote, window, cx);
     }
 
     /// Stage a remote file locally and open the temp copy in VS Code.
@@ -3027,6 +3287,22 @@ impl RootView {
                                     .child(summary),
                             )
                             .child(header_button(
+                                "tab-new-file",
+                                "+f",
+                                cx,
+                                |this, window, cx| {
+                                    this.start_create(false, window, cx);
+                                },
+                            ))
+                            .child(header_button(
+                                "tab-new-dir",
+                                "+d",
+                                cx,
+                                |this, window, cx| {
+                                    this.start_create(true, window, cx);
+                                },
+                            ))
+                            .child(header_button(
                                 "tab-download",
                                 "⇩",
                                 cx,
@@ -3248,6 +3524,7 @@ impl RootView {
                 tab.and_then(|t| t.session.as_ref()),
                 tab.map(|t| t.session_id).unwrap_or(0),
                 self.temp_download_cache.clone(),
+                self.tree_editor.as_ref(),
                 cx,
                 &mut rows,
             );
@@ -3269,6 +3546,7 @@ impl RootView {
                     .on_action(cx.listener(Self::on_delete_entry))
                     .on_action(cx.listener(Self::on_cancel_delete))
                     .on_action(cx.listener(Self::on_confirm_delete))
+                    .on_action(cx.listener(Self::on_rename_entry))
             })
             // Dropping OS files onto the tree background uploads them into
             // the remote home directory; dropping onto a directory row
@@ -3411,7 +3689,7 @@ impl RootView {
             .into_any_element()
     }
 
-    fn render_statusbar(&mut self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_statusbar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Show the active tab's lifecycle, transfer, and status; with no
         // tabs the global (UI-level) status stands alone.
         let (state, transfer, status) = match self.active_tab() {
@@ -3450,6 +3728,11 @@ impl RootView {
             }
             parts.join(" — ")
         });
+        // Dropped shell tab with a known profile: offer a one-click way
+        // back (phone sessions disconnect constantly).
+        let can_reconnect = self.active_tab().is_some_and(|tab| {
+            !tab.is_log() && tab.profile.is_some() && tab.state == ConnState::Disconnected
+        });
         div()
             .h(px(STATUSBAR_HEIGHT))
             .w_full()
@@ -3470,6 +3753,24 @@ impl RootView {
                         .text_color(theme::warning())
                         .truncate()
                         .child(text),
+                )
+            })
+            .when(can_reconnect, |bar| {
+                bar.child(
+                    div()
+                        .id("status-reconnect")
+                        .px_2()
+                        .py(px(1.))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(theme::accent())
+                        .text_color(theme::accent())
+                        .hover(|style| style.bg(theme::hover()))
+                        .child("Reconnect")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reconnect_tab(cx);
+                        })),
                 )
             })
             .child(
@@ -3519,6 +3820,7 @@ fn render_tree_rows(
     session: Option<&SessionHandle>,
     session_id: u64,
     temp_download_cache: Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>,
+    editor: Option<&TreeEditor>,
     cx: &mut Context<RootView>,
     rows: &mut Vec<gpui::AnyElement>,
 ) {
@@ -3532,6 +3834,12 @@ fn render_tree_rows(
         let external_drop_path = path.clone();
         let tree_drop_path = path.clone();
         let temp_download_cache = temp_download_cache.clone();
+
+        // Renaming this entry: swap its row for the inline editor.
+        if let Some(ed) = editor.filter(|ed| ed.target.as_ref() == Some(&node.entry.path)) {
+            rows.push(tree_editor_row(ed, depth, is_dir));
+            continue;
+        }
 
         rows.push(
             div()
@@ -3750,6 +4058,12 @@ fn render_tree_rows(
                 .into_any_element(),
         );
         if node.expanded {
+            // A create editor targeting this directory goes before its
+            // children.
+            if let Some(ed) = editor.filter(|ed| ed.target.is_none() && ed.parent == node.entry.path)
+            {
+                rows.push(tree_editor_row(ed, depth + 1, ed.is_dir));
+            }
             if let Some(children) = node.children.as_ref() {
                 render_tree_rows(
                     children,
@@ -3760,12 +4074,50 @@ fn render_tree_rows(
                     session,
                     session_id,
                     temp_download_cache,
+                    editor,
                     cx,
                     rows,
                 );
             }
         }
     }
+}
+
+/// The inline rename/create row: a text field in tree clothing. Enter and
+/// Escape are handled by the tree container's ConfirmDelete/CancelDelete
+/// action handlers (the FileTree key bindings dispatch there while the
+/// field is focused).
+fn tree_editor_row(
+    editor: &TreeEditor,
+    depth: usize,
+    is_dir: bool,
+) -> gpui::AnyElement {
+    div()
+        .id("tree-editor-row")
+        .h(px(24.))
+        .ml(px(4. + depth as f32 * 14.))
+        .mr(px(4.))
+        .px(px(6.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .rounded_sm()
+        .bg(theme::selection())
+        .child(
+            svg()
+                .path(if is_dir {
+                    assets::ICON_CHEVRON_RIGHT
+                } else {
+                    assets::ICON_FILE
+                })
+                .w(px(14.))
+                .h(px(14.))
+                .text_color(theme::text_dim())
+                .into_any_element(),
+        )
+        .child(editor.field.clone())
+        .into_any_element()
 }
 
 impl Focusable for RootView {
@@ -3849,6 +4201,7 @@ impl Render for RootView {
             // get their own clone.
             let vscode_path = path.clone();
             let delete_path = path.clone();
+            let rename_path = path.clone();
             root = root
                 .child(
                     div()
@@ -3931,6 +4284,22 @@ impl Render for RootView {
                                 .child("Open in VS Code")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_in_vscode(vscode_path.clone(), cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("context-menu-rename")
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::text())
+                                .hover(|item| item.bg(theme::selection()))
+                                .child("Rename")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.context_menu = None;
+                                    this.start_rename(rename_path.clone(), window, cx);
                                 })),
                         )
                         .child(
@@ -4065,5 +4434,6 @@ impl Render for RootView {
 
 // Actions bound in `main.rs` under the "FileTree" key context. DeleteEntry
 // asks to delete the selected entry; while the confirmation is up, Enter
-// confirms and Escape cancels. Handlers live on the file-tree container.
-gpui::actions!(file_tree, [DeleteEntry, CancelDelete, ConfirmDelete]);
+// confirms and Escape cancels. RenameEntry opens the inline rename editor.
+// Handlers live on the file-tree container.
+gpui::actions!(file_tree, [DeleteEntry, CancelDelete, ConfirmDelete, RenameEntry]);

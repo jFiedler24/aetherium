@@ -93,7 +93,7 @@ use gpui::{
     App, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
 };
 
-use crate::ui::{CancelDelete, ConfirmDelete, DeleteEntry, RootView};
+use crate::ui::{CancelDelete, ConfirmDelete, DeleteEntry, RenameEntry, RootView};
 
 /// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
 /// errors) are visible when running the binary directly.
@@ -134,12 +134,13 @@ fn main() {
         ]);
         // File-tree shortcuts: Delete/Backspace ask to delete the selected
         // entry; while the confirmation dialog is up, Enter confirms and
-        // Escape cancels.
+        // Escape cancels. F2 renames inline.
         cx.bind_keys([
             KeyBinding::new("delete", DeleteEntry, Some("FileTree")),
             KeyBinding::new("backspace", DeleteEntry, Some("FileTree")),
             KeyBinding::new("enter", ConfirmDelete, Some("FileTree")),
             KeyBinding::new("escape", CancelDelete, Some("FileTree")),
+            KeyBinding::new("f2", RenameEntry, Some("FileTree")),
         ]);
 
         let bounds = Bounds {
