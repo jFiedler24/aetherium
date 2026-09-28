@@ -20,6 +20,7 @@ use gpui::{
 use parking_lot::Mutex;
 
 use crate::assets;
+use crate::history::HistoryStore;
 use crate::log_highlight::LogHighlighter;
 use crate::profiles::{AuthMethod, Profile, ProfileStore};
 use crate::recents::{RecentEntry, RecentStore, now_unix, relative_time};
@@ -281,6 +282,8 @@ struct SessionTab {
     pending_upload_dirs: Vec<PathBuf>,
     /// Log highlighting for `tail -f` tabs; `None` for shell tabs.
     highlighter: Option<Arc<LogHighlighter>>,
+    /// Cross-session history recall position; `None` means the live line.
+    history_pos: Option<usize>,
 }
 
 impl SessionTab {
@@ -388,6 +391,9 @@ pub struct RootView {
     /// Zoomable terminal font size (cmd +/-, cmd+wheel); the grid re-measures
     /// and the PTY resizes automatically.
     terminal_font_size: f32,
+    /// Commands submitted in any session, persisted across launches and
+    /// recallable with Shift+↑ / Shift+↓ (roadmap 3.4).
+    history: HistoryStore,
     focus_handle: FocusHandle,
 }
 
@@ -423,6 +429,7 @@ impl RootView {
             pending_vscode_open: Vec::new(),
             local_echo: true,
             terminal_font_size: TERMINAL_FONT_SIZE,
+            history: HistoryStore::load(),
             focus_handle: cx.focus_handle(),
         };
         // Purge staging leftovers from previous runs (drag-out cancels,
@@ -857,6 +864,7 @@ impl RootView {
             transfer: None,
             pending_upload_dirs: Vec::new(),
             highlighter: None,
+            history_pos: None,
         };
         session.connect(profile);
         self.tabs.push(tab);
@@ -917,6 +925,7 @@ impl RootView {
             transfer: None,
             pending_upload_dirs: Vec::new(),
             highlighter: Some(Arc::new(LogHighlighter::load())),
+            history_pos: None,
         };
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1625,10 +1634,12 @@ impl RootView {
         };
         let terminal = tab.terminal.clone();
         let is_log = tab.is_log();
+        let tab_index = self.active;
+        let session_handle = tab.session.clone();
         let keystroke = &event.keystroke;
         let mods = &keystroke.modifiers;
 
-        // Scrollback navigation does not go to the PTY.
+        // Scrollback navigation and history recall do not go to the PTY.
         if mods.shift && !mods.control && !mods.alt {
             let scroll = match keystroke.key.as_str() {
                 "pageup" => Some(Scroll::PageUp),
@@ -1639,6 +1650,14 @@ impl RootView {
                 terminal.term.lock().scroll_display(scroll);
                 terminal.mark_dirty();
                 cx.notify();
+                return;
+            }
+            // Shift+↑/↓ recall the cross-session command history. Not in
+            // full-screen apps, where these keys belong to the app.
+            if matches!(keystroke.key.as_str(), "up" | "down")
+                && !terminal.term.lock().mode().contains(TermMode::ALT_SCREEN)
+            {
+                self.recall_history(keystroke.key == "up", cx);
                 return;
             }
         }
@@ -1682,7 +1701,8 @@ impl RootView {
                 } else {
                     text.into_bytes()
                 };
-                if let Some(session) = tab.session.as_ref() {
+                if let Some(session) = session_handle.as_ref() {
+                    self.track_command_input(tab_index, &bytes);
                     session.input(bytes);
                 }
                 self.scroll_to_bottom();
@@ -1701,7 +1721,8 @@ impl RootView {
             if self.local_echo && !mode.contains(TermMode::ALT_SCREEN) {
                 terminal.echo_input(&bytes);
             }
-            if let Some(session) = tab.session.as_ref() {
+            if let Some(session) = session_handle.as_ref() {
+                self.track_command_input(tab_index, &bytes);
                 session.input(bytes);
             }
             self.scroll_to_bottom();
@@ -1715,6 +1736,74 @@ impl RootView {
             tab.terminal.term.lock().scroll_display(Scroll::Bottom);
             tab.terminal.mark_dirty();
         }
+    }
+
+    /// Feed outgoing bytes into the input-line tracker; a submitted command
+    /// joins the cross-session history (persisted immediately). Any normal
+    /// typing leaves the history-recall position.
+    fn track_command_input(&mut self, tab_index: usize, bytes: &[u8]) {
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            return;
+        };
+        tab.history_pos = None;
+        if let Some(command) = tab.terminal.track_input(bytes) {
+            self.history.push(command);
+            if let Err(err) = self.history.save() {
+                self.log(LogLevel::Warn, format!("failed to save command history: {err:#}"));
+            }
+        }
+    }
+
+    /// Shift+↑/↓: recall the previous/next command from the cross-session
+    /// history. The recalled text replaces the input line: ^U asks the
+    /// remote line editor to clear it, then the command goes in as if
+    /// typed.
+    fn recall_history(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let tab_index = self.active;
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        if tab.is_log() || self.history.is_empty() {
+            return;
+        }
+        let history_len = self.history.len();
+        // Position within the history; the history length doubles as the
+        // live, not-yet-submitted line.
+        let pos = tab.history_pos.unwrap_or(history_len);
+        let new_pos = if backwards {
+            pos.saturating_sub(1)
+        } else {
+            (pos + 1).min(history_len)
+        };
+        if new_pos == pos {
+            return; // oldest entry, or already back at the live line
+        }
+        self.tabs[tab_index].history_pos = Some(new_pos);
+        let command = if new_pos == history_len {
+            String::new() // back at the live line: clear the recalled text
+        } else {
+            self.history.commands()[new_pos].clone()
+        };
+        let terminal = self.tabs[tab_index].terminal.clone();
+        let session = self.tabs[tab_index].session.clone();
+        terminal.set_input_line(&command);
+        let mut bytes = vec![0x15u8]; // ^U: kill the remote line before inserting.
+        bytes.extend_from_slice(command.as_bytes());
+        if self.local_echo && !command.is_empty() {
+            terminal.echo_input(command.as_bytes());
+        }
+        if let Some(session) = session {
+            session.input(bytes);
+        }
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            tab.status = if command.is_empty() {
+                "history: back to the current line".into()
+            } else {
+                format!("history: {command}")
+            };
+        }
+        self.scroll_to_bottom();
+        cx.notify();
     }
 
     /// Zoom the terminal font by `delta` pixels (cmd +/-, cmd+wheel), clamped

@@ -74,6 +74,10 @@ pub struct TerminalModel {
     /// Keystrokes echoed into the grid ahead of the server; the matching
     /// server echo is dropped in `feed` so input never appears twice.
     pending_echo: Arc<Mutex<Vec<u8>>>,
+    /// Reconstruction of the current input line (bytes sent since the last
+    /// Enter), fed from outgoing keystrokes for command-history capture.
+    /// Approximate: line editing beyond Backspace/^C/^U is not modeled.
+    input_line: Arc<Mutex<Vec<u8>>>,
 }
 
 impl TerminalModel {
@@ -95,6 +99,7 @@ impl TerminalModel {
             pty_writer,
             parser: Arc::new(Mutex::new(ansi::Processor::new())),
             pending_echo: Arc::new(Mutex::new(Vec::new())),
+            input_line: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -210,7 +215,77 @@ impl TerminalModel {
         // Drop any half-consumed escape sequence from the previous session.
         *self.parser.lock() = ansi::Processor::new();
         self.pending_echo.lock().clear();
+        self.input_line.lock().clear();
         self.set_dirty();
+    }
+
+    /// Feed bytes that are about to be sent to the PTY into the input-line
+    /// tracker. Returns the submitted command when the input contained
+    /// Enter.
+    pub fn track_input(&self, bytes: &[u8]) -> Option<String> {
+        let mut line = self.input_line.lock();
+        let mut submitted = None;
+        // Skip state for escape sequences: 1 = ESC seen, 2 = inside CSI,
+        // 3 = SS3 final byte still to skip.
+        let mut escape = 0u8;
+        for &byte in bytes {
+            if escape == 2 {
+                // CSI: parameters/intermediates are skipped until the final
+                // byte (0x40..=0x7E).
+                if (0x40..=0x7e).contains(&byte) {
+                    escape = 0;
+                }
+                continue;
+            }
+            if escape == 3 {
+                // SS3 final byte.
+                escape = 0;
+                continue;
+            }
+            if escape == 1 {
+                match byte {
+                    b'[' => {
+                        escape = 2;
+                        continue;
+                    }
+                    b'O' => {
+                        escape = 3;
+                        continue;
+                    }
+                    _ => escape = 0, // Alt-modified character: handle it.
+                }
+            }
+            match byte {
+                0x1b => escape = 1,
+                b'\r' | b'\n' => {
+                    let command = String::from_utf8_lossy(&line).trim().to_string();
+                    if !command.is_empty() {
+                        submitted = Some(command);
+                    }
+                    line.clear();
+                }
+                0x7f | 0x08 => {
+                    // Backspace removes the last character (char-aware so
+                    // multi-byte input pops whole).
+                    let mut text = String::from_utf8_lossy(&line).into_owned();
+                    text.pop();
+                    *line = text.into_bytes();
+                }
+                0x03 | 0x15 => {
+                    // ^C abandons the line, ^U kills it.
+                    line.clear();
+                }
+                byte if byte >= 0x20 && byte != 0x7f => line.push(byte),
+                _ => {}
+            }
+        }
+        submitted
+    }
+
+    /// Replace the tracked input line; history recall inserts the recalled
+    /// command so the reconstruction matches what the grid will show.
+    pub fn set_input_line(&self, line: &str) {
+        *self.input_line.lock() = line.as_bytes().to_vec();
     }
 
     /// Resize the grid; returns true if the size actually changed.
@@ -752,5 +827,41 @@ mod tests {
         model.selection_start(0, 5, Direction::Left);
         model.selection_update(0, 9, Direction::Left);
         assert_eq!(model.selected_text(), None);
+    }
+
+    #[test]
+    fn input_tracker_captures_submitted_commands() {
+        let model = TerminalModel::new(80, 24);
+        // Nothing submitted yet.
+        assert_eq!(model.track_input(b"ls -la"), None);
+        // Enter completes the command and clears the line.
+        assert_eq!(model.track_input(b"\r"), Some("ls -la".to_string()));
+        // The next command starts fresh.
+        assert_eq!(model.track_input(b"pwd\r"), Some("pwd".to_string()));
+        // Empty lines submit nothing.
+        assert_eq!(model.track_input(b"\r"), None);
+    }
+
+    #[test]
+    fn input_tracker_models_basic_line_editing() {
+        let model = TerminalModel::new(80, 24);
+        // Backspace deletes the previous character.
+        model.track_input(b"abc");
+        model.track_input(b"\x7f");
+        assert_eq!(model.track_input(b"d\r"), Some("abd".to_string()));
+        // Multi-byte characters pop whole.
+        model.track_input("é".as_bytes());
+        model.track_input(b"\x7f");
+        assert_eq!(model.track_input(b"x\r"), Some("x".to_string()));
+        // ^C and ^U abandon the line.
+        model.track_input(b"garbage");
+        model.track_input(b"\x03");
+        assert_eq!(model.track_input(b"ok\r"), Some("ok".to_string()));
+        model.track_input(b"nope");
+        model.track_input(b"\x15");
+        assert_eq!(model.track_input(b"fine\r"), Some("fine".to_string()));
+        // Escape sequences and tabs do not join the line.
+        model.track_input(b"\x1b[A\x1b[B\t");
+        assert_eq!(model.track_input(b"clean\r"), Some("clean".to_string()));
     }
 }

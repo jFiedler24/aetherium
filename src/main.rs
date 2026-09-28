@@ -6,6 +6,7 @@
 
 mod assets;
 mod crypto;
+mod history;
 mod log_highlight;
 mod profiles;
 mod recents;
