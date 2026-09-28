@@ -14,10 +14,10 @@ This file tracks planned features and implementation progress for the aetherium 
 
 - [x] Backend emits `TransferStarted`, `TransferProgress` (with speed + ETA), `TransferDone`.
 - [x] Status bar shows label, done/total, percentage, speed, and ETA.
-- [ ] Format byte counts as KB/MB/GB — done via existing `format_size`.
-- [ ] Render a graphical progress bar with percentage (currently text-only).
+- [x] Format byte counts as KB/MB/GB — done via existing `format_size`.
+- [x] Render a graphical progress bar with percentage (cancel button beside it).
 - [ ] Support multiple concurrent transfers (queue + per-transfer rows).
-- [ ] Add a "Cancel transfer" action.
+- [x] Add a "Cancel transfer" action — a shared cancel flag checked between chunks; partial files are removed.
 
 Implementation notes: `TransferProgress` in [src/session.rs](src/session.rs) now
 tracks a rolling 3-second sample window to estimate bytes/sec and ETA; the
@@ -128,8 +128,9 @@ tracks a rolling 3-second sample window to estimate bytes/sec and ETA; the
 | Feature | Status | Notes |
 |---|---|---|
 | SFTP upload/download | `[x]` | Working, progress events emitted |
-| Progress bar in status bar | `[x]` | Text-based; graphical bar still open |
+| Progress bar in status bar | `[x]` | Graphical bar + cancel button |
 | Transfer speed/ETA | `[x]` | Rolling 3s window estimate |
+| Transfer cancel | `[x]` | Shared flag checked between chunks, partials removed |
 | Encrypted password storage | `[x]` | AES-256-GCM, key in `~/.config/aetherium/key` |
 | `known_hosts` verification | `[x]` | Trust-on-first-use + reject changed keys |
 | Auto-detect default SSH keys | `[x]` | `id_ed25519` → `id_rsa` → `id_ecdsa` |

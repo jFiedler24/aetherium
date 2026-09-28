@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -277,6 +278,8 @@ struct SessionTab {
     tree_focus_handle: FocusHandle,
     /// Active file transfer: (label, done bytes, total bytes, bytes/sec, eta seconds).
     transfer: Option<(String, u64, u64, f64, u64)>,
+    /// Set to abort the active transfer; shared with the backend task.
+    transfer_cancel: Option<Arc<AtomicBool>>,
     /// Remote directories that pending uploads write into; refreshed every
     /// time a transfer completes.
     pending_upload_dirs: Vec<PathBuf>,
@@ -622,6 +625,7 @@ impl RootView {
             SessionEvent::TransferDone { label } => {
                 let tab = &mut self.tabs[index];
                 tab.transfer = None;
+                tab.transfer_cancel = None;
                 tab.status = label.clone();
                 // Refresh every directory that pending uploads write into.
                 let dirs = std::mem::take(&mut tab.pending_upload_dirs);
@@ -636,6 +640,26 @@ impl RootView {
                 }
                 let tab_label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Info, format!("{tab_label}: {label}"));
+            }
+            SessionEvent::TransferCancelled { label } => {
+                let tab = &mut self.tabs[index];
+                tab.transfer = None;
+                tab.transfer_cancel = None;
+                tab.status = format!("cancelled {label}");
+                // Refresh every directory pending uploads wrote into, like a
+                // finished transfer (completed files stay, partials are gone).
+                let dirs = std::mem::take(&mut tab.pending_upload_dirs);
+                let session_id = tab.session_id;
+                if let Some(session) = tab.session.as_ref() {
+                    for dir in &dirs {
+                        if let Some(node) = find_node(&mut tab.tree, dir) {
+                            node.loading = true;
+                        }
+                        session.list_dir(session_id, dir.clone());
+                    }
+                }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Warn, format!("{tab_label}: cancelled {label}"));
             }
             SessionEvent::EntryMoved { from, to } => {
                 let tab = &mut self.tabs[index];
@@ -721,6 +745,7 @@ impl RootView {
                 tab.root_path = None;
                 tab.tree_selection = None;
                 tab.transfer = None;
+                tab.transfer_cancel = None;
                 tab.pending_upload_dirs.clear();
                 tab.connecting_profile = None;
                 self.tree_drag_target = None;
@@ -862,6 +887,7 @@ impl RootView {
             tree_selection: None,
             tree_focus_handle: cx.focus_handle(),
             transfer: None,
+            transfer_cancel: None,
             pending_upload_dirs: Vec::new(),
             highlighter: None,
             history_pos: None,
@@ -923,6 +949,7 @@ impl RootView {
             tree_selection: None,
             tree_focus_handle: cx.focus_handle(),
             transfer: None,
+            transfer_cancel: None,
             pending_upload_dirs: Vec::new(),
             highlighter: Some(Arc::new(LogHighlighter::load())),
             history_pos: None,
@@ -1065,16 +1092,26 @@ impl RootView {
         if paths.is_empty() {
             return;
         }
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let Some(session) = tab.session.as_ref() else {
-            return;
-        };
-        for local in paths {
-            session.upload(tab.session_id, local.clone(), remote_dir.clone());
+        // One flag per batch: cancelling aborts every upload queued here.
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let Some(tab) = self.active_tab() else {
+                return;
+            };
+            let Some(session) = tab.session.as_ref() else {
+                return;
+            };
+            for local in paths {
+                session.upload(
+                    tab.session_id,
+                    local.clone(),
+                    remote_dir.clone(),
+                    cancel.clone(),
+                );
+            }
         }
         let tab = self.active_tab_mut().expect("checked above");
+        tab.transfer_cancel = Some(cancel);
         if !tab.pending_upload_dirs.contains(&remote_dir) {
             tab.pending_upload_dirs.push(remote_dir);
         }
@@ -1099,8 +1136,12 @@ impl RootView {
             cx.notify();
             return;
         };
+        let cancel = Arc::new(AtomicBool::new(false));
         if let Some(session) = tab.session.as_ref() {
-            session.download(tab.session_id, remote);
+            session.download(tab.session_id, remote, cancel.clone());
+            if let Some(tab) = self.active_tab_mut() {
+                tab.transfer_cancel = Some(cancel);
+            }
         }
         cx.notify();
     }
@@ -1238,6 +1279,7 @@ impl RootView {
         tab.root_path = None;
         tab.tree_selection = None;
         tab.transfer = None;
+        tab.transfer_cancel = None;
         tab.terminal_focus_pending = true;
         // Drag-out staging belonged to the dead session.
         self.purge_staged_for(old_session_id);
@@ -1735,6 +1777,19 @@ impl RootView {
         if let Some(tab) = self.active_tab() {
             tab.terminal.term.lock().scroll_display(Scroll::Bottom);
             tab.terminal.mark_dirty();
+        }
+    }
+
+    /// Abort the active transfer of the active tab. The backend task checks
+    /// the flag between chunks and removes the partial file.
+    fn cancel_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if let Some(cancel) = tab.transfer_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            tab.status = "cancelling transfer…".into();
+            cx.notify();
         }
     }
 
@@ -3799,7 +3854,12 @@ impl RootView {
             ConnState::Connected => ("● connected", theme::success()),
         };
         // Active transfer progress, shown between the state and the status
-        // message.
+        // message: a graphical bar when the total is known, plus the
+        // label/size/speed/ETA text and a cancel button.
+        let transfer_bar = transfer
+            .as_ref()
+            .filter(|(_, _, total, _, _)| *total > 0)
+            .map(|(_, done, total, _, _)| (*done as f64 / *total as f64).min(1.0));
         let transfer_text = transfer.as_ref().map(|(label, done, total, bps, eta)| {
             let mut parts = Vec::new();
             parts.push(label.clone());
@@ -3835,6 +3895,25 @@ impl RootView {
             .px_3()
             .text_xs()
             .child(div().text_color(state_color).child(state_text))
+            .when_some(transfer_bar, |bar, pct| {
+                const BAR_WIDTH: f32 = 120.;
+                bar.child(
+                    div()
+                        .id("transfer-bar")
+                        .flex_none()
+                        .w(px(BAR_WIDTH))
+                        .h(px(6.))
+                        .rounded_sm()
+                        .bg(theme::border())
+                        .child(
+                            div()
+                                .h_full()
+                                .w(px(BAR_WIDTH * pct as f32))
+                                .rounded_sm()
+                                .bg(theme::accent()),
+                        ),
+                )
+            })
             .when_some(transfer_text, |bar, text| {
                 bar.child(
                     div()
@@ -3842,6 +3921,19 @@ impl RootView {
                         .text_color(theme::warning())
                         .truncate()
                         .child(text),
+                )
+                .child(
+                    div()
+                        .id("transfer-cancel")
+                        .flex_none()
+                        .px_1()
+                        .cursor_pointer()
+                        .text_color(theme::text_dim())
+                        .hover(|style| style.text_color(theme::danger()))
+                        .child("✕")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_transfer(cx);
+                        })),
                 )
             })
             .when(can_reconnect, |bar| {

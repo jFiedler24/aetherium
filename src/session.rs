@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
@@ -30,9 +31,11 @@ pub enum Command {
     ResizePty { cols: u32, rows: u32 },
     ListDir { session_id: u64, path: PathBuf },
     /// Upload a local file or directory (recursively) into `remote_dir`.
-    Upload { session_id: u64, local: PathBuf, remote_dir: PathBuf },
+    /// Set `cancel` to abort the transfer (checked between chunks).
+    Upload { session_id: u64, local: PathBuf, remote_dir: PathBuf, cancel: Arc<AtomicBool> },
     /// Download a remote file or directory (recursively) into ~/Downloads.
-    Download { session_id: u64, remote: PathBuf },
+    /// Set `cancel` to abort the transfer (checked between chunks).
+    Download { session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool> },
     /// Download a remote file to a temp directory for drag-out. The UI is
     /// notified via `Event::TempDownloadReady` when the file is available
     /// locally.
@@ -75,6 +78,9 @@ pub enum Event {
     /// The transfer finished successfully; the label names the result
     /// (target directory for uploads, saved path for downloads).
     TransferDone { label: String },
+    /// The transfer was aborted via its cancel flag (partial files are
+    /// removed where possible).
+    TransferCancelled { label: String },
     /// A drag-and-drop move finished; the UI refreshes the directories that
     /// lost or gained an entry.
     EntryMoved { from: PathBuf, to: PathBuf },
@@ -167,12 +173,18 @@ impl SessionHandle {
         self.send(Command::ListDir { session_id, path });
     }
 
-    pub fn upload(&self, session_id: u64, local: PathBuf, remote_dir: PathBuf) {
-        self.send(Command::Upload { session_id, local, remote_dir });
+    pub fn upload(
+        &self,
+        session_id: u64,
+        local: PathBuf,
+        remote_dir: PathBuf,
+        cancel: Arc<AtomicBool>,
+    ) {
+        self.send(Command::Upload { session_id, local, remote_dir, cancel });
     }
 
-    pub fn download(&self, session_id: u64, remote: PathBuf) {
-        self.send(Command::Download { session_id, remote });
+    pub fn download(&self, session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool>) {
+        self.send(Command::Download { session_id, remote, cancel });
     }
 
     /// Download a remote file to a temp directory for drag-out.
@@ -466,7 +478,7 @@ async fn command_loop(
                             }
                         });
                     }
-                    Some(Command::Upload { session_id, local, remote_dir }) => {
+                    Some(Command::Upload { session_id, local, remote_dir, cancel }) => {
                         // Like ListDir, transfers run off the session loop so
                         // terminal I/O keeps flowing while bytes move. The
                         // session tag is for the UI's bookkeeping; the backend
@@ -475,15 +487,15 @@ async fn command_loop(
                         let sftp = sftp.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            upload(&sftp, &event_tx, &local, &remote_dir).await;
+                            upload(&sftp, &event_tx, &local, &remote_dir, &cancel).await;
                         });
                     }
-                    Some(Command::Download { session_id, remote }) => {
+                    Some(Command::Download { session_id, remote, cancel }) => {
                         let _ = session_id;
                         let sftp = sftp.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            download(&sftp, &event_tx, &remote).await;
+                            download(&sftp, &event_tx, &remote, &cancel).await;
                         });
                     }
                     Some(Command::DownloadToTemp { session_id, remote }) => {
@@ -726,25 +738,31 @@ fn local_tree_size(path: &std::path::Path) -> u64 {
 }
 
 /// Upload `local` (file or directory, recursive) into `remote_dir`.
+/// Aborts when `cancel` is set; the partial remote file is removed.
 async fn upload(
     sftp: &russh_sftp::client::SftpSession,
     event_tx: &std_mpsc::Sender<Event>,
     local: &std::path::Path,
     remote_dir: &std::path::Path,
+    cancel: &AtomicBool,
 ) {
     let label = format!("upload {} → {}", local.display(), remote_dir.display());
     let total = local_tree_size(local);
     let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
     let mut progress = TransferProgress::new(event_tx, &label, total);
-    match upload_path(sftp, local, remote_dir, &mut progress).await {
+    match upload_path(sftp, local, remote_dir, &mut progress, cancel).await {
         Ok(()) => {
             let _ = event_tx.send(Event::TransferDone { label });
         }
         Err(err) => {
-            let _ = event_tx.send(Event::Error(format!(
-                "uploading {}: {err:#}",
-                local.display()
-            )));
+            if cancel.load(Ordering::Relaxed) {
+                let _ = event_tx.send(Event::TransferCancelled { label });
+            } else {
+                let _ = event_tx.send(Event::Error(format!(
+                    "uploading {}: {err:#}",
+                    local.display()
+                )));
+            }
         }
     }
 }
@@ -754,8 +772,13 @@ async fn upload_path(
     local: &std::path::Path,
     remote_dir: &std::path::Path,
     progress: &mut TransferProgress<'_>,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     use std::io::Read as _;
+
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!("cancelled");
+    }
 
     let metadata = std::fs::metadata(local)
         .with_context(|| format!("reading metadata of {}", local.display()))?;
@@ -773,8 +796,14 @@ async fn upload_path(
             .with_context(|| format!("reading directory {}", local.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("reading {}", local.display()))?;
-            Box::pin(upload_path(sftp, &entry.path(), std::path::Path::new(&sub_dir), progress))
-                .await?;
+            Box::pin(upload_path(
+                sftp,
+                &entry.path(),
+                std::path::Path::new(&sub_dir),
+                progress,
+                cancel,
+            ))
+            .await?;
         }
         return Ok(());
     }
@@ -789,6 +818,12 @@ async fn upload_path(
 
     let mut buffer = vec![0u8; TRANSFER_CHUNK];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            // Drop the partial remote file; empty directories left behind
+            // are harmless and the rmdir failure modes differ per server.
+            let _ = sftp.remove_file(remote_path.clone()).await;
+            anyhow::bail!("cancelled");
+        }
         // Local disk reads are blocking but fast; the SFTP write below still
         // yields to the runtime between chunks.
         let read = local_file
@@ -811,11 +846,13 @@ async fn upload_path(
 }
 
 /// Download `remote` (file or directory, recursive) into ~/Downloads,
-/// preserving the base name and de-duplicating on collision.
+/// preserving the base name and de-duplicating on collision. Aborts when
+/// `cancel` is set; the partial local file is removed.
 async fn download(
     sftp: &russh_sftp::client::SftpSession,
     event_tx: &std_mpsc::Sender<Event>,
     remote: &std::path::Path,
+    cancel: &AtomicBool,
 ) {
     let Some(home) = dirs::home_dir() else {
         let _ = event_tx.send(Event::Error("download: no home directory".into()));
@@ -845,17 +882,21 @@ async fn download(
     };
     let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
     let mut progress = TransferProgress::new(event_tx, &label, total);
-    match download_path(sftp, remote, &downloads, &mut progress).await {
+    match download_path(sftp, remote, &downloads, &mut progress, cancel).await {
         Ok(saved) => {
             let _ = event_tx.send(Event::TransferDone {
                 label: format!("{} → {}", label, saved.display()),
             });
         }
         Err(err) => {
-            let _ = event_tx.send(Event::Error(format!(
-                "downloading {}: {err:#}",
-                remote.display()
-            )));
+            if cancel.load(Ordering::Relaxed) {
+                let _ = event_tx.send(Event::TransferCancelled { label });
+            } else {
+                let _ = event_tx.send(Event::Error(format!(
+                    "downloading {}: {err:#}",
+                    remote.display()
+                )));
+            }
         }
     }
 }
@@ -999,8 +1040,13 @@ async fn download_path(
     remote: &std::path::Path,
     local_dir: &std::path::Path,
     progress: &mut TransferProgress<'_>,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf> {
     use std::io::Write as _;
+
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!("cancelled");
+    }
 
     let name = remote
         .file_name()
@@ -1029,6 +1075,7 @@ async fn download_path(
                 std::path::Path::new(&entry.path()),
                 &target,
                 progress,
+                cancel,
             ))
             .await?;
         }
@@ -1045,6 +1092,12 @@ async fn download_path(
 
     let mut buffer = vec![0u8; TRANSFER_CHUNK];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            // Drop the partial local file; empty directories left behind
+            // are harmless.
+            let _ = std::fs::remove_file(&target);
+            anyhow::bail!("cancelled");
+        }
         let read = remote_file
             .read(&mut buffer)
             .await
