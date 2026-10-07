@@ -32,6 +32,7 @@ const SIGNAL_MEDIUM: &str = include_str!("../zed_icons/signal_medium.svg");
 const DISCONNECTED: &str = include_str!("../zed_icons/disconnected.svg");
 const FOLDER: &str = include_str!("../zed_icons/folder.svg");
 const FOLDER_OPEN: &str = include_str!("../zed_icons/folder_open.svg");
+const ARROW_RIGHT: &str = include_str!("../zed_icons/arrow_right.svg");
 
 /// App icon, shown next to the brand name in the header.
 pub const ICON_MAIN_EXECUTABLE: &str = "aetherium/icons/main_executable.svg";
@@ -67,6 +68,8 @@ pub const ICON_DISCONNECTED: &str = "aetherium/icons/disconnected.svg";
 pub const ICON_FOLDER: &str = "aetherium/icons/folder.svg";
 /// File tree: expanded directory.
 pub const ICON_FOLDER_OPEN: &str = "aetherium/icons/folder_open.svg";
+/// Connect button: log into the selected profile.
+pub const ICON_ARROW_RIGHT: &str = "aetherium/icons/arrow_right.svg";
 
 const BUILD_TOOL_PATH: &str = "aetherium/icons/build_tool.svg";
 const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
@@ -158,6 +161,7 @@ impl AssetSource for EmbeddedAssets {
             ICON_DISCONNECTED => Some(DISCONNECTED.as_bytes()),
             ICON_FOLDER => Some(FOLDER.as_bytes()),
             ICON_FOLDER_OPEN => Some(FOLDER_OPEN.as_bytes()),
+            ICON_ARROW_RIGHT => Some(ARROW_RIGHT.as_bytes()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

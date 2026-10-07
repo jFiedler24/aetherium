@@ -3354,19 +3354,46 @@ impl RootView {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child(svg().path(assets::ICON_CONFIGURATION).w(px(12.)).h(px(12.)))
+                    .child(
+                        svg()
+                            .path(assets::ICON_CONFIGURATION)
+                            .w(px(12.))
+                            .h(px(12.))
+                            .text_color(theme::text_dim()),
+                    )
                     .child(div().text_xs().text_color(theme::text_dim()).child("PROFILES")),
             )
             .child(self.render_profile_list(cx))
             .child(
-                div().px_2().pb_2().child(header_button(
-                    "connect",
-                    "Connect",
-                    cx,
-                    |this, window, cx| {
-                        this.connect_selected(window, cx);
-                    },
-                )),
+                div().px_2().pb_2().child(
+                    div()
+                        .id("connect")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(theme::button())
+                        .text_color(theme::accent())
+                        .hover(|style| style.bg(theme::button_hover()))
+                        .active(|style| style.opacity(0.8))
+                        .cursor_pointer()
+                        .tooltip(tip("Connect to the selected profile"))
+                        .child(
+                            svg()
+                                .path(assets::ICON_ARROW_RIGHT)
+                                .w(px(13.))
+                                .h(px(13.))
+                                .text_color(theme::accent()),
+                        )
+                        .child("Connect")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.connect_selected(window, cx);
+                        })),
+                ),
             )
             .child(section_label("RECENT SESSIONS"))
             .child(self.render_recents(cx))
