@@ -16,7 +16,7 @@ use gpui::{
     Entity, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Hsla,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle,
     ScrollWheelEvent, ShapedLine, SharedString, TextRun, Transformation, UnderlineStyle, Window,
-    canvas, div, fill, font, outline, point, prelude::*, px, radians, rgb, rgba, size, svg,
+    canvas, div, fill, font, outline, point, prelude::*, px, radians, rgb, size, svg,
 };
 use parking_lot::Mutex;
 
@@ -355,6 +355,8 @@ pub struct RootView {
     /// Deleting is permanent over SFTP (no trash), so both the Delete key
     /// and the context menu ask first.
     confirm_delete: Option<PathBuf>,
+    /// The theme switcher dropdown is open (anchored under the header).
+    theme_menu: bool,
     /// Inline rename/create editor in the file tree, if one is open.
     tree_editor: Option<TreeEditor>,
     /// Entry under the cursor during an internal file-tree drag.
@@ -421,6 +423,7 @@ impl RootView {
             next_tab_id: 0,
             context_menu: None,
             confirm_delete: None,
+            theme_menu: false,
             tree_editor: None,
             tree_drag_target: None,
             tree_dragging: None,
@@ -1294,6 +1297,18 @@ impl RootView {
         self.purge_staged_for(old_session_id);
         let label = Self::tab_log_label(&self.tabs[self.active]);
         self.log(LogLevel::Info, format!("{label}: reconnecting"));
+        cx.notify();
+    }
+
+    /// Switch the active theme (from the header's theme menu). Persists the
+    /// choice; the whole UI re-reads colors on the next paint.
+    fn apply_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        if theme::set_active(&name) {
+            self.theme_menu = false;
+            self.status = format!("theme: {name}");
+        } else {
+            self.status = format!("unknown theme: {name}");
+        }
         cx.notify();
     }
 
@@ -2197,45 +2212,9 @@ impl ProfileForm {
 
 // --- terminal colors --------------------------------------------------------
 
-/// Zed default-dark terminal palette: the `terminal_ansi_*` colors of Zed's
-/// built-in theme (MIT-licensed), transcribed from Zed's color scales. The
-/// black/white scales are alpha ramps that Zed composites over the terminal
-/// background; the alpha is kept so the rendering matches. Normal colors are
-/// scale step 11, bright colors step 10, dim colors step 9.
-const ANSI_NORMAL: [u32; 8] = [
-    0x000000f2, // black
-    0xff9592ff, // red
-    0x3dd68cff, // green
-    0xf5e147ff, // yellow
-    0x70b8ffff, // blue
-    0xbaa7ffff, // magenta
-    0x4ccce6ff, // cyan
-    0xeeeeecff, // white
-];
-const ANSI_BRIGHT: [u32; 8] = [
-    0x000000e6, // bright black
-    0xec5d5eff, // bright red
-    0x33b074ff, // bright green
-    0xffff57ff, // bright yellow
-    0x3b9effff, // bright blue
-    0x7d66d9ff, // bright magenta
-    0x23afd0ff, // bright cyan
-    0xb5b3adff, // bright white
-];
-const ANSI_DIM: [u32; 8] = [
-    0x000000cc, // dim black
-    0xe5484dff, // dim red
-    0x30a46cff, // dim green
-    0xffe629ff, // dim yellow
-    0x0090ffff, // dim blue
-    0x6e56cfff, // dim magenta
-    0x00a2c7ff, // dim cyan
-    0x7c7b74ff, // dim white
-];
-/// Default terminal foreground (`terminal_foreground`, white scale step 12).
-const TERM_FG: u32 = 0xfffffff2;
-/// Default terminal background (`terminal_background` = theme background).
-const TERM_BG: u32 = 0x22252bff;
+// The terminal palette lives in the active theme: foreground/background and
+// the 16 ANSI colors come from the theme JSON (`terminal.*` keys); see
+// `theme.rs`.
 
 fn rgb_to_hsla(color: Rgb) -> Hsla {
     rgb((color.r as u32) << 16 | (color.g as u32) << 8 | color.b as u32).into()
@@ -2244,8 +2223,8 @@ fn rgb_to_hsla(color: Rgb) -> Hsla {
 /// 256-color lookup: 0-15 palette, 16-231 cube, 232-255 grayscale.
 fn indexed_color(index: u8) -> Hsla {
     match index {
-        0..=7 => rgba(ANSI_NORMAL[index as usize]).into(),
-        8..=15 => rgba(ANSI_BRIGHT[index as usize - 8]).into(),
+        0..=7 => theme::ansi_normal()[index as usize],
+        8..=15 => theme::ansi_bright()[index as usize - 8],
         16..=231 => {
             let idx = index - 16;
             let r = idx / 36;
@@ -2262,42 +2241,46 @@ fn indexed_color(index: u8) -> Hsla {
 }
 
 fn named_color(color: NamedColor, dim: bool) -> Hsla {
-    fn palette(colors: &[u32; 8], index: usize, dim: bool) -> Hsla {
-        rgba(if dim { ANSI_DIM[index] } else { colors[index] }).into()
-    }
+    let normal = theme::ansi_normal();
+    let bright = theme::ansi_bright();
+    let dims = theme::ansi_dim();
     match color {
         NamedColor::Foreground => {
-            rgba(if dim { 0xffffffcc } else { TERM_FG }).into()
+            if dim {
+                theme::term_fg_dim()
+            } else {
+                theme::term_fg()
+            }
         }
-        NamedColor::Background => rgba(TERM_BG).into(),
-        NamedColor::BrightForeground => rgba(0xffffffe6).into(),
-        NamedColor::Black => palette(&ANSI_NORMAL, 0, dim),
-        NamedColor::Red => palette(&ANSI_NORMAL, 1, dim),
-        NamedColor::Green => palette(&ANSI_NORMAL, 2, dim),
-        NamedColor::Yellow => palette(&ANSI_NORMAL, 3, dim),
-        NamedColor::Blue => palette(&ANSI_NORMAL, 4, dim),
-        NamedColor::Magenta => palette(&ANSI_NORMAL, 5, dim),
-        NamedColor::Cyan => palette(&ANSI_NORMAL, 6, dim),
-        NamedColor::White => palette(&ANSI_NORMAL, 7, dim),
-        NamedColor::BrightBlack => palette(&ANSI_BRIGHT, 0, false),
-        NamedColor::BrightRed => palette(&ANSI_BRIGHT, 1, false),
-        NamedColor::BrightGreen => palette(&ANSI_BRIGHT, 2, false),
-        NamedColor::BrightYellow => palette(&ANSI_BRIGHT, 3, false),
-        NamedColor::BrightBlue => palette(&ANSI_BRIGHT, 4, false),
-        NamedColor::BrightMagenta => palette(&ANSI_BRIGHT, 5, false),
-        NamedColor::BrightCyan => palette(&ANSI_BRIGHT, 6, false),
-        NamedColor::BrightWhite => palette(&ANSI_BRIGHT, 7, false),
-        NamedColor::DimBlack => rgba(ANSI_DIM[0]).into(),
-        NamedColor::DimRed => rgba(ANSI_DIM[1]).into(),
-        NamedColor::DimGreen => rgba(ANSI_DIM[2]).into(),
-        NamedColor::DimYellow => rgba(ANSI_DIM[3]).into(),
-        NamedColor::DimBlue => rgba(ANSI_DIM[4]).into(),
-        NamedColor::DimMagenta => rgba(ANSI_DIM[5]).into(),
-        NamedColor::DimCyan => rgba(ANSI_DIM[6]).into(),
-        NamedColor::DimWhite => rgba(ANSI_DIM[7]).into(),
+        NamedColor::Background => theme::term_bg(),
+        NamedColor::BrightForeground => theme::term_fg_bright(),
+        NamedColor::Black => normal[0],
+        NamedColor::Red => normal[1],
+        NamedColor::Green => normal[2],
+        NamedColor::Yellow => normal[3],
+        NamedColor::Blue => normal[4],
+        NamedColor::Magenta => normal[5],
+        NamedColor::Cyan => normal[6],
+        NamedColor::White => normal[7],
+        NamedColor::BrightBlack => bright[0],
+        NamedColor::BrightRed => bright[1],
+        NamedColor::BrightGreen => bright[2],
+        NamedColor::BrightYellow => bright[3],
+        NamedColor::BrightBlue => bright[4],
+        NamedColor::BrightMagenta => bright[5],
+        NamedColor::BrightCyan => bright[6],
+        NamedColor::BrightWhite => bright[7],
+        NamedColor::DimBlack => dims[0],
+        NamedColor::DimRed => dims[1],
+        NamedColor::DimGreen => dims[2],
+        NamedColor::DimYellow => dims[3],
+        NamedColor::DimBlue => dims[4],
+        NamedColor::DimMagenta => dims[5],
+        NamedColor::DimCyan => dims[6],
+        NamedColor::DimWhite => dims[7],
         // Cursor color and dim/bright foreground/background variants fall
         // back to the defaults.
-        _ => rgba(TERM_FG).into(),
+        _ => theme::term_fg(),
     }
 }
 
@@ -2562,7 +2545,7 @@ impl RootView {
                 .flex_1()
                 .min_w(px(0.))
                 .h_full()
-                .bg(rgba(TERM_BG))
+                .bg(theme::term_bg())
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2583,7 +2566,7 @@ impl RootView {
             .flex_1()
             .min_w(px(0.))
             .h_full()
-            .bg(rgba(TERM_BG))
+            .bg(theme::term_bg())
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(Self::on_terminal_key_down))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
@@ -2806,7 +2789,7 @@ fn terminal_prepaint(
     let (rows, cursor, selection) = collect_runs(terminal, highlighter);
     // Same conversion path as `cell_colors`' default background, so plain
     // cells compare equal and skip their background fill.
-    let default_bg = rgba(TERM_BG).into();
+    let default_bg = theme::term_bg();
 
     let mut lines = Vec::new();
     let mut backgrounds = Vec::new();
@@ -2894,7 +2877,7 @@ fn terminal_prepaint(
                 &[TextRun {
                     len,
                     font: font.clone(),
-                    color: rgba(TERM_BG).into(),
+                    color: theme::term_bg(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -3076,6 +3059,10 @@ impl RootView {
                 } else {
                     "local echo off".into()
                 };
+                cx.notify();
+            }))
+            .child(header_button("theme", &theme::active_name(), cx, |this, _window, cx| {
+                this.theme_menu = !this.theme_menu;
                 cx.notify();
             }))
             .into_any_element()
@@ -4384,6 +4371,11 @@ impl Render for RootView {
             // and the file tree does not have focus (a handled FileTree key
             // binding never reaches this listener).
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if this.theme_menu && event.keystroke.key.as_str() == "escape" {
+                    this.theme_menu = false;
+                    cx.notify();
+                    return;
+                }
                 if this.confirm_delete.is_none() {
                     return;
                 }
@@ -4420,6 +4412,99 @@ impl Render for RootView {
                     .child(self.render_terminal(cx)),
             )
             .child(self.render_statusbar(cx));
+
+        // Theme switcher dropdown, anchored under the header: a transparent
+        // layer to dismiss, then the menu (same pattern as the context menu).
+        if self.theme_menu {
+            let active = theme::active_name();
+            let themes = theme::list();
+            let mut menu = div()
+                .id("theme-menu")
+                .absolute()
+                .top(px(HEADER_HEIGHT))
+                .right(px(8.))
+                .w(px(200.))
+                .max_h(px(400.))
+                .overflow_y_scroll()
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::border())
+                .rounded_md()
+                .p_1()
+                .flex()
+                .flex_col()
+                .shadow_md();
+            let mut last_appearance = None;
+            for (ix, (name, appearance)) in themes.into_iter().enumerate() {
+                if last_appearance != Some(appearance) {
+                    last_appearance = Some(appearance);
+                    menu = menu.child(
+                        div()
+                            .px_2()
+                            .pt_1()
+                            .pb_0p5()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text_dim())
+                            .child(match appearance {
+                                theme::Appearance::Dark => "Dark",
+                                theme::Appearance::Light => "Light",
+                            }),
+                    );
+                }
+                let is_active = name == active;
+                let row_name = name.clone();
+                menu = menu.child(
+                    div()
+                        .id(("theme-item", ix))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(if is_active {
+                            theme::accent()
+                        } else {
+                            theme::text()
+                        })
+                        .hover(|item| item.bg(theme::selection()))
+                        .child(format!("{} {}", if is_active { "✓" } else { " " }, name))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.apply_theme(row_name.clone(), cx);
+                        })),
+                );
+            }
+            root = root
+                .child(
+                    div()
+                        .id("theme-menu-dismiss")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.theme_menu = false;
+                            cx.notify();
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                            this.theme_menu = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    // Swallow presses that start inside the menu so they
+                    // never reach the dismiss layer below: otherwise the
+                    // dismiss closes the menu between the row's mouse-down
+                    // and mouse-up, and the row's click never completes.
+                    menu.on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    })),
+                );
+        }
 
         // Right-click context menu from the file tree, painted above
         // everything else: a transparent layer to dismiss, then the menu.
@@ -4544,7 +4629,17 @@ impl Render for RootView {
                                     this.context_menu = None;
                                     this.ask_delete(delete_path.clone(), cx);
                                 })),
-                        ),
+                        )
+                        // Swallow presses that start inside the menu so they
+                        // never reach the dismiss layer below (same race as
+                        // the theme menu: the dismiss would close the menu
+                        // between a row's mouse-down and mouse-up).
+                        .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                        })),
                 );
         }
 

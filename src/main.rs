@@ -13,87 +13,8 @@ mod recents;
 mod session;
 mod terminal_model;
 mod text_field;
+mod theme;
 mod ui;
-
-/// Zed-like dark theme constants.
-///
-/// All colors are transcribed from Zed's built-in default dark theme
-/// (`fallback_themes.rs` in zed's `theme` crate, MIT-licensed).
-pub(crate) mod theme {
-    use gpui::{Hsla, hsla};
-
-    /// UI font family; matches Zed's default. Falls back to the system UI
-    /// font when Zed's fonts are not installed — drop the OFL-licensed
-    /// `Zed Sans`/`Zed Mono` files into `~/.config/aetherium/fonts/` to make
-    /// the app use them without a system-wide install.
-    pub const FONT_UI: &str = "Zed Sans";
-    /// Monospace font family for the terminal. Must be a true monospace:
-    /// every cell metric (cursor position, selection, mouse mapping) derives
-    /// from one advance width. Bundled with the app (see `assets.rs`), so it
-    /// resolves everywhere — unlike "Zed Mono"/"SF Mono", which silently fell
-    /// back to a proportional font on stock macOS and broke the grid.
-    /// Users who install Zed Mono into the fonts dir can switch back.
-    pub const FONT_MONO: &str = "Lilex";
-
-    /// Window / terminal background (`background`).
-    pub fn bg() -> Hsla {
-        hsla(215. / 360., 0.12, 0.15, 1.)
-    }
-    /// Panels (header, sidebar, status bar) — `panel_background`.
-    pub fn panel() -> Hsla {
-        hsla(215. / 360., 0.12, 0.15, 1.)
-    }
-    /// Borders between panels (`border_variant`).
-    pub fn border() -> Hsla {
-        hsla(228. / 360., 0.08, 0.25, 1.)
-    }
-    /// Primary text (`text`).
-    pub fn text() -> Hsla {
-        hsla(221. / 360., 0.11, 0.86, 1.)
-    }
-    /// Secondary text (`text_muted`).
-    pub fn text_dim() -> Hsla {
-        hsla(218. / 360., 0.07, 0.46, 1.)
-    }
-    /// Accent blue (`icon_accent`).
-    pub fn accent() -> Hsla {
-        hsla(207.8 / 360., 0.81, 0.66, 1.)
-    }
-    /// Terminal/editor cursor (`players.local.cursor` of Zed's default dark).
-    pub fn cursor() -> Hsla {
-        hsla(216. / 360., 0.71, 0.53, 1.)
-    }
-    /// Selected list-row background (`element_selected`).
-    pub fn selection() -> Hsla {
-        hsla(224. / 360., 0.113, 0.261, 1.)
-    }
-    /// Hover highlight (`element_hover`).
-    pub fn hover() -> Hsla {
-        hsla(225. / 360., 0.118, 0.267, 1.)
-    }
-    /// Drop-target highlight while dragging over the file tree
-    /// (`drop_target_background`).
-    pub fn drop_target() -> Hsla {
-        hsla(220. / 360., 0.083, 0.214, 1.)
-    }
-    /// Buttons (`element_background`).
-    pub fn button() -> Hsla {
-        hsla(223. / 360., 0.13, 0.21, 1.)
-    }
-    pub fn button_hover() -> Hsla {
-        hsla(225. / 360., 0.118, 0.267, 1.)
-    }
-    /// Status colors (the accent hues of the default dark theme).
-    pub fn success() -> Hsla {
-        hsla(95. / 360., 0.38, 0.62, 1.)
-    }
-    pub fn warning() -> Hsla {
-        hsla(39. / 360., 0.67, 0.69, 1.)
-    }
-    pub fn danger() -> Hsla {
-        hsla(355. / 360., 0.65, 0.65, 1.)
-    }
-}
 
 use gpui::{
     App, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
@@ -120,6 +41,8 @@ static LOGGER: StderrLogger = StderrLogger;
 fn main() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
+    // Bundled Zed themes + the saved preference, before any rendering.
+    theme::init();
     gpui_platform::application()
         .with_assets(assets::EmbeddedAssets)
         .run(|cx: &mut App| {
