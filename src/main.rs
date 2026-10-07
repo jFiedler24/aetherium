@@ -27,8 +27,13 @@ pub(crate) mod theme {
     /// `Zed Sans`/`Zed Mono` files into `~/.config/aetherium/fonts/` to make
     /// the app use them without a system-wide install.
     pub const FONT_UI: &str = "Zed Sans";
-    /// Monospace font family for the terminal; matches Zed's default.
-    pub const FONT_MONO: &str = "Zed Mono";
+    /// Monospace font family for the terminal. Must be a true monospace:
+    /// every cell metric (cursor position, selection, mouse mapping) derives
+    /// from one advance width. Bundled with the app (see `assets.rs`), so it
+    /// resolves everywhere — unlike "Zed Mono"/"SF Mono", which silently fell
+    /// back to a proportional font on stock macOS and broke the grid.
+    /// Users who install Zed Mono into the fonts dir can switch back.
+    pub const FONT_MONO: &str = "Lilex";
 
     /// Window / terminal background (`background`).
     pub fn bg() -> Hsla {
@@ -118,6 +123,9 @@ fn main() {
     gpui_platform::application()
         .with_assets(assets::EmbeddedAssets)
         .run(|cx: &mut App| {
+        // Bundled Lilex guarantees a true monospace for the terminal; user
+        // fonts may still override/extend afterwards.
+        assets::load_bundled_fonts(cx);
         // Optional user fonts (e.g. Zed Sans/Mono) from the config dir.
         assets::load_user_fonts(cx);
         // Key bindings for the text fields (profile form).

@@ -25,7 +25,9 @@ use crate::history::HistoryStore;
 use crate::log_highlight::LogHighlighter;
 use crate::profiles::{AuthMethod, Profile, ProfileStore};
 use crate::recents::{RecentEntry, RecentStore, now_unix, relative_time};
-use crate::session::{Command as SessionCommand, Event as SessionEvent, FileEntry, SessionHandle};
+use crate::session::{
+    Command as SessionCommand, Event as SessionEvent, FileEntry, SessionHandle, TempDownloadCache,
+};
 use crate::terminal_model::TerminalModel;
 use crate::text_field::{Backtab, Tab, TextField};
 use crate::theme;
@@ -376,13 +378,14 @@ pub struct RootView {
     /// immediately instead of waiting for a fixed poll tick.
     terminal_wake_tx: tokio::sync::mpsc::UnboundedSender<()>,
     /// Cache of (session, remote path) → local temp path for drag-out.
-    /// Populated by `SessionEvent::TempDownloadReady` after a background SFTP
-    /// download. Wrapped in `Arc<Mutex>` because the `external_drag_payload`
-    /// closure needs to read it without holding `&mut self`. Entries are
-    /// deleted (and their files removed) when the drag ends inside the app,
-    /// when the session disconnects or its tab closes, and every staged file
-    /// is purged on the next app launch.
-    temp_download_cache: Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>,
+    /// Populated by the staging download directly on the backend thread (see
+    /// [`TempDownloadCache`]) so the `external_drag_payload` resolver can
+    /// block on it while the drag is leaving the window; the
+    /// `TempDownloadReady` event additionally drives status text and the
+    /// "Open in VS Code" flow. Entries are deleted (and their files removed)
+    /// when the drag ends inside the app, when the session disconnects or its
+    /// tab closes, and every staged file is purged on the next app launch.
+    temp_download_cache: TempDownloadCache,
     /// (session, remote path) pairs staged via the context menu's
     /// "Open in VS Code" entry: when the staging download finishes, the
     /// local temp file is handed to VS Code.
@@ -779,9 +782,15 @@ impl RootView {
             } => {
                 let mut cache = self.temp_download_cache.lock();
                 if let Some(old) = cache.insert((session_id, remote.clone()), local.clone()) {
-                    // Superseded staging of the same file: drop the old copy.
-                    if let Some(dir) = old.parent() {
-                        let _ = std::fs::remove_dir_all(dir);
+                    // Superseded staging of the same file: drop the old copy
+                    // — but not when it's this same path; the backend now
+                    // publishes into the cache before this event arrives, so
+                    // `old == local` is the normal case, and deleting it
+                    // would remove the live staged file.
+                    if old != local {
+                        if let Some(dir) = old.parent() {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
                     }
                 }
                 drop(cache);
@@ -1498,7 +1507,7 @@ impl RootView {
         }
         log::info!("vscode: staging {}", remote.display());
         if let Some(session) = session {
-            session.download_to_temp(session_id, remote.clone());
+            session.download_to_temp(session_id, remote.clone(), self.temp_download_cache.clone());
         }
         self.status = format!("staging {} for VS Code…", remote.display());
         cx.notify();
@@ -2228,10 +2237,6 @@ const TERM_FG: u32 = 0xfffffff2;
 /// Default terminal background (`terminal_background` = theme background).
 const TERM_BG: u32 = 0x22252bff;
 
-fn hex(value: u32) -> Hsla {
-    rgb(value).into()
-}
-
 fn rgb_to_hsla(color: Rgb) -> Hsla {
     rgb((color.r as u32) << 16 | (color.g as u32) << 8 | color.b as u32).into()
 }
@@ -2448,13 +2453,20 @@ fn collect_runs(
         // boundary rule, which only matters for inverse-video rendering.
         if let Some(range) = selection_range {
             if range.contains_cell(&indexed, indexed.point, CursorShape::Hidden) {
+                // Extend the run of overlay segments, but keep processing the
+                // cell: its glyph must still be painted below the overlay.
+                // Bailing out here used to swallow every selected cell's text
+                // after the first one of each segment.
+                let mut merged = false;
                 if let Some((seg_row, seg_start, seg_span)) = selection.last_mut() {
                     if *seg_row == row && *seg_start + *seg_span == col {
                         *seg_span += 1;
-                        continue;
+                        merged = true;
                     }
                 }
-                selection.push((row, col, 1));
+                if !merged {
+                    selection.push((row, col, 1));
+                }
             }
         }
         // Capture the glyph under the cursor, including the leading cell of a
@@ -2550,7 +2562,7 @@ impl RootView {
                 .flex_1()
                 .min_w(px(0.))
                 .h_full()
-                .bg(hex(TERM_BG))
+                .bg(rgba(TERM_BG))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2571,7 +2583,7 @@ impl RootView {
             .flex_1()
             .min_w(px(0.))
             .h_full()
-            .bg(hex(TERM_BG))
+            .bg(rgba(TERM_BG))
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(Self::on_terminal_key_down))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
@@ -2765,26 +2777,25 @@ fn terminal_prepaint(
     focused: bool,
     font_size: f32,
 ) -> TerminalPrepaint {
+    // Note: `Window::scale_factor` is paint-phase-only in gpui, so the grid
+    // origin cannot be device-pixel snapped here in prepaint. Text and
+    // cursor share this same (possibly fractional) origin, which is what
+    // keeps them aligned; Zed additionally snaps the origin, but only from
+    // its layout/paint phases.
     let font = font(theme::FONT_MONO);
     let font_size = px(font_size);
     let line_height = prepaint_line_height(font_size.into());
 
-    // Measure a monospace cell from a probe string.
-    let probe = "0000000000";
-    let probe_line = window.text_system().shape_line(
-        probe.into(),
-        font_size,
-        &[TextRun {
-            len: probe.len(),
-            font: font.clone(),
-            color: hex(TERM_FG),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }],
-        None,
-    );
-    let cell_width = (probe_line.width / probe.len() as f32).max(px(1.));
+    // Monospace cell width: the advance of 'm' (Zed's terminal measures
+    // exactly this). A shaped probe line's width includes side bearings, so
+    // dividing it by the char count mis-measures the grid the cursor and
+    // `force_width` snapping rely on.
+    let font_id = window.text_system().resolve_font(&font);
+    let cell_width = window
+        .text_system()
+        .advance(font_id, font_size, 'm')
+        .map(|advance| advance.width)
+        .unwrap_or(px(8.));
 
     *geometry.lock() = Some(TermGeometry {
         bounds,
@@ -2793,7 +2804,9 @@ fn terminal_prepaint(
     });
 
     let (rows, cursor, selection) = collect_runs(terminal, highlighter);
-    let default_bg = hex(TERM_BG);
+    // Same conversion path as `cell_colors`' default background, so plain
+    // cells compare equal and skip their background fill.
+    let default_bg = rgba(TERM_BG).into();
 
     let mut lines = Vec::new();
     let mut backgrounds = Vec::new();
@@ -2822,6 +2835,10 @@ fn terminal_prepaint(
                 run_font.style = gpui::FontStyle::Italic;
             }
             let text: gpui::SharedString = run.text.clone().into();
+            // No `force_width`: its base-glyph counter breaks on ligatures
+            // (one glyph covering two cells), cramming the rest of the run.
+            // With the cell width measured as the 'm' advance, monospace
+            // shaping already lands on the cursor's grid.
             let shaped = window.text_system().shape_line(
                 text.clone(),
                 font_size,
@@ -2863,8 +2880,8 @@ fn terminal_prepaint(
     // the glyph underneath in the terminal background color on top of it.
     let cursor = cursor.map(|(line, col, shape, cursor_char)| {
         let origin = point(
-            bounds.left() + (cell_width * col as f32).floor(),
-            bounds.top() + (line_height * line as f32).floor(),
+            bounds.left() + cell_width * col as f32,
+            bounds.top() + line_height * line as f32,
         );
         let color = theme::cursor();
 
@@ -2877,7 +2894,7 @@ fn terminal_prepaint(
                 &[TextRun {
                     len,
                     font: font.clone(),
-                    color: hex(TERM_BG),
+                    color: rgba(TERM_BG).into(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -2913,11 +2930,14 @@ fn terminal_prepaint(
                 _ => Bounds::new(origin, size(width, line_height)),
             }
         };
-        let snapped = window.pixel_snap_bounds(cursor_bounds);
+        // No pixel-snapping here: the quad must share the text's exact
+        // (fractional) origin, otherwise the marker drifts up to half a point
+        // off the cell grid. Zed's terminal snaps only the element origin and
+        // leaves cell offsets fractional for both text and cursor.
         let quad = if hollow {
-            outline(snapped, color, BorderStyle::Solid)
+            outline(cursor_bounds, color, BorderStyle::Solid)
         } else {
-            fill(snapped, color)
+            fill(cursor_bounds, color)
         };
         TerminalCursor {
             origin,
@@ -4000,7 +4020,7 @@ fn render_tree_rows(
     show_details: bool,
     session: Option<&SessionHandle>,
     session_id: u64,
-    temp_download_cache: Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>,
+    temp_download_cache: TempDownloadCache,
     editor: Option<&TreeEditor>,
     cx: &mut Context<RootView>,
     rows: &mut Vec<gpui::AnyElement>,
@@ -4056,20 +4076,27 @@ fn render_tree_rows(
                         let remote_for_download = row_path.clone();
                         let session_for_download = session.cloned();
                         let session_id = session_id;
+                        let cache_for_download = temp_download_cache.clone();
                         move |drag, click_offset, _window, cx| {
                             // Kick off a temp download in the background so
                             // the file is (hopefully) ready by the time the
-                            // drag leaves the window.
+                            // drag leaves the window. An already-staged copy
+                            // is reused: re-staging would delete the path a
+                            // previous drag may still be handing to the OS.
                             if !drag.is_dir {
                                 if let Some(session) = session_for_download.as_ref() {
-                                    log::info!(
-                                        "drag-out: staging {} for session {session_id}",
-                                        remote_for_download.display()
-                                    );
-                                    session.download_to_temp(
-                                        session_id,
-                                        remote_for_download.clone(),
-                                    );
+                                    let key = (session_id, remote_for_download.clone());
+                                    if !cache_for_download.lock().contains_key(&key) {
+                                        log::info!(
+                                            "drag-out: staging {} for session {session_id}",
+                                            remote_for_download.display()
+                                        );
+                                        session.download_to_temp(
+                                            session_id,
+                                            remote_for_download.clone(),
+                                            cache_for_download.clone(),
+                                        );
+                                    }
                                 }
                             }
                             cx.new(|_| DraggedEntryView {
@@ -4088,27 +4115,46 @@ fn render_tree_rows(
                     let weak_root = cx.weak_entity();
                     move |drag: &DraggedEntry, _window, cx| {
                         if drag.is_dir {
+                            let name = drag.name.to_string();
+                            let _ = weak_root.update(cx, |this, cx| {
+                                this.status =
+                                    format!("drag-out: {name} is a folder — only files can be dragged out");
+                                cx.notify();
+                            });
                             return None;
                         }
-                        let payload = cache
-                            .lock()
-                            .get(&(session_id, drag.path.clone()))
-                            .map(|local| {
-                                ExternalDragPayload::Files(FileDragPaths::new([(
-                                    local.clone(),
-                                    false,
-                                )]))
-                            });
+                        let key = (session_id, drag.path.clone());
+                        // The staging download publishes its result directly
+                        // into this map from the backend thread. gpui resolves
+                        // the payload exactly once, the first time the pointer
+                        // leaves the window, so wait for it (bounded) rather
+                        // than letting the drop die: blocking here freezes the
+                        // drag image briefly, a dead drag is worse.
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        let local = loop {
+                            if let Some(local) = cache.lock().get(&key) {
+                                break Some(local.clone());
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        };
+                        let payload = local.map(|local| {
+                            ExternalDragPayload::Files(FileDragPaths::new([(
+                                local,
+                                false,
+                            )]))
+                        });
                         log::info!(
                             "drag-out: resolve {} (session {session_id}) → {}",
                             drag.path.display(),
                             if payload.is_some() { "hit" } else { "miss" }
                         );
                         if payload.is_none() {
-                            // The pointer left the window before the staging
-                            // download finished. gpui resolves the payload
-                            // only once, so a retry is the only recourse —
-                            // say so instead of failing silently.
+                            // The staging download is still running after the
+                            // wait window — say so instead of failing silently.
+                            // A retry drag will hit the cache once it lands.
                             let name = drag.name.to_string();
                             let _ = weak_root.update(cx, |this, cx| {
                                 this.status =

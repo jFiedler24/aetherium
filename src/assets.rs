@@ -36,6 +36,30 @@ const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
 
 pub struct EmbeddedAssets;
 
+// Lilex (https://github.com/mishamyrt/Lilex), SIL OFL 1.1 — see
+// `src/fonts/OFL.txt`. Bundled so the terminal always has a true monospace
+// available: system font enumeration on macOS does not reliably expose one
+// to gpui's matcher (SF Mono is hidden; a missing "Zed Mono" silently falls
+// back to a proportional font and breaks the whole cell grid).
+const LILEX_REGULAR: &[u8] = include_bytes!("fonts/Lilex-Regular.ttf");
+const LILEX_BOLD: &[u8] = include_bytes!("fonts/Lilex-Bold.ttf");
+const LILEX_ITALIC: &[u8] = include_bytes!("fonts/Lilex-Italic.ttf");
+const LILEX_BOLD_ITALIC: &[u8] = include_bytes!("fonts/Lilex-BoldItalic.ttf");
+
+/// Register the bundled Lilex family with the text system. Must run before
+/// any code resolves `theme::FONT_MONO`.
+pub fn load_bundled_fonts(cx: &mut App) {
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(LILEX_REGULAR),
+        Cow::Borrowed(LILEX_BOLD),
+        Cow::Borrowed(LILEX_ITALIC),
+        Cow::Borrowed(LILEX_BOLD_ITALIC),
+    ];
+    if let Err(err) = cx.text_system().add_fonts(fonts) {
+        eprintln!("aetherium: loading bundled Lilex font: {err:#}");
+    }
+}
+
 /// Load user-provided font files (`.ttf`/`.otf`/`.ttc`) from
 /// `~/.config/aetherium/fonts/`. This is how Zed's own fonts (Zed Sans /
 /// Zed Mono, SIL OFL 1.1) can be used without a system-wide installation:

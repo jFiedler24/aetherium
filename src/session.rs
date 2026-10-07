@@ -24,6 +24,14 @@ use uuid::Uuid;
 use crate::profiles::{AuthMethod, Profile};
 use crate::terminal_model::TerminalModel;
 
+/// Staged drag-out downloads, keyed by (session_id, remote path). The
+/// staging download writes into this map directly from the backend thread:
+/// gpui resolves the external-drag payload synchronously on the UI thread,
+/// possibly while the drag is leaving the window, so the resolver may block
+/// on this map — it must not depend on the UI event loop for the write.
+pub type TempDownloadCache =
+    Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>;
+
 /// UI → backend commands.
 pub enum Command {
     Connect(Profile),
@@ -38,8 +46,13 @@ pub enum Command {
     Download { session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool> },
     /// Download a remote file to a temp directory for drag-out. The UI is
     /// notified via `Event::TempDownloadReady` when the file is available
-    /// locally.
-    DownloadToTemp { session_id: u64, remote: PathBuf },
+    /// locally; `cache` additionally receives the staged path directly on
+    /// the backend thread (see [`TempDownloadCache`]).
+    DownloadToTemp {
+        session_id: u64,
+        remote: PathBuf,
+        cache: TempDownloadCache,
+    },
     /// Move/rename a remote entry (SFTP `rename`); used by file-tree
     /// drag-and-drop.
     Rename { session_id: u64, from: PathBuf, to: PathBuf },
@@ -188,8 +201,12 @@ impl SessionHandle {
     }
 
     /// Download a remote file to a temp directory for drag-out.
-    pub fn download_to_temp(&self, session_id: u64, remote: PathBuf) {
-        self.send(Command::DownloadToTemp { session_id, remote });
+    pub fn download_to_temp(&self, session_id: u64, remote: PathBuf, cache: TempDownloadCache) {
+        self.send(Command::DownloadToTemp {
+            session_id,
+            remote,
+            cache,
+        });
     }
 
     pub fn rename(&self, session_id: u64, from: PathBuf, to: PathBuf) {
@@ -498,11 +515,15 @@ async fn command_loop(
                             download(&sftp, &event_tx, &remote, &cancel).await;
                         });
                     }
-                    Some(Command::DownloadToTemp { session_id, remote }) => {
+                    Some(Command::DownloadToTemp {
+                        session_id,
+                        remote,
+                        cache,
+                    }) => {
                         let sftp = sftp.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            download_to_temp(&sftp, &event_tx, session_id, &remote).await;
+                            download_to_temp(&sftp, &event_tx, session_id, &remote, &cache).await;
                         });
                     }
                     Some(Command::Rename { session_id, from, to }) => {
@@ -908,6 +929,7 @@ async fn download_to_temp(
     event_tx: &std_mpsc::Sender<Event>,
     session_id: u64,
     remote: &std::path::Path,
+    cache: &TempDownloadCache,
 ) {
     let metadata = match sftp.metadata(remote.to_string_lossy().into_owned()).await {
         Ok(metadata) => metadata,
@@ -985,6 +1007,20 @@ async fn download_to_temp(
 
     match result {
         Ok(()) => {
+            // Publish the staged path before notifying the UI event loop:
+            // the drag-out resolver blocks on this map on the UI thread, and
+            // the event loop can't run (and insert it) until it returns.
+            if let Some(old) = cache
+                .lock()
+                .insert((session_id, remote.to_path_buf()), local.clone())
+            {
+                // Superseded staging of the same file: drop the old copy.
+                if old != local {
+                    if let Some(dir) = old.parent() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+            }
             log::info!("drag-out: staged {} → {}", remote.display(), local.display());
             let _ = event_tx.send(Event::TempDownloadReady {
                 session_id,
