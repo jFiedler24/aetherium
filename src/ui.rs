@@ -199,7 +199,7 @@ impl Render for DraggedEntryView {
                     .child(
                         svg()
                             .path(if self.is_dir {
-                                assets::ICON_CHEVRON_RIGHT
+                                assets::ICON_FOLDER
                             } else {
                                 assets::ICON_FILE
                             })
@@ -2960,6 +2960,56 @@ fn header_button(
         .into_any_element()
 }
 
+/// Hover popup for icon-only controls: a small panel-styled text bubble.
+struct TextTip(SharedString);
+
+impl Render for TextTip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(theme::panel())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_md()
+            .text_xs()
+            .text_color(theme::text())
+            .child(self.0.clone())
+    }
+}
+
+fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    let text = text.into();
+    move |_, cx| cx.new(|_| TextTip(text.clone())).into()
+}
+
+fn header_icon_button(
+    id: &'static str,
+    icon: &'static str,
+    tooltip: &'static str,
+    cx: &mut Context<RootView>,
+    on_click: impl Fn(&mut RootView, &mut Window, &mut Context<RootView>) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.))
+        .h(px(26.))
+        .rounded_sm()
+        .bg(theme::button())
+        .text_color(theme::text())
+        .hover(|style| style.bg(theme::button_hover()))
+        .active(|style| style.opacity(0.8))
+        .cursor_pointer()
+        .tooltip(tip(tooltip))
+        .child(svg().path(icon).w(px(14.)).h(px(14.)).text_color(theme::text()))
+        .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+        .into_any_element()
+}
+
 fn section_label(label: &str) -> gpui::AnyElement {
     div()
         .px_2()
@@ -3004,7 +3054,6 @@ impl RootView {
             .and_then(|i| self.store.profiles.get(i))
             .map(|p| format!("{} — {}", p.name, p.summary()))
             .unwrap_or_else(|| "no profile selected".to_string());
-        let echo_label = if self.local_echo { "echo: on" } else { "echo: off" };
 
         div()
             .h(px(HEADER_HEIGHT))
@@ -3027,7 +3076,8 @@ impl RootView {
                         svg()
                             .path(assets::ICON_MAIN_EXECUTABLE)
                             .w(px(20.))
-                            .h(px(20.)),
+                            .h(px(20.))
+                            .text_color(theme::accent()),
                     )
                     .child(
                         div()
@@ -3043,28 +3093,67 @@ impl RootView {
                     .truncate()
                     .child(summary),
             )
-            .child(header_button("new-profile", "+ New", cx, |this, window, cx| {
+            .child(header_icon_button("new-profile", assets::ICON_PLUS, "New profile", cx, |this, window, cx| {
                 this.open_new_profile_form(window, cx)
             }))
-            .child(header_button("edit-profile", "Edit", cx, |this, window, cx| {
+            .child(header_icon_button("edit-profile", assets::ICON_PENCIL, "Edit profile", cx, |this, window, cx| {
                 this.open_edit_profile_form(window, cx)
             }))
-            .child(header_button("delete-profile", "Delete", cx, |this, _window, cx| {
+            .child(header_icon_button("delete-profile", assets::ICON_TRASH, "Delete profile", cx, |this, _window, cx| {
                 this.delete_selected_profile(cx)
             }))
-            .child(header_button("toggle-echo", echo_label, cx, |this, _window, cx| {
-                this.local_echo = !this.local_echo;
-                this.status = if this.local_echo {
-                    "local echo on".into()
+            .child(header_icon_button(
+                "toggle-echo",
+                if self.local_echo {
+                    assets::ICON_EYE
                 } else {
-                    "local echo off".into()
-                };
-                cx.notify();
-            }))
-            .child(header_button("theme", &theme::active_name(), cx, |this, _window, cx| {
-                this.theme_menu = !this.theme_menu;
-                cx.notify();
-            }))
+                    assets::ICON_EYE_OFF
+                },
+                if self.local_echo {
+                    "Local echo: on"
+                } else {
+                    "Local echo: off"
+                },
+                cx,
+                |this, _window, cx| {
+                    this.local_echo = !this.local_echo;
+                    this.status = if this.local_echo {
+                        "local echo on".into()
+                    } else {
+                        "local echo off".into()
+                    };
+                    cx.notify();
+                },
+            ))
+            .child(
+                div()
+                    .id("theme")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(theme::button())
+                    .text_color(theme::text())
+                    .hover(|style| style.bg(theme::button_hover()))
+                    .active(|style| style.opacity(0.8))
+                    .cursor_pointer()
+                    .tooltip(tip("Switch theme"))
+                    .child(theme::active_name())
+                    .child(
+                        svg()
+                            .path(assets::ICON_CHEVRON_DOWN)
+                            .w(px(12.))
+                            .h(px(12.))
+                            .text_color(theme::text_dim()),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.theme_menu = !this.theme_menu;
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -3855,10 +3944,10 @@ impl RootView {
             ),
             None => (ConnState::Disconnected, None, self.status.clone()),
         };
-        let (state_text, state_color) = match state {
-            ConnState::Disconnected => ("○ disconnected", theme::text_dim()),
-            ConnState::Connecting => ("◌ connecting…", theme::warning()),
-            ConnState::Connected => ("● connected", theme::success()),
+        let (state_icon, state_text, state_color) = match state {
+            ConnState::Disconnected => (assets::ICON_DISCONNECTED, "disconnected", theme::text_dim()),
+            ConnState::Connecting => (assets::ICON_SIGNAL_MEDIUM, "connecting…", theme::warning()),
+            ConnState::Connected => (assets::ICON_SIGNAL_HIGH, "connected", theme::success()),
         };
         // Active transfer progress, shown between the state and the status
         // message: a graphical bar when the total is known, plus the
@@ -3901,7 +3990,22 @@ impl RootView {
             .justify_between()
             .px_3()
             .text_xs()
-            .child(div().text_color(state_color).child(state_text))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_color(state_color)
+                    .child(
+                        svg()
+                            .path(state_icon)
+                            .w(px(12.))
+                            .h(px(12.))
+                            .text_color(state_color),
+                    )
+                    .child(state_text),
+            )
             .when_some(transfer_bar, |bar, pct| {
                 const BAR_WIDTH: f32 = 120.;
                 bar.child(
@@ -4244,6 +4348,19 @@ fn render_tree_rows(
                             .into_any_element()
                     },
                 )
+                .when(is_dir, |row| {
+                    row.child(
+                        svg()
+                            .path(if node.expanded {
+                                assets::ICON_FOLDER_OPEN
+                            } else {
+                                assets::ICON_FOLDER
+                            })
+                            .w(px(14.))
+                            .h(px(14.))
+                            .text_color(theme::text_dim()),
+                    )
+                })
                 .child(
                     div()
                         .flex_1()
@@ -4321,7 +4438,7 @@ fn tree_editor_row(
         .child(
             svg()
                 .path(if is_dir {
-                    assets::ICON_CHEVRON_RIGHT
+                    assets::ICON_FOLDER
                 } else {
                     assets::ICON_FILE
                 })

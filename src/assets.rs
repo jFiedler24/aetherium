@@ -18,6 +18,21 @@ const UPDATE_MANAGER: &str = include_str!("../aetherium_icons_dark_v2/update_man
 const CHEVRON_RIGHT: &str = include_str!("../aetherium_icons_dark_v2/chevron_right.svg");
 const FILE: &str = include_str!("../aetherium_icons_dark_v2/file.svg");
 
+// UI glyphs from Zed's icon set (derived from Lucide, ISC — see
+// `zed_icons/LICENSES`). Rendered through gpui's alpha-mask SVG path, so the
+// stroke colors baked into the files are ignored; `.text_color()` tints them.
+const PLUS: &str = include_str!("../zed_icons/plus.svg");
+const PENCIL: &str = include_str!("../zed_icons/pencil.svg");
+const TRASH: &str = include_str!("../zed_icons/trash.svg");
+const EYE: &str = include_str!("../zed_icons/eye.svg");
+const EYE_OFF: &str = include_str!("../zed_icons/eye_off.svg");
+const CHEVRON_DOWN: &str = include_str!("../zed_icons/chevron_down.svg");
+const SIGNAL_HIGH: &str = include_str!("../zed_icons/signal_high.svg");
+const SIGNAL_MEDIUM: &str = include_str!("../zed_icons/signal_medium.svg");
+const DISCONNECTED: &str = include_str!("../zed_icons/disconnected.svg");
+const FOLDER: &str = include_str!("../zed_icons/folder.svg");
+const FOLDER_OPEN: &str = include_str!("../zed_icons/folder_open.svg");
+
 /// App icon, shown next to the brand name in the header.
 pub const ICON_MAIN_EXECUTABLE: &str = "aetherium/icons/main_executable.svg";
 /// Shell tabs: an interactive terminal session.
@@ -30,6 +45,28 @@ pub const ICON_CONFIGURATION: &str = "aetherium/icons/configuration.svg";
 pub const ICON_CHEVRON_RIGHT: &str = "aetherium/icons/chevron_right.svg";
 /// File tree: generic file glyph.
 pub const ICON_FILE: &str = "aetherium/icons/file.svg";
+/// Header: create a new profile.
+pub const ICON_PLUS: &str = "aetherium/icons/plus.svg";
+/// Header: edit the selected profile.
+pub const ICON_PENCIL: &str = "aetherium/icons/pencil.svg";
+/// Header: delete the selected profile.
+pub const ICON_TRASH: &str = "aetherium/icons/trash.svg";
+/// Header: local echo is on.
+pub const ICON_EYE: &str = "aetherium/icons/eye.svg";
+/// Header: local echo is off.
+pub const ICON_EYE_OFF: &str = "aetherium/icons/eye_off.svg";
+/// Header: marks the theme button as a dropdown.
+pub const ICON_CHEVRON_DOWN: &str = "aetherium/icons/chevron_down.svg";
+/// Status bar: connected.
+pub const ICON_SIGNAL_HIGH: &str = "aetherium/icons/signal_high.svg";
+/// Status bar: connecting.
+pub const ICON_SIGNAL_MEDIUM: &str = "aetherium/icons/signal_medium.svg";
+/// Status bar: disconnected.
+pub const ICON_DISCONNECTED: &str = "aetherium/icons/disconnected.svg";
+/// File tree: closed directory.
+pub const ICON_FOLDER: &str = "aetherium/icons/folder.svg";
+/// File tree: expanded directory.
+pub const ICON_FOLDER_OPEN: &str = "aetherium/icons/folder_open.svg";
 
 const BUILD_TOOL_PATH: &str = "aetherium/icons/build_tool.svg";
 const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
@@ -110,6 +147,17 @@ impl AssetSource for EmbeddedAssets {
             UPDATE_MANAGER_PATH => Some(UPDATE_MANAGER.as_bytes()),
             ICON_CHEVRON_RIGHT => Some(CHEVRON_RIGHT.as_bytes()),
             ICON_FILE => Some(FILE.as_bytes()),
+            ICON_PLUS => Some(PLUS.as_bytes()),
+            ICON_PENCIL => Some(PENCIL.as_bytes()),
+            ICON_TRASH => Some(TRASH.as_bytes()),
+            ICON_EYE => Some(EYE.as_bytes()),
+            ICON_EYE_OFF => Some(EYE_OFF.as_bytes()),
+            ICON_CHEVRON_DOWN => Some(CHEVRON_DOWN.as_bytes()),
+            ICON_SIGNAL_HIGH => Some(SIGNAL_HIGH.as_bytes()),
+            ICON_SIGNAL_MEDIUM => Some(SIGNAL_MEDIUM.as_bytes()),
+            ICON_DISCONNECTED => Some(DISCONNECTED.as_bytes()),
+            ICON_FOLDER => Some(FOLDER.as_bytes()),
+            ICON_FOLDER_OPEN => Some(FOLDER_OPEN.as_bytes()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
