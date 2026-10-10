@@ -109,6 +109,7 @@ impl IDataObject_Impl for FileDrag_Impl {
             std::thread::sleep(Duration::from_millis(50));
         };
         let path = path.ok_or_else(|| windows::core::Error::from(STG_E_MEDIUMFULL))?;
+        log::info!("drag-out: target requested data, resolved {}", path.display());
         build_hdrop(&path)
     }
 
@@ -206,19 +207,26 @@ pub fn begin_file_drag(
     wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
 ) {
     std::thread::spawn(move || {
+        log::info!("drag-out: OLE drag thread started (hwnd {hwnd:#x})");
         unsafe {
-            if OleInitialize(None).is_err() {
+            if let Err(err) = OleInitialize(None) {
+                log::error!("drag-out: OleInitialize failed: {err}");
                 return;
             }
             let drag = FileDrag { wait_path };
             // Both interfaces live on the one COM object.
             let data: IDataObject = drag.into();
             let Ok(source) = data.cast::<IDropSource>() else {
+                log::error!("drag-out: could not get IDropSource from the data object");
                 CoUninitialize();
                 return;
             };
             let mut effect = DROPEFFECT(0);
-            let _ = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+            let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+            log::info!(
+                "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
+                effect
+            );
             CoUninitialize();
         }
         release_ghost_drag(hwnd);

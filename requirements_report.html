@@ -1,0 +1,2528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Requirements Tracing Report</title>
+    <style>/* Requirements Tracing Report CSS */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+    line-height: 1.6;
+    color: #333;
+    background-color: #f8f9fa;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* Header */
+.report-header {
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    margin-bottom: 30px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.report-header h1 {
+    color: #2c3e50;
+    font-size: 2.5rem;
+    margin: 0;
+}
+
+.status-badge {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 20px;
+    border-radius: 25px;
+    font-weight: 600;
+    font-size: 1.1rem;
+}
+
+.status-badge.success {
+    background-color: #d4edda;
+    color: #155724;
+    border: 2px solid #c3e6cb;
+}
+
+.status-badge.error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 2px solid #f5c6cb;
+}
+
+.status-indicator {
+    font-size: 1.3rem;
+    font-weight: bold;
+}
+
+/* Summary Section */
+.summary {
+    background: white;
+    border-radius: 8px;
+    padding: 25px;
+    margin-bottom: 30px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.summary h2 {
+    color: #2c3e50;
+    margin-bottom: 20px;
+    font-size: 1.8rem;
+}
+
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+}
+
+.summary-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border-radius: 6px;
+    border-left: 4px solid #007bff;
+}
+
+.summary-label {
+    font-weight: 600;
+    color: #495057;
+}
+
+.summary-value {
+    font-size: 1.2rem;
+    font-weight: bold;
+    color: #007bff;
+}
+
+.summary-value.error {
+    color: #dc3545;
+}
+
+/* [impl->req~defect-type-statistics~1] */
+/* Defect Statistics Breakdown */
+.defect-statistics {
+    margin-top: 25px;
+    padding-top: 20px;
+    border-top: 2px solid #e9ecef;
+}
+
+.defect-statistics h3 {
+    color: #495057;
+    font-size: 1.3rem;
+    margin-bottom: 15px;
+}
+
+.defect-stats-list {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 12px;
+}
+
+.defect-stat-item {
+    background-color: #fff3cd;
+    border-left: 4px solid #ffc107;
+    padding: 12px 16px;
+    border-radius: 4px;
+    color: #856404;
+    font-weight: 500;
+    font-size: 0.95rem;
+    display: flex;
+    align-items: center;
+}
+
+.defect-stat-item::before {
+    content: "⚠";
+    margin-right: 10px;
+    font-size: 1.2rem;
+}
+
+/* Defects Section */
+.defects {
+    background: white;
+    border-radius: 8px;
+    padding: 25px;
+    margin-bottom: 30px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    border-left: 4px solid #dc3545;
+}
+
+.defects h2 {
+    color: #dc3545;
+    margin-bottom: 20px;
+    font-size: 1.8rem;
+}
+
+.defect-list {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.defect-item {
+    background-color: #f8d7da;
+    border: 1px solid #f5c6cb;
+    border-radius: 6px;
+    padding: 15px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 15px;
+    align-items: center;
+}
+
+.defect-type {
+    background-color: #dc3545;
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.defect-description {
+    color: #721c24;
+    font-weight: 500;
+}
+
+/* Link to view the defective spec item */
+.defect-item-link {
+    color: #721c24;
+    text-decoration: none;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 4px;
+    background-color: rgba(220, 53, 69, 0.1);
+    border: 1px solid rgba(220, 53, 69, 0.3);
+    font-size: 0.85rem;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+}
+
+.defect-item-link:hover {
+    background-color: rgba(220, 53, 69, 0.2);
+    border-color: rgba(220, 53, 69, 0.5);
+    transform: translateX(3px);
+}
+
+.defect-item-link:active {
+    transform: translateX(1px);
+}
+
+.defect-link {
+    color: #007bff;
+    text-decoration: none;
+    font-weight: 600;
+    margin-left: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background-color: rgba(0, 123, 255, 0.1);
+    font-size: 0.85rem;
+}
+
+.defect-link:hover {
+    background-color: rgba(0, 123, 255, 0.2);
+    text-decoration: underline;
+}
+
+.defect-item-id {
+    font-family: monospace;
+    background-color: #f8f9fa;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    color: #495057;
+}
+
+/* Coverage Table */
+.coverage-by-type {
+    background: white;
+    border-radius: 8px;
+    padding: 25px;
+    margin-bottom: 30px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.coverage-by-type h2 {
+    color: #2c3e50;
+    margin-bottom: 20px;
+    font-size: 1.8rem;
+}
+
+.coverage-table table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 15px;
+}
+
+.coverage-table th,
+.coverage-table td {
+    padding: 12px 15px;
+    text-align: left;
+    border-bottom: 1px solid #dee2e6;
+}
+
+.coverage-table th {
+    background-color: #f8f9fa;
+    font-weight: 600;
+    color: #495057;
+    text-transform: uppercase;
+    font-size: 0.9rem;
+    letter-spacing: 0.5px;
+}
+
+.coverage-table tr:hover {
+    background-color: #f8f9fa;
+}
+
+.artifact-type {
+    font-family: monospace;
+    font-weight: 600;
+    color: #007bff;
+    text-transform: uppercase;
+}
+
+.total-count,
+.covered-count {
+    font-weight: 600;
+    text-align: center;
+}
+
+.coverage-percentage {
+    font-weight: 600;
+    text-align: center;
+}
+
+/* Specification Items */
+.specification-items {
+    background: white;
+    border-radius: 8px;
+    padding: 25px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.specification-items h2 {
+    color: #2c3e50;
+    margin-bottom: 30px;
+    font-size: 1.8rem;
+}
+
+.artifact-group {
+    margin-bottom: 40px;
+}
+
+.artifact-type-header {
+    color: #495057;
+    font-size: 1.5rem;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #dee2e6;
+    font-family: monospace;
+    letter-spacing: 1px;
+}
+
+.items-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+    gap: 20px;
+}
+
+.spec-item {
+    background-color: #fff;
+    border: 1px solid #dee2e6;
+    border-radius: 8px;
+    padding: 20px;
+    transition: all 0.3s ease;
+    position: relative;
+}
+
+.spec-item:hover {
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    transform: translateY(-2px);
+}
+
+.spec-item.defect {
+    border-left: 4px solid #dc3545;
+    background-color: #fff5f5;
+}
+
+.spec-item.orphaned-item {
+    border-left: 4px solid #ffc107;
+    background-color: #fffbf0;
+    opacity: 0.8;
+}
+
+.section-header {
+    margin: 30px 0 20px 0;
+    padding: 20px;
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    border-left: 4px solid #28a745;
+}
+
+.section-header.orphaned-section {
+    border-left: 4px solid #ffc107;
+    background-color: #fffbf0;
+}
+
+.section-header h3 {
+    color: #495057;
+    margin: 0 0 10px 0;
+    font-size: 1.4rem;
+}
+
+.section-description {
+    color: #6c757d;
+    margin: 0;
+    font-size: 0.95rem;
+}
+
+.item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+
+.item-id {
+    font-family: monospace;
+    font-size: 1.1rem;
+    color: #007bff;
+    margin: 0;
+    font-weight: 600;
+}
+
+.item-status {
+    display: flex;
+    gap: 8px;
+}
+
+.coverage-badge {
+    padding: 4px 8px;
+    border-radius: 12px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.coverage-badge.coverage-ok {
+    background-color: #d4edda;
+    color: #155724;
+}
+
+.coverage-badge.coverage-partial {
+    background-color: #fff3cd;
+    color: #856404;
+}
+
+.coverage-badge.coverage-error {
+    background-color: #f8d7da;
+    color: #721c24;
+}
+
+.item-content {
+    margin-bottom: 15px;
+}
+
+.item-title {
+    color: #2c3e50;
+    margin-bottom: 10px;
+    font-size: 1.1rem;
+}
+
+.item-description {
+    color: #6c757d;
+    line-height: 1.5;
+    margin-bottom: 15px;
+}
+
+.item-description p {
+    margin-bottom: 8px;
+}
+
+.item-metadata {
+    background-color: #f8f9fa;
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 0.9rem;
+}
+
+.metadata-row {
+    display: flex;
+    margin-bottom: 6px;
+}
+
+.metadata-row:last-child {
+    margin-bottom: 0;
+}
+
+.metadata-label {
+    font-weight: 600;
+    color: #495057;
+    min-width: 80px;
+    margin-right: 10px;
+}
+
+.metadata-value {
+    color: #6c757d;
+    font-family: monospace;
+    word-break: break-all;
+}
+
+/* Links Section */
+.links-section {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #dee2e6;
+}
+
+.links-section h6 {
+    color: #495057;
+    margin-bottom: 10px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.links-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.link-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+
+.link-item:last-child {
+    margin-bottom: 0;
+}
+
+.link-item.link-ok {
+    background-color: #d4edda;
+    border-left: 3px solid #28a745;
+}
+
+.link-item.link-error {
+    background-color: #f8d7da;
+    border-left: 3px solid #dc3545;
+}
+
+.link-target,
+.link-source {
+    font-family: monospace;
+    font-weight: 600;
+    color: #007bff;
+}
+
+.link-status {
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.link-item.link-ok .link-status {
+    color: #155724;
+}
+
+.link-item.link-error .link-status {
+    color: #721c24;
+}
+
+/* Status Indicators */
+.status-indicator.coverage-ok,
+.status-indicator.link-ok {
+    color: #28a745;
+}
+
+.status-indicator.coverage-partial {
+    color: #ffc107;
+}
+
+.status-indicator.coverage-error,
+.status-indicator.link-error {
+    color: #dc3545;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+    }
+    
+    .report-header {
+        flex-direction: column;
+        gap: 20px;
+        text-align: center;
+    }
+    
+    .report-header h1 {
+        font-size: 2rem;
+    }
+    
+    .summary-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .items-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .coverage-table {
+        overflow-x: auto;
+    }
+    
+    .defect-item {
+        grid-template-columns: 1fr;
+        gap: 10px;
+    }
+}
+
+@media (max-width: 480px) {
+    .report-header h1 {
+        font-size: 1.8rem;
+    }
+    
+    .status-badge {
+        font-size: 1rem;
+        padding: 10px 15px;
+    }
+    
+    .item-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 10px;
+    }
+}
+
+/* Requirement links styles */
+.requirement-link {
+    color: #3498db;
+    text-decoration: none;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.9em;
+    padding: 2px 6px;
+    background-color: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+    display: inline-block;
+    margin: 1px;
+}
+
+.requirement-link:hover {
+    color: #2980b9;
+    background-color: #e3f2fd;
+    border-color: #3498db;
+    text-decoration: none;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(52, 152, 219, 0.2);
+}
+
+.requirement-link:active {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px rgba(52, 152, 219, 0.2);
+}
+
+/* Different link statuses */
+.requirement-link.link-valid {
+    border-color: #27ae60;
+    background-color: #f8fff8;
+}
+
+.requirement-link.link-valid:hover {
+    background-color: #e8f5e8;
+    border-color: #27ae60;
+    color: #27ae60;
+}
+
+.requirement-link.link-invalid {
+    border-color: #e74c3c;
+    background-color: #fff8f8;
+}
+
+.requirement-link.link-invalid:hover {
+    background-color: #fdf2f2;
+    border-color: #e74c3c;
+    color: #e74c3c;
+}
+
+.requirement-link.link-orphaned {
+    border-color: #f39c12;
+    background-color: #fffbf0;
+}
+
+.requirement-link.link-orphaned:hover {
+    background-color: #fef5e7;
+    border-color: #f39c12;
+    color: #e67e22;
+}
+
+/* Target highlighting when navigating to an anchor */
+.spec-item:target {
+    border: 2px solid #3498db;
+    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+    animation: highlight-pulse 2s ease-out;
+}
+
+@keyframes highlight-pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(52, 152, 219, 0.7);
+    }
+    70% {
+        box-shadow: 0 0 0 10px rgba(52, 152, 219, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(52, 152, 219, 0);
+    }
+}
+
+/* Smooth scrolling for anchor links */
+html {
+    scroll-behavior: smooth;
+}
+
+/* Metadata row spacing for links */
+.metadata-row .metadata-value .requirement-link:not(:last-child) {
+    margin-right: 4px;
+}
+
+/* [impl->req~defect-requirement-linking~1] */
+/* Defect requirement link styles */
+.defect-req-link {
+    color: #e74c3c;
+    text-decoration: none;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.9em;
+    padding: 2px 6px;
+    background-color: #fff5f5;
+    border: 1px solid #ffcdd2;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+    display: inline-block;
+    margin: 1px;
+    font-weight: 600;
+}
+
+.defect-req-link:hover {
+    color: #c0392b;
+    background-color: #ffebee;
+    border-color: #e74c3c;
+    text-decoration: none;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(231, 76, 60, 0.3);
+}
+
+.defect-req-link:active {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px rgba(231, 76, 60, 0.3);
+}
+</style>
+</head>
+<body>
+    <div class="container">
+        <header class="report-header">
+            <h1>Requirements Tracing Report</h1>
+            <div class="status-badge">
+                <span class="status-indicator">✓</span>
+                <span class="status-text">All requirements properly traced</span>
+            </div>
+        </header>
+
+        <section class="summary">
+            <h2>Summary</h2>
+            <div class="summary-grid">
+                <div class="summary-item">
+                    <span class="summary-label">Total Items:</span>
+                    <span class="summary-value">71</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Defects:</span>
+                    <span class="summary-value">0</span>
+                </div>
+            </div></section><section class="specification-items">
+            <h2>Specification Items</h2>
+            <div class="items-grid"><div class="spec-item" id="item_creq_edit_remote_files_with_local_editor_1" data-req-id="creq~edit-remote-files-with-local-editor~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~edit-remote-files-with-local-editor~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~edit-remote-files-with-local-editor~1</h5><div class="item-description"><p>Double-clicking a remote file must open it in my local editor (like
+MobaXterm): edit, save, and the tool asks whether to sync the changes
+back to the device.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:69</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~remote-edit-writeback~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_login_without_typing_passwords_1" data-req-id="creq~login-without-typing-passwords~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~login-without-typing-passwords~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~login-without-typing-passwords~1</h5><div class="item-description"><p>Connecting must work without typing a password every time — use the
+system's SSH keys and agent, like the normal <code>ssh</code> command does. On
+Windows that means both the OpenSSH agent and Pageant.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:19</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~silent-key-auth~1</span>,<span class="requirement-link link-covered shallow">feat~windows-parity~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_remote_files_like_a_file_manager_1" data-req-id="creq~remote-files-like-a-file-manager~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~remote-files-like-a-file-manager~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~remote-files-like-a-file-manager~1</h5><div class="item-description"><p>I want to browse the remote file system graphically: see directories and
+files with sizes, drag files between my desktop and the remote, move
+things around, download and upload — like a file manager, not scp
+commands.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:27</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~file-tree~1</span>,<span class="requirement-link link-covered shallow">feat~transfer-progress~1</span>,<span class="requirement-link link-covered shallow">feat~os-file-drag-out~1</span>,<span class="requirement-link link-covered shallow">feat~os-file-drop-in~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_rest_api_for_ai_1" data-req-id="creq~rest-api-for-ai~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~rest-api-for-ai~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~rest-api-for-ai~1</h5><div class="item-description"><p>Expose a localhost REST interface that makes it super easy for an AI to
+control a running instance — open a log-follow view, execute commands on
+a target, replace/upload/download a certain file — and advertise the
+interface via the CLI.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:52</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~rest-api~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_slick_modern_ui_1" data-req-id="creq~slick-modern-ui~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~slick-modern-ui~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~slick-modern-ui~1</h5><div class="item-description"><p>The app should look modern and slick: a nice dark theme (light too),
+icons instead of text buttons where they make sense, and it must not
+look broken (no stray lines, no odd spacing).</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:44</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~theme-system~1</span>,<span class="requirement-link link-covered shallow">feat~icon-ui~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_ssh_terminal_for_homelab_1" data-req-id="creq~ssh-terminal-for-homelab~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~ssh-terminal-for-homelab~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~ssh-terminal-for-homelab~1</h5><div class="item-description"><p>I want one app to work on my remote machines (Raspberry Pi, phone via
+SSH, other boxes on my LAN) with saved connection profiles — click
+Connect, get a terminal, done.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:11</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~connection-profiles~1</span>,<span class="requirement-link link-covered shallow">feat~terminal-emulation~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_watch_remote_logs_like_snaketail_1" data-req-id="creq~watch-remote-logs-like-snaketail~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~watch-remote-logs-like-snaketail~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~watch-remote-logs-like-snaketail~1</h5><div class="item-description"><p>Watching remote log files must feel like SnakeTail: open a log, it
+follows new lines, errors and warnings are highlighted, I can pause, and
+I can filter noisy logs down to the lines I care about.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:36</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~log-follow-view~1</span>,<span class="requirement-link link-covered shallow">feat~snaketail-tools~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_creq_windows_parity_1" data-req-id="creq~windows-parity~1">
+                    <div class="item-header">
+                        <h4 class="item-id">creq~windows-parity~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">creq~windows-parity~1</h5><div class="item-description"><p>On Windows everything must work like on the Mac: no console window next
+to the UI, drag-out of files, and the same login-without-passwords
+support.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/customer.md:61</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">feat~windows-parity~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_connection_profiles_1" data-req-id="feat~connection-profiles~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~connection-profiles~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~connection-profiles~1</h5><div class="item-description"><p>The app shall offer named connection profiles (host, port, username,
+auth method) that persist between launches, with one-click connect from
+a sidebar.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:6</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~ssh-terminal-for-homelab~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~ssh-terminal-for-homelab~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~connection-profiles-4342400178408981231~0</span>,<span class="requirement-link link-covered shallow">req~profile-storage~1</span>,<span class="requirement-link link-covered shallow">req~known-hosts-verification~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_file_tree_1" data-req-id="feat~file-tree~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~file-tree~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~file-tree~1</h5><div class="item-description"><p>The app shall show the remote file system as a lazily loaded tree with
+directory disclosure, file sizes, selection, and context-menu actions.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/files.md:3</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~file-tree-739461626868670595~0</span>,<span class="requirement-link link-covered shallow">req~sftp-operations~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_icon_ui_1" data-req-id="feat~icon-ui~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~icon-ui~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~icon-ui~1</h5><div class="item-description"><p>Header actions and status indicators shall use icons (from Zed's
+Lucide-derived set) with hover tooltips instead of text labels where an
+icon is unambiguous; connection state shall be shown as a colored icon.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/terminal.md:52</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~slick-modern-ui~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~slick-modern-ui~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~icon-ui-16398624836145443236~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_log_follow_view_1" data-req-id="feat~log-follow-view~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~log-follow-view~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~log-follow-view~1</h5><div class="item-description"><p>The app shall open read-only tabs that follow a remote log file in
+real time (streaming the tail over the SSH connection), openable from
+the file tree's context menu.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/logs.md:3</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~watch-remote-logs-like-snaketail~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~watch-remote-logs-like-snaketail~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~log-follow-view-11376352580996325560~0</span>,<span class="requirement-link link-covered shallow">req~log-rotation~1</span>,<span class="requirement-link link-covered shallow">req~log-highlighting~1</span>,<span class="requirement-link link-covered shallow">req~piped-newline-handling~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_os_file_drag_out_1" data-req-id="feat~os-file-drag-out~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~os-file-drag-out~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~os-file-drag-out~1</h5><div class="item-description"><p>Dragging a remote file from the tree to the OS desktop or a file
+manager shall download it to a temp file in the background and hand the
+real local path to the OS once staged.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/files.md:31</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~os-file-drag-out-6899272431525779522~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_os_file_drop_in_1" data-req-id="feat~os-file-drop-in~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~os-file-drop-in~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~os-file-drop-in~1</h5><div class="item-description"><p>Dropping local files onto the tree or terminal shall upload them into
+the target directory (or the session's home directory).</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/files.md:41</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~os-file-drop-in-5312732653769802644~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_remote_edit_writeback_1" data-req-id="feat~remote-edit-writeback~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~remote-edit-writeback~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~remote-edit-writeback~1</h5><div class="item-description"><p>Double-clicking a remote file shall open a staged local copy in the
+user's editor; when the copy is saved, the app asks whether to upload
+the changes back to the device.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/files.md:50</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~edit-remote-files-with-local-editor~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~edit-remote-files-with-local-editor~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~remote-edit-writeback-14779396723442143171~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_rest_api_1" data-req-id="feat~rest-api~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~rest-api~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~rest-api~1</h5><div class="item-description"><p>A self-describing HTTP API on localhost shall let an AI or local
+scripts control the running app: discover targets, open shell and
+log-follow tabs, run commands, and read/replace remote files.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/api.md:3</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~rest-api-for-ai~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~rest-api-for-ai~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~rest-api-8001128905745437364~0</span>,<span class="requirement-link link-covered shallow">req~api-transport~1</span>,<span class="requirement-link link-covered shallow">req~api-token-auth~1</span>,<span class="requirement-link link-covered shallow">req~api-drives-ui-sessions~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_silent_key_auth_1" data-req-id="feat~silent-key-auth~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~silent-key-auth~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~silent-key-auth~1</h5><div class="item-description"><p>Connecting shall first try key-based authentication without prompting
+(ssh-agent, then default key files), falling back to the stored
+password only when key auth does not succeed — mirroring OpenSSH's
+default order.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:35</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~login-without-typing-passwords~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~login-without-typing-passwords~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~silent-key-auth-16586013141973672631~0</span>,<span class="requirement-link link-covered shallow">req~agent-auth~1</span>,<span class="requirement-link link-covered shallow">req~default-key-fallback~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_snaketail_tools_1" data-req-id="feat~snaketail-tools~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~snaketail-tools~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~snaketail-tools~1</h5><div class="item-description"><p>Log tabs shall offer SnakeTail's working tools: pause/resume follow,
+case-insensitive search with match navigation, a filter view showing
+only matching lines, and bookmarks on lines.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/logs.md:32</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~watch-remote-logs-like-snaketail~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~watch-remote-logs-like-snaketail~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~snaketail-tools-9523073341741335031~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_terminal_emulation_1" data-req-id="feat~terminal-emulation~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~terminal-emulation~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~terminal-emulation~1</h5><div class="item-description"><p>The app shall render an interactive terminal over SSH (xterm-256color)
+with correct glyphs, colors, selection, copy, scrollback, and font
+zoom, matching the rendering quality of Zed's terminal.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/terminal.md:3</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~ssh-terminal-for-homelab~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~ssh-terminal-for-homelab~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~terminal-emulation-1488185052312034709~0</span>,<span class="requirement-link link-covered shallow">req~bundled-monospace-font~1</span>,<span class="requirement-link link-covered shallow">req~local-echo~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_theme_system_1" data-req-id="feat~theme-system~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~theme-system~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~theme-system~1</h5><div class="item-description"><p>The whole UI — including terminal colors — shall be theme-driven, with
+Zed's standard theme families bundled, persisted selection, and a
+header switcher grouped dark/light.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/terminal.md:33</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~slick-modern-ui~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~slick-modern-ui~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~theme-system-7094135202574954927~0</span>,<span class="requirement-link link-covered shallow">req~bundled-zed-themes~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_transfer_progress_1" data-req-id="feat~transfer-progress~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~transfer-progress~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~transfer-progress~1</h5><div class="item-description"><p>Uploads and downloads shall show a graphical progress bar with size,
+speed, ETA, and a cancel button.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/files.md:22</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~remote-files-like-a-file-manager~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~transfer-progress-5847356204615052182~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_feat_windows_parity_1" data-req-id="feat~windows-parity~1">
+                    <div class="item-header">
+                        <h4 class="item-id">feat~windows-parity~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">feat~windows-parity~1</h5><div class="item-description"><p>On Windows the app shall behave like the macOS build: GUI subsystem
+without a console window, working agent-based passwordless login, and
+file drag-out to Explorer.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:66</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, req</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">creq~windows-parity~1</span>,<span class="requirement-link">creq~login-without-typing-passwords~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-unwanted">creq~windows-parity~1</span>,<span class="requirement-link link-unwanted">creq~login-without-typing-passwords~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~windows-parity-10837721609297764626~0</span>,<span class="requirement-link link-covered shallow">req~windows-gui-subsystem~1</span>,<span class="requirement-link link-covered shallow">req~windows-drag-out~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_agent_auth_1" data-req-id="req~agent-auth~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~agent-auth~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~agent-auth~1</h5><div class="item-description"><p>Agent authentication shall support the platform ssh-agent: Unix domain
+socket via <code>SSH_AUTH_SOCK</code>, and on Windows the OpenSSH agent named pipe
+falling back to Pageant.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:46</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~silent-key-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~silent-key-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~agent-auth-2562406149798453621~0</span>,<span class="requirement-link link-covered shallow">impl~agent-auth-15385386599030740549~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_api_drives_ui_sessions_1" data-req-id="req~api-drives-ui-sessions~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~api-drives-ui-sessions~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~api-drives-ui-sessions~1</h5><div class="item-description"><p>API operations shall run on the UI thread against the visible tabs'
+existing SSH sessions — no hidden parallel connections.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/api.md:33</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~api-drives-ui-sessions-1448317812575814887~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_api_token_auth_1" data-req-id="req~api-token-auth~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~api-token-auth~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~api-token-auth~1</h5><div class="item-description"><p>Every endpoint except the self-describing index and health check shall
+require a bearer token persisted in the config directory.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/api.md:24</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~api-token-auth-6682421107947947249~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_api_transport_1" data-req-id="req~api-transport~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~api-transport~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~api-transport~1</h5><div class="item-description"><p>The API shall listen on 127.0.0.1 only, on a configurable port
+(<code>AETHERIUM_API_PORT</code> or 48920..48925 fallback), hand-rolled HTTP/1.1
+with JSON responses, and advertise its URL and token location in the
+startup log and status bar.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/api.md:13</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~api-transport-13590724034275183099~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_bundled_monospace_font_1" data-req-id="req~bundled-monospace-font~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~bundled-monospace-font~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~bundled-monospace-font~1</h5><div class="item-description"><p>A true monospace font (Lilex) shall be bundled so the terminal cell
+grid is always correct even when system font enumeration fails to
+expose a monospace to the UI toolkit.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/terminal.md:13</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~terminal-emulation~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~terminal-emulation~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~bundled-monospace-font-15352569498445590621~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_bundled_zed_themes_1" data-req-id="req~bundled-zed-themes~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~bundled-zed-themes~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~bundled-zed-themes~1</h5><div class="item-description"><p>Themes shall be parsed from the original Zed theme JSON (One, Ayu,
+Gruvbox families) rather than hardcoded palettes.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/terminal.md:43</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~theme-system~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~theme-system~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~bundled-zed-themes-1503012342011044291~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_default_key_fallback_1" data-req-id="req~default-key-fallback~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~default-key-fallback~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~default-key-fallback~1</h5><div class="item-description"><p>When no agent identity is accepted, the app shall try the default
+private keys <code>id_ed25519</code>, <code>id_rsa</code>, <code>id_ecdsa</code> from the user's <code>.ssh</code>
+directory before using a stored password.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:56</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~silent-key-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~silent-key-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~default-key-fallback-6290104542750125658~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_known_hosts_verification_1" data-req-id="req~known-hosts-verification~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~known-hosts-verification~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~known-hosts-verification~1</h5><div class="item-description"><p>On connect, the server's host key shall be verified against the user's
+<code>known_hosts</code>; unknown keys are learned (trust-on-first-use), changed
+keys are rejected.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:25</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~connection-profiles~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~connection-profiles~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~known-hosts-verification-7417886633352830872~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_local_echo_1" data-req-id="req~local-echo~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~local-echo~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~local-echo~1</h5><div class="item-description"><p>Printable keystrokes shall be echoed into the grid instantly and the
+server's identical echo deduplicated, so typing stays responsive on
+high-latency links.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/terminal.md:23</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~terminal-emulation~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~terminal-emulation~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~local-echo-12654171270862646907~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_log_highlighting_1" data-req-id="req~log-highlighting~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~log-highlighting~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~log-highlighting~1</h5><div class="item-description"><p>Log lines shall be syntax-highlighted via configurable regex rules
+(errors bold red, warnings amber, timestamps cyan, …), editable in the
+config directory.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/logs.md:22</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, utest</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~log-highlighting-14719052022688558269~0</span>,<span class="requirement-link link-covered shallow">utest~log-highlighting-4589016108637773256~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_log_rotation_1" data-req-id="req~log-rotation~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~log-rotation~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~log-rotation~1</h5><div class="item-description"><p>The follow command shall use <code>tail -F</code> (by filename) with an automatic
+fallback to <code>-f</code>, so log rotation does not freeze the view.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/logs.md:13</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~log-rotation-10767503195705708096~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_piped_newline_handling_1" data-req-id="req~piped-newline-handling~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~piped-newline-handling~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~piped-newline-handling~1</h5><div class="item-description"><p>Channel output without a PTY shall be translated LF → CRLF before
+reaching the grid, because the terminal emulator keeps the column on
+bare line feeds.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/logs.md:42</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl, utest</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~piped-newline-handling-5718690650210482511~0</span>,<span class="requirement-link link-covered shallow">utest~piped-newline-handling-8242751811329495106~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_profile_storage_1" data-req-id="req~profile-storage~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~profile-storage~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~profile-storage~1</h5><div class="item-description"><p>Profiles shall be stored on disk (TOML) with passwords/passphrases
+encrypted at rest under the user's config directory.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:16</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~connection-profiles~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~connection-profiles~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~profile-storage-4104207981843970511~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_sftp_operations_1" data-req-id="req~sftp-operations~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~sftp-operations~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~sftp-operations~1</h5><div class="item-description"><p>Directory listing, rename/move, recursive delete, create file/dir, and
+single/directory transfers shall work over SFTP without blocking the
+terminal session.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/files.md:12</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~file-tree~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~file-tree~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~sftp-operations-7541398859190302414~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_windows_drag_out_1" data-req-id="req~windows-drag-out~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~windows-drag-out~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~windows-drag-out~1</h5><div class="item-description"><p>Dragging a remote file out of the app window on Windows shall offer it
+to the OS via an OLE drag (CF_HDROP) built from the staged temp download.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:85</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~windows-parity~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~windows-parity~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~windows-drag-out-6944009282299321240~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_req_windows_gui_subsystem_1" data-req-id="req~windows-gui-subsystem~1">
+                    <div class="item-header">
+                        <h4 class="item-id">req~windows-gui-subsystem~1</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"><h5 class="item-title">req~windows-gui-subsystem~1</h5><div class="item-description"><p>The Windows binary shall be a GUI-subsystem application; diagnostics
+shall be written to a log file because stderr is unavailable.</p>
+</div></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">docs/requirements/connection.md:76</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Needs:</span>
+                            <span class="metadata-value">impl</span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~windows-parity~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~windows-parity~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Incoming Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covered shallow">impl~windows-gui-subsystem-11911753859457645401~0</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_agent_auth_15385386599030740549_0" data-req-id="impl~agent-auth-15385386599030740549~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~agent-auth-15385386599030740549~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:1591</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~agent-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~agent-auth~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_agent_auth_2562406149798453621_0" data-req-id="impl~agent-auth-2562406149798453621~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~agent-auth-2562406149798453621~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:1582</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~agent-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~agent-auth~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_api_drives_ui_sessions_1448317812575814887_0" data-req-id="impl~api-drives-ui-sessions-1448317812575814887~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~api-drives-ui-sessions-1448317812575814887~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:514</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~api-drives-ui-sessions~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~api-drives-ui-sessions~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_api_token_auth_6682421107947947249_0" data-req-id="impl~api-token-auth-6682421107947947249~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~api-token-auth-6682421107947947249~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/api.rs:253</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~api-token-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~api-token-auth~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_api_transport_13590724034275183099_0" data-req-id="impl~api-transport-13590724034275183099~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~api-transport-13590724034275183099~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/api.rs:80</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~api-transport~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~api-transport~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_bundled_monospace_font_15352569498445590621_0" data-req-id="impl~bundled-monospace-font-15352569498445590621~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~bundled-monospace-font-15352569498445590621~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/assets.rs:112</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~bundled-monospace-font~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~bundled-monospace-font~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_bundled_zed_themes_1503012342011044291_0" data-req-id="impl~bundled-zed-themes-1503012342011044291~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~bundled-zed-themes-1503012342011044291~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/theme.rs:368</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~bundled-zed-themes~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~bundled-zed-themes~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_connection_profiles_4342400178408981231_0" data-req-id="impl~connection-profiles-4342400178408981231~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~connection-profiles-4342400178408981231~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:1302</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~connection-profiles~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~connection-profiles~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_default_key_fallback_6290104542750125658_0" data-req-id="impl~default-key-fallback-6290104542750125658~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~default-key-fallback-6290104542750125658~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:1544</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~default-key-fallback~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~default-key-fallback~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_file_tree_739461626868670595_0" data-req-id="impl~file-tree-739461626868670595~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~file-tree-739461626868670595~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:5821</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~file-tree~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~file-tree~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_icon_ui_16398624836145443236_0" data-req-id="impl~icon-ui-16398624836145443236~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~icon-ui-16398624836145443236~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:4525</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~icon-ui~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~icon-ui~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_known_hosts_verification_7417886633352830872_0" data-req-id="impl~known-hosts-verification-7417886633352830872~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~known-hosts-verification-7417886633352830872~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:274</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~known-hosts-verification~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~known-hosts-verification~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_local_echo_12654171270862646907_0" data-req-id="impl~local-echo-12654171270862646907~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~local-echo-12654171270862646907~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/terminal_model.rs:215</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~local-echo~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~local-echo~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_log_follow_view_11376352580996325560_0" data-req-id="impl~log-follow-view-11376352580996325560~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~log-follow-view-11376352580996325560~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:1383</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~log-follow-view~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~log-follow-view~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_log_highlighting_14719052022688558269_0" data-req-id="impl~log-highlighting-14719052022688558269~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~log-highlighting-14719052022688558269~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/log_highlight.rs:72</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~log-highlighting~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~log-highlighting~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_log_rotation_10767503195705708096_0" data-req-id="impl~log-rotation-10767503195705708096~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~log-rotation-10767503195705708096~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:445</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~log-rotation~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~log-rotation~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_os_file_drag_out_6899272431525779522_0" data-req-id="impl~os-file-drag-out-6899272431525779522~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~os-file-drag-out-6899272431525779522~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:5965</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~os-file-drag-out~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~os-file-drag-out~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_os_file_drop_in_5312732653769802644_0" data-req-id="impl~os-file-drop-in-5312732653769802644~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~os-file-drop-in-5312732653769802644~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:1979</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~os-file-drop-in~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~os-file-drop-in~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_piped_newline_handling_5718690650210482511_0" data-req-id="impl~piped-newline-handling-5718690650210482511~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~piped-newline-handling-5718690650210482511~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:899</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~piped-newline-handling~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~piped-newline-handling~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_profile_storage_4104207981843970511_0" data-req-id="impl~profile-storage-4104207981843970511~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~profile-storage-4104207981843970511~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/profiles.rs:140</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~profile-storage~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~profile-storage~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_remote_edit_writeback_14779396723442143171_0" data-req-id="impl~remote-edit-writeback-14779396723442143171~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~remote-edit-writeback-14779396723442143171~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:2395</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~remote-edit-writeback~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~remote-edit-writeback~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_rest_api_8001128905745437364_0" data-req-id="impl~rest-api-8001128905745437364~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~rest-api-8001128905745437364~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:1500</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~rest-api~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~rest-api~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_sftp_operations_7541398859190302414_0" data-req-id="impl~sftp-operations-7541398859190302414~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~sftp-operations-7541398859190302414~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:423</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~sftp-operations~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~sftp-operations~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_silent_key_auth_16586013141973672631_0" data-req-id="impl~silent-key-auth-16586013141973672631~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~silent-key-auth-16586013141973672631~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/session.rs:1431</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~silent-key-auth~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~silent-key-auth~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_snaketail_tools_9523073341741335031_0" data-req-id="impl~snaketail-tools-9523073341741335031~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~snaketail-tools-9523073341741335031~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:4660</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~snaketail-tools~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~snaketail-tools~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_terminal_emulation_1488185052312034709_0" data-req-id="impl~terminal-emulation-1488185052312034709~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~terminal-emulation-1488185052312034709~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:3890</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~terminal-emulation~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~terminal-emulation~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_theme_system_7094135202574954927_0" data-req-id="impl~theme-system-7094135202574954927~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~theme-system-7094135202574954927~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:2195</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~theme-system~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~theme-system~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_transfer_progress_5847356204615052182_0" data-req-id="impl~transfer-progress-5847356204615052182~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~transfer-progress-5847356204615052182~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/ui.rs:5646</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~transfer-progress~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~transfer-progress~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_windows_drag_out_6944009282299321240_0" data-req-id="impl~windows-drag-out-6944009282299321240~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~windows-drag-out-6944009282299321240~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/windows_drag.rs:204</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~windows-drag-out~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~windows-drag-out~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_windows_gui_subsystem_11911753859457645401_0" data-req-id="impl~windows-gui-subsystem-11911753859457645401~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~windows-gui-subsystem-11911753859457645401~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/main.rs:10</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~windows-gui-subsystem~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~windows-gui-subsystem~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_impl_windows_parity_10837721609297764626_0" data-req-id="impl~windows-parity-10837721609297764626~0">
+                    <div class="item-header">
+                        <h4 class="item-id">impl~windows-parity-10837721609297764626~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/main.rs:9</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">feat~windows-parity~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">feat~windows-parity~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_utest_log_highlighting_4589016108637773256_0" data-req-id="utest~log-highlighting-4589016108637773256~0">
+                    <div class="item-header">
+                        <h4 class="item-id">utest~log-highlighting-4589016108637773256~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/log_highlight.rs:156</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~log-highlighting~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~log-highlighting~1</span></span>
+                        </div></div>
+                </div><div class="spec-item" id="item_utest_piped_newline_handling_8242751811329495106_0" data-req-id="utest~piped-newline-handling-8242751811329495106~0">
+                    <div class="item-header">
+                        <h4 class="item-id">utest~piped-newline-handling-8242751811329495106~0</h4>
+                        <div class="item-status">
+                            <span class="coverage-badge">covered</span>
+                        </div>
+                    </div>
+                    
+                    <div class="item-content"></div>
+
+                    <div class="item-metadata"><div class="metadata-row">
+                                    <span class="metadata-label">Location:</span>
+                                    <span class="metadata-value">src/terminal_model.rs:933</span>
+                                </div><div class="metadata-row">
+                            <span class="metadata-label">Covers:</span>
+                            <span class="metadata-value"><span class="requirement-link">req~piped-newline-handling~1</span></span>
+                        </div><div class="metadata-row">
+                            <span class="metadata-label">Outgoing Links:</span>
+                            <span class="metadata-value"><span class="requirement-link link-covers">req~piped-newline-handling~1</span></span>
+                        </div></div>
+                </div></div>
+        </section>
+    </div>
+    
+    <script>
+        // [impl->req~html-compliant-anchors~1]
+        // [impl->req~defect-requirement-linking~1]
+        // Make requirement IDs clickable by adding hyperlinks
+        document.addEventListener('DOMContentLoaded', function() {
+            // Create a map of requirement ID to HTML-safe anchor ID
+            const requirementElements = document.querySelectorAll('.spec-item');
+            const idToAnchor = new Map();
+            
+            requirementElements.forEach((element) => {
+                const reqId = element.getAttribute('data-req-id');
+                if (reqId) {
+                    // HTML-safe ID is already set on the element
+                    const anchorId = element.id;
+                    idToAnchor.set(reqId, anchorId);
+                }
+            });
+            
+            // Convert requirement text to links in metadata sections
+            const requirementLinks = document.querySelectorAll('.requirement-link');
+            requirementLinks.forEach(linkElement => {
+                const reqId = linkElement.textContent.trim();
+                if (idToAnchor.has(reqId)) {
+                    // Convert span to anchor
+                    const anchor = document.createElement('a');
+                    anchor.href = '#' + idToAnchor.get(reqId);
+                    anchor.className = linkElement.className;
+                    anchor.textContent = linkElement.textContent;
+                    linkElement.parentNode.replaceChild(anchor, linkElement);
+                }
+            });
+            
+            // Convert requirement IDs in defect descriptions to clickable links
+            const defectDescriptions = document.querySelectorAll('.defect-description');
+            defectDescriptions.forEach(descElement => {
+                let html = descElement.innerHTML;
+                // Match requirement ID patterns like "req~name~1" or "dsn~name~2"
+                const reqIdPattern = /\b([a-z]+)~([a-zA-Z0-9-_]+)~(\d+)\b/g;
+                html = html.replace(reqIdPattern, (match) => {
+                    if (idToAnchor.has(match)) {
+                        return `<a href="#${idToAnchor.get(match)}" class="defect-req-link">${match}</a>`;
+                    }
+                    return match;
+                });
+                descElement.innerHTML = html;
+            });
+            
+            // Add smooth scrolling
+            document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+                anchor.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    const target = document.querySelector(this.getAttribute('href'));
+                    if (target) {
+                        target.scrollIntoView({
+                            behavior: 'smooth',
+                            block: 'center'
+                        });
+                        // Highlight the target briefly
+                        target.style.backgroundColor = '#fff3cd';
+                        setTimeout(() => {
+                            target.style.backgroundColor = '';
+                        }, 2000);
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>

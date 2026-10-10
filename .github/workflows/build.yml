@@ -37,6 +37,18 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Install cargo-ovft
+        run: cargo install cargo-ovft
+
+      - name: Requirements traceability
+        run: cargo ovft --check --output requirements_report.html
+
+      - name: Zip requirements report
+        shell: bash
+        run: |
+          mkdir -p dist
+          python3 -c "import zipfile; zipfile.ZipFile('dist/requirements-report.zip', 'w').write('requirements_report.html')"
+
       - name: Build and package (Linux)
         if: runner.os == 'Linux'
         run: bash scripts/build-linux.sh

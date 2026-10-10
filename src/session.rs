@@ -1466,7 +1466,29 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
                 .await
                 .context("publickey authentication")?
         }
-        AuthMethod::Agent => authenticate_with_agent(handle, &profile.username).await?,
+        AuthMethod::Agent => {
+            // The agent is preferred, but like OpenSSH we fall back to the
+            // default key files when the agent is unreachable or holds no
+            // accepted identity — on Windows this is the common case, since
+            // `ssh` CLI works via default keys while its agent service is
+            // stopped.
+            match authenticate_with_agent(handle, &profile.username).await {
+                Ok(result @ AuthResult::Success) => result,
+                agent_result => {
+                    log::info!(
+                        "agent auth did not succeed ({agent_result:?}); trying default keys"
+                    );
+                    match try_default_key_auth(handle, &profile.username).await {
+                        Some(result) => result,
+                        None => {
+                            return Err(anyhow!(
+                                "ssh-agent has no accepted identity and no default key worked"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
     };
 
     match result {
@@ -1533,6 +1555,15 @@ async fn try_silent_auth(handle: &mut Handle<ClientHandler>, username: &str) -> 
     if let Ok(result @ AuthResult::Success) = authenticate_with_agent(handle, username).await {
         return Some(result);
     }
+    try_default_key_auth(handle, username).await
+}
+
+/// Try the default private key files (`id_ed25519`, `id_rsa`, `id_ecdsa`),
+/// unencrypted, like OpenSSH's identity-file fallback.
+async fn try_default_key_auth(
+    handle: &mut Handle<ClientHandler>,
+    username: &str,
+) -> Option<AuthResult> {
     let key_path = detect_default_ssh_key()?;
     let key = russh::keys::load_secret_key(&key_path, None).ok()?;
     let hash = handle.best_supported_rsa_hash().await.ok()?.flatten();
