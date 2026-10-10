@@ -409,7 +409,16 @@ async fn command_loop(
                         shell.window_change(cols, rows, 0, 0).await.context("window-change")?;
                     }
                     Some(Command::TailFile { tail_id, terminal, path }) => {
-                        let command = format!("tail -n 200 -f {}", shell_quote(&path));
+                        // `-F` follows the file *by name*, so the view keeps
+                        // working across log rotation (rename + recreate).
+                        // tails without -F (busybox) exit immediately; the
+                        // fallback re-runs with -f. stderr of the -F attempt
+                        // is suppressed so its "invalid option" message never
+                        // reaches the grid.
+                        let quoted = shell_quote(&path);
+                        let command = format!(
+                            "tail -n 200 -F {quoted} 2>/dev/null || tail -n 200 -f {quoted}"
+                        );
                         match handle.channel_open_session().await {
                             Ok(mut channel) => {
                                 let started = channel
@@ -433,7 +442,14 @@ async fn command_loop(
                                                     match msg {
                                                         Some(ChannelMsg::Data { data })
                                                         | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                                                            terminal.feed(&data);
+                                                            // The channel has no PTY, so
+                                                            // remote \\n arrives bare — but
+                                                            // alacritty routes raw LF to
+                                                            // `linefeed` and keeps the
+                                                            // column, staircase-style. A PTY
+                                                            // would apply ONLCR; do the same
+                                                            // here (existing \\r\\n untouched).
+                                                            terminal.feed(&lf_to_crlf(&data));
                                                         }
                                                         Some(ChannelMsg::Eof)
                                                         | Some(ChannelMsg::Close)
@@ -737,6 +753,24 @@ fn remote_join(dir: &std::path::Path, name: &str) -> String {
 /// Quote a path for execution by a POSIX shell.
 fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// Translate lone `\n` to `\r\n` (PTY-style ONLCR). Borrowed when no
+/// translation is needed.
+fn lf_to_crlf(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !data.contains(&b'\n') {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut prev = 0u8;
+    for &byte in data {
+        if byte == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+        prev = byte;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Total size of a local file tree; unreadable entries are skipped.

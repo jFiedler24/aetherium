@@ -3,7 +3,7 @@
 //! translates gpui keystrokes into the byte sequences a PTY expects.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -11,6 +11,7 @@ use alacritty_terminal::index::{Column, Direction, Line, Point};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::vte::ansi;
 use gpui::Keystroke;
@@ -78,6 +79,12 @@ pub struct TerminalModel {
     /// Enter), fed from outgoing keystrokes for command-history capture.
     /// Approximate: line editing beyond Backspace/^C/^U is not modeled.
     input_line: Arc<Mutex<Vec<u8>>>,
+    /// Count of complete lines ever fed into the grid (counted `\\n`s).
+    /// Shared across clones; the SSH/tail reader threads increment it. Log
+    /// views use it to give scrollback rows stable anchors: a row captured at
+    /// line index `l` with counter `n` keeps the identity `l + n`, because
+    /// every newline shifts every existing row's line index by exactly one.
+    lines_fed: Arc<AtomicU64>,
 }
 
 impl TerminalModel {
@@ -100,6 +107,7 @@ impl TerminalModel {
             parser: Arc::new(Mutex::new(ansi::Processor::new())),
             pending_echo: Arc::new(Mutex::new(Vec::new())),
             input_line: Arc::new(Mutex::new(Vec::new())),
+            lines_fed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -134,8 +142,63 @@ impl TerminalModel {
             self.parser
                 .lock()
                 .advance(&mut *term, &bytes[bytes.len() - unconfirmed..]);
+            let newlines = bytes[bytes.len() - unconfirmed..]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u64;
+            self.lines_fed.fetch_add(newlines, Ordering::Relaxed);
         }
         self.set_dirty();
+    }
+
+    /// Total complete lines ever fed into the grid. See the field doc: the
+    /// sum of a row's alacritty line index and this counter at capture time
+    /// is a stable identity for that row while it stays in the grid.
+    pub fn lines_fed(&self) -> u64 {
+        self.lines_fed.load(Ordering::Relaxed)
+    }
+
+    /// Valid alacritty line index range: `(min_line0, screen_lines)`. Row
+    /// indexes run `-(total_lines - screen_lines) .. screen_lines - 1`.
+    pub fn grid_bounds(&self) -> (i32, i32) {
+        let term = self.term.lock();
+        let screen = term.screen_lines() as i32;
+        let history = term.grid().total_lines() as i32 - screen;
+        (-history, screen)
+    }
+
+    /// Extract one grid row's text. `line0` is alacritty space: it matches
+    /// the `point.line` coordinates display_iter reports (0 = top viewport
+    /// row, `screen_lines - 1` = bottom, negative = scrollback), so a row
+    /// paints at canvas row `line0 + display_offset`. Returns the text with
+    /// trailing whitespace trimmed, plus the first column of each remaining
+    /// character (for mapping match ranges onto cells). `None` when out of
+    /// range.
+    pub fn row_text(&self, line0: i32) -> Option<(String, Vec<usize>)> {
+        let term = self.term.lock();
+        let screen = term.screen_lines() as i32;
+        let history = term.grid().total_lines() as i32 - screen;
+        if line0 < -history || line0 >= screen {
+            return None;
+        }
+        let row = &term.grid()[Line(line0)];
+        let mut text = String::new();
+        let mut cols = Vec::new();
+        for col in 0..term.columns() {
+            let cell = &row[Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            cols.push(col);
+            text.push(cell.c);
+        }
+        let trimmed = text.trim_end().len();
+        text.truncate(trimmed);
+        cols.truncate(text.chars().count());
+        Some((text, cols))
     }
 
     /// Whether the server is expected to echo these keystrokes back verbatim:
@@ -863,5 +926,78 @@ mod tests {
         // Escape sequences and tabs do not join the line.
         model.track_input(b"\x1b[A\x1b[B\t");
         assert_eq!(model.track_input(b"clean\r"), Some("clean".to_string()));
+    }
+
+    #[test]
+    fn log_grids_start_lines_at_column_zero() {
+        // Piped remote output is \\n-terminated (no PTY translating to
+        // \\r\\n) and alacritty routes raw LF to `linefeed` without LNM, so
+        // the tail reader translates lone \\n to \\r\\n before feeding. Feed
+        // the translated form here; every line must start at column 0.
+        let model = TerminalModel::new(80, 10);
+        for i in 0..30 {
+            model.feed(format!("line{i:02}\r\n").as_bytes());
+        }
+        let term = model.term.lock();
+        let history = term.grid().total_lines() - term.grid().screen_lines();
+        // "line00" survives in scrollback; "line29" is the last content row,
+        // right above the empty cursor line at the top line index.
+        let (oldest, _) = model_row(&term, -(history as i32));
+        assert!(oldest.starts_with("line00"), "got {oldest:?}");
+        let (newest, _) = model_row(&term, term.screen_lines() as i32 - 2);
+        assert!(newest.starts_with("line29"), "got {newest:?}");
+    }
+
+    #[test]
+    fn line_anchor_is_stable_across_feeds() {
+        // A row's identity = line index + lines_fed at capture time; it must
+        // resolve to the same text after more lines arrive.
+        let model = TerminalModel::new(80, 10);
+        for i in 0..15 {
+            model.feed(format!("line{i:02}\r\n").as_bytes());
+        }
+        let term = model.term.lock();
+        let fed = model.lines_fed();
+        // Find "line03" wherever it currently is.
+        let history = (term.grid().total_lines() - term.grid().screen_lines()) as i32;
+        let mut anchor = None;
+        for l in -history..term.screen_lines() as i32 {
+            let (text, _) = model_row(&term, l);
+            if text.starts_with("line03") {
+                anchor = Some(l as i64 + fed as i64);
+                break;
+            }
+        }
+        drop(term);
+        let anchor = anchor.expect("line03 in grid");
+        for i in 15..40 {
+            model.feed(format!("line{i:02}\r\n").as_bytes());
+        }
+        let term = model.term.lock();
+        let line0 = (anchor - model.lines_fed() as i64) as i32;
+        let (text, _) = model_row(&term, line0);
+        assert!(text.starts_with("line03"), "got {text:?} at {line0}");
+    }
+
+    /// Helper: row text via the same API the log view uses.
+    fn model_row(term: &Term<UiProxy>, line0: i32) -> (String, Vec<usize>) {
+        let row = &term.grid()[Line(line0)];
+        let mut text = String::new();
+        let mut cols = Vec::new();
+        for col in 0..term.columns() {
+            let cell = &row[Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            cols.push(col);
+            text.push(cell.c);
+        }
+        let trimmed = text.trim_end().len();
+        text.truncate(trimmed);
+        cols.truncate(text.chars().count());
+        (text, cols)
     }
 }

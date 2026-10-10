@@ -289,6 +289,8 @@ struct SessionTab {
     highlighter: Option<Arc<LogHighlighter>>,
     /// Cross-session history recall position; `None` means the live line.
     history_pos: Option<usize>,
+    /// SnakeTail-style search/filter/follow/bookmarks; `Some` only for log tabs.
+    log_view: Option<LogView>,
 }
 
 impl SessionTab {
@@ -302,6 +304,209 @@ impl SessionTab {
         match &self.kind {
             TabKind::Log { ended: true, .. } => ConnState::Disconnected,
             _ => self.state.clone(),
+        }
+    }
+}
+
+/// SnakeTail-style view state for log-follow tabs: search, filter,
+/// follow/pause, and bookmarks.
+///
+/// Rows are anchored by `line_index + lines_fed_at_capture` (see
+/// `TerminalModel::lines_fed`): every newline shifts all existing rows'
+/// alacritty line indexes by exactly one, so that sum is a stable identity
+/// while the row stays in the grid. `line0_now = anchor - lines_fed_now`.
+struct LogView {
+    /// Pinned to the live edge; wheel-up (or the pause button) unpins so the
+    /// stream keeps buffering while the user reads (SnakeTail's pause).
+    follow: bool,
+    search_field: Option<Entity<TextField>>,
+    filter_field: Option<Entity<TextField>>,
+    /// Text the caches below were computed for.
+    search_text: String,
+    filter_text: String,
+    search_re: Option<regex::Regex>,
+    filter_re: Option<regex::Regex>,
+    /// Matching rows, oldest first: (anchor, match char ranges per row).
+    matches: Vec<(i64, Vec<(usize, usize)>)>,
+    /// Index into `matches` of the current match.
+    current_match: Option<usize>,
+    /// Anchors of rows matching the filter (oldest first); empty = filter
+    /// yields nothing (or is inactive — check `filter_re`).
+    filtered: Vec<i64>,
+    /// Rows scrolled up from the live edge while filtering.
+    filter_offset: usize,
+    bookmarks: std::collections::BTreeSet<i64>,
+    /// Current line, for bookmark toggling and navigation reference.
+    caret: Option<i64>,
+    /// Terminal output arrived; recompute matches/filter on next poll.
+    stale: bool,
+}
+
+impl LogView {
+    fn new() -> Self {
+        Self {
+            follow: true,
+            search_field: None,
+            filter_field: None,
+            search_text: String::new(),
+            filter_text: String::new(),
+            search_re: None,
+            filter_re: None,
+            matches: Vec::new(),
+            current_match: None,
+            filtered: Vec::new(),
+            filter_offset: 0,
+            bookmarks: std::collections::BTreeSet::new(),
+            caret: None,
+            stale: true,
+        }
+    }
+
+    /// Create the search/filter text fields on first use (needs a `Context`).
+    fn ensure_fields(&mut self, cx: &mut Context<RootView>) {
+        if self.search_field.is_none() {
+            self.search_field = Some(cx.new(|cx| TextField::new(cx, "search…")));
+        }
+        if self.filter_field.is_none() {
+            self.filter_field = Some(cx.new(|cx| TextField::new(cx, "filter…")));
+        }
+    }
+
+    fn set_search(&mut self, text: String) {
+        self.search_text = text;
+        self.search_re = if self.search_text.is_empty() {
+            None
+        } else {
+            regex::Regex::new(&format!("(?i){}", regex::escape(&self.search_text))).ok()
+        };
+        self.current_match = None;
+        self.stale = true;
+    }
+
+    fn set_filter(&mut self, text: String) {
+        self.filter_text = text;
+        self.filter_re = if self.filter_text.is_empty() {
+            None
+        } else {
+            regex::Regex::new(&format!("(?i){}", regex::escape(&self.filter_text))).ok()
+        };
+        self.filter_offset = 0;
+        self.stale = true;
+    }
+
+    /// Recompute search matches and the filter row set from the grid, and
+    /// prune anchors of rows that have scrolled out of the scrollback.
+    fn refresh(&mut self, terminal: &TerminalModel) {
+        self.stale = false;
+        let fed = terminal.lines_fed() as i64;
+        let (min_line0, screen) = terminal.grid_bounds();
+        // Row indexes outlive the grid eventually; drop their bookmarks and
+        // any current-match pointer that referenced them.
+        self.bookmarks
+            .retain(|&anchor| anchor - fed >= min_line0 as i64 - 1);
+        self.matches.clear();
+        self.filtered.clear();
+        let search = self.search_re.clone();
+        let filter = self.filter_re.clone();
+        for line0 in min_line0..screen {
+            let Some((text, cols)) = terminal.row_text(line0) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let anchor = line0 as i64 + fed;
+            if let Some(re) = filter.as_ref() {
+                if re.find(&text).is_some() {
+                    self.filtered.push(anchor);
+                }
+            }
+            if let Some(re) = search.as_ref() {
+                let mut ranges = Vec::new();
+                for found in re.find_iter(&text) {
+                    let start_char = text[..found.start()].chars().count();
+                    let end_char = text[..found.end()].chars().count();
+                    if start_char >= end_char || end_char > cols.len() {
+                        continue;
+                    }
+                    ranges.push((start_char, end_char));
+                    if ranges.len() >= 64 {
+                        break;
+                    }
+                }
+                if !ranges.is_empty() {
+                    self.matches.push((anchor, ranges));
+                }
+            }
+        }
+        if let Some(current) = self.current_match {
+            if current >= self.matches.len() {
+                self.current_match = None;
+            }
+        }
+        // Keep the caret alive only while its row is in the grid.
+        if let Some(caret) = self.caret {
+            if caret - fed < min_line0 as i64 || caret - fed >= screen as i64 {
+                self.caret = None;
+            }
+        }
+    }
+
+    /// `true` when only filter-matching rows should render.
+    fn filtering(&self) -> bool {
+        self.filter_re.is_some()
+    }
+
+    /// Current line for bookmark toggling: explicit caret, else the current
+    /// match, else the newest grid row.
+    fn caret_anchor(&self, terminal: &TerminalModel) -> i64 {
+        let fed = terminal.lines_fed() as i64;
+        if let Some(caret) = self.caret {
+            return caret;
+        }
+        if let Some(current) = self.current_match {
+            return self.matches[current].0;
+        }
+        // Newest content row: the topmost line index minus one (the top row
+        // is usually the empty cursor line).
+        let (_min, screen) = terminal.grid_bounds();
+        fed + screen as i64 - 2
+    }
+}
+
+/// Per-frame painting data for a log tab's overlays, built on the UI thread
+/// and passed into the canvas prepaint.
+struct LogOverlay {
+    /// Search-match char ranges per alacritty line index.
+    matches: std::collections::HashMap<i32, Vec<(usize, usize)>>,
+    /// The active match gets a stronger background.
+    current: Option<(i32, (usize, usize))>,
+    /// Bookmarked line indexes.
+    bookmarks: Vec<i32>,
+    /// Current-line marker.
+    caret: Option<i32>,
+}
+
+impl LogOverlay {
+    fn build(view: &LogView, fed: i64) -> Self {
+        let mut matches = std::collections::HashMap::new();
+        let mut current = None;
+        for (ix, (anchor, ranges)) in view.matches.iter().enumerate() {
+            let line0 = (*anchor - fed) as i32;
+            if Some(ix) == view.current_match {
+                current = Some((line0, ranges[0]));
+            }
+            matches.insert(line0, ranges.clone());
+        }
+        Self {
+            matches,
+            current,
+            bookmarks: view
+                .bookmarks
+                .iter()
+                .map(|anchor| (*anchor - fed) as i32)
+                .collect(),
+            caret: view.caret.map(|anchor| (anchor - fed) as i32),
         }
     }
 }
@@ -508,7 +713,17 @@ impl RootView {
                             }
                         }
                     }
-                    if this.tabs.iter().any(|tab| tab.terminal.take_dirty()) {
+                    if this
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.terminal.take_dirty())
+                    {
+                        // New output invalidates log search/filter caches.
+                        for tab in &mut this.tabs {
+                            if let Some(view) = tab.log_view.as_mut() {
+                                view.stale = true;
+                            }
+                        }
                         cx.notify();
                     }
                 });
@@ -540,6 +755,7 @@ impl RootView {
                             handled = true;
                         }
                     }
+                    this.log_view_upkeep(cx);
                     if handled {
                         cx.notify();
                     }
@@ -550,6 +766,48 @@ impl RootView {
             }
         })
         .detach();
+    }
+
+    /// Per-tick upkeep of the active log tab: follow pinning, applying
+    /// search/filter field text, and refreshing stale result caches.
+    fn log_view_upkeep(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(view) = tab.log_view.as_mut() else {
+            return;
+        };
+        // Pin to the live edge while following.
+        if view.follow {
+            if view.filtering() {
+                view.filter_offset = 0;
+            } else {
+                tab.terminal.term.lock().scroll_display(Scroll::Bottom);
+            }
+        }
+        // The toolbar fields edit themselves; pick up their text here so the
+        // whole view updates even though the fields re-render independently.
+        let search_now = view
+            .search_field
+            .as_ref()
+            .map(|field| field.read(cx).text().to_string())
+            .unwrap_or_default();
+        if search_now != view.search_text {
+            view.set_search(search_now);
+        }
+        let filter_now = view
+            .filter_field
+            .as_ref()
+            .map(|field| field.read(cx).text().to_string())
+            .unwrap_or_default();
+        if filter_now != view.filter_text {
+            view.set_filter(filter_now);
+        }
+        if view.stale {
+            view.refresh(&tab.terminal);
+            tab.terminal.mark_dirty();
+            cx.notify();
+        }
     }
 
     fn handle_tab_event(&mut self, index: usize, event: SessionEvent) {
@@ -903,6 +1161,7 @@ impl RootView {
             pending_upload_dirs: Vec::new(),
             highlighter: None,
             history_pos: None,
+            log_view: None,
         };
         session.connect(profile);
         self.tabs.push(tab);
@@ -965,6 +1224,7 @@ impl RootView {
             pending_upload_dirs: Vec::new(),
             highlighter: Some(Arc::new(LogHighlighter::load())),
             history_pos: None,
+            log_view: Some(LogView::new()),
         };
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -983,7 +1243,188 @@ impl RootView {
         self.tree_editor = None;
         self.tree_drag_target = None;
         self.tree_dragging = None;
-        self.tabs[index].terminal_focus_pending = true;
+        let tab = &mut self.tabs[index];
+        tab.terminal_focus_pending = true;
+        if let Some(view) = tab.log_view.as_mut() {
+            // Results may be stale after time on another tab.
+            view.stale = true;
+            if view.follow {
+                if view.filtering() {
+                    view.filter_offset = 0;
+                } else {
+                    tab.terminal.term.lock().scroll_display(Scroll::Bottom);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Toggle following the live edge (SnakeTail's pause/resume). Pausing
+    /// keeps the stream buffering in the grid; resuming jumps to the edge.
+    fn log_toggle_follow(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let Some(view) = tab.log_view.as_mut() else {
+            return;
+        };
+        view.follow = !view.follow;
+        if view.follow {
+            if view.filtering() {
+                view.filter_offset = 0;
+            } else {
+                tab.terminal.term.lock().scroll_display(Scroll::Bottom);
+            }
+        }
+        tab.terminal.mark_dirty();
+        cx.notify();
+    }
+
+    /// Scroll so the row `line0` lands at the bottom of the viewport,
+    /// following when it is already the live edge.
+    fn log_reveal_line(&mut self, line0: i32) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let Some(view) = tab.log_view.as_mut() else {
+            return;
+        };
+        if view.filtering() {
+            let fed = tab.terminal.lines_fed() as i64;
+            if let Some(index) = view
+                .filtered
+                .iter()
+                .position(|anchor| (*anchor - fed) as i32 == line0)
+            {
+                let len = view.filtered.len();
+                view.filter_offset = (len - 1 - index).min(len.saturating_sub(1));
+                view.follow = view.filter_offset == 0;
+            }
+        } else {
+            let (min_line0, screen) = tab.terminal.grid_bounds();
+            let history = (-min_line0).max(0);
+            let d_cur = tab
+                .terminal
+                .term
+                .lock()
+                .renderable_content()
+                .display_offset as i32;
+            let d_target = ((screen - 1) - line0).clamp(0, history);
+            if d_target != d_cur {
+                tab.terminal
+                    .term
+                    .lock()
+                    .scroll_display(Scroll::Delta(d_target - d_cur));
+            }
+            view.follow = d_target == 0;
+        }
+        tab.terminal.mark_dirty();
+    }
+
+    /// Step through search matches (SnakeTail's search-and-highlight);
+    /// wraps around, scrolls the match into view, and marks it current.
+    fn log_search_navigate(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let target = {
+            let Some(tab) = self.active_tab_mut() else {
+                return;
+            };
+            let Some(view) = tab.log_view.as_mut() else {
+                return;
+            };
+            if view.matches.is_empty() {
+                self.status = "no matches".into();
+                return;
+            }
+            let fed = tab.terminal.lines_fed() as i64;
+            let len = view.matches.len();
+            let next = match view.current_match {
+                Some(cur) => {
+                    if forward {
+                        (cur + 1) % len
+                    } else {
+                        (cur + len - 1) % len
+                    }
+                }
+                None => {
+                    // First match at/after the caret line (before, backwards).
+                    let caret0 = view.caret_anchor(&tab.terminal) - fed;
+                    view.matches
+                        .iter()
+                        .position(|(anchor, _)| {
+                            let line = *anchor - fed;
+                            if forward {
+                                line >= caret0
+                            } else {
+                                line <= caret0
+                            }
+                        })
+                        .unwrap_or(if forward { 0 } else { len - 1 })
+                }
+            };
+            view.current_match = Some(next);
+            let anchor = view.matches[next].0;
+            view.caret = Some(anchor);
+            (anchor - fed) as i32
+        };
+        self.log_reveal_line(target);
+        cx.notify();
+    }
+
+    /// Toggle a bookmark on the current line (⌘B).
+    fn log_toggle_bookmark(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let Some(view) = tab.log_view.as_mut() else {
+            return;
+        };
+        let fed = tab.terminal.lines_fed() as i64;
+        let (min_line0, screen) = tab.terminal.grid_bounds();
+        let anchor = view
+            .caret_anchor(&tab.terminal)
+            .clamp(fed + min_line0 as i64, fed + screen as i64 - 1);
+        if !view.bookmarks.insert(anchor) {
+            view.bookmarks.remove(&anchor);
+        }
+        view.caret = Some(anchor);
+        tab.terminal.mark_dirty();
+        cx.notify();
+    }
+
+    /// Jump between bookmarks (⌘[ / ⌘]).
+    fn log_bookmark_navigate(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let target = {
+            let Some(tab) = self.active_tab_mut() else {
+                return;
+            };
+            let Some(view) = tab.log_view.as_mut() else {
+                return;
+            };
+            if view.bookmarks.is_empty() {
+                return;
+            }
+            let fed = tab.terminal.lines_fed() as i64;
+            let caret0 = view.caret_anchor(&tab.terminal) - fed;
+            let next = if forward {
+                view.bookmarks
+                    .iter()
+                    .find(|anchor| **anchor - fed > caret0)
+                    .or_else(|| view.bookmarks.iter().next())
+            } else {
+                view.bookmarks
+                    .iter()
+                    .rev()
+                    .find(|anchor| **anchor - fed < caret0)
+                    .or_else(|| view.bookmarks.iter().next_back())
+            };
+            next.map(|anchor| {
+                view.caret = Some(*anchor);
+                (*anchor - fed) as i32
+            })
+        };
+        if let Some(line0) = target {
+            self.log_reveal_line(line0);
+        }
         cx.notify();
     }
 
@@ -1747,6 +2188,97 @@ impl RootView {
 
         // Log-follow tabs are read-only views of `tail -f` output.
         if is_log {
+            let focused = window.focused(cx);
+            let (search_focus, filter_focus) = self
+                .active_tab()
+                .and_then(|tab| tab.log_view.as_ref())
+                .map(|view| {
+                    (
+                        view.search_field
+                            .as_ref()
+                            .map(|field| field.read(cx).focus_handle(cx)),
+                        view.filter_field
+                            .as_ref()
+                            .map(|field| field.read(cx).focus_handle(cx)),
+                    )
+                })
+                .unwrap_or((None, None));
+            let field_focused = search_focus
+                .as_ref()
+                .is_some_and(|handle| Some(handle) == focused.as_ref())
+                || filter_focus
+                    .as_ref()
+                    .is_some_and(|handle| Some(handle) == focused.as_ref());
+
+            if mods.platform && !mods.control && !mods.alt {
+                match keystroke.key.as_str() {
+                    "f" => {
+                        if let Some(handle) = search_focus {
+                            window.focus(&handle, cx);
+                        }
+                        return;
+                    }
+                    "g" => {
+                        self.log_search_navigate(!mods.shift, cx);
+                        return;
+                    }
+                    "b" => {
+                        self.log_toggle_bookmark(cx);
+                        return;
+                    }
+                    "[" => {
+                        self.log_bookmark_navigate(false, cx);
+                        return;
+                    }
+                    "]" => {
+                        self.log_bookmark_navigate(true, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if field_focused {
+                match keystroke.key.as_str() {
+                    // Enter in the search field steps matches; in the filter
+                    // field it just returns focus to the log (the poll loop
+                    // applies filter text as it changes).
+                    "enter" => {
+                        if search_focus
+                            .as_ref()
+                            .is_some_and(|handle| Some(handle) == focused.as_ref())
+                        {
+                            self.log_search_navigate(!mods.shift, cx);
+                        } else if let Some(tab) = self.active_tab() {
+                            window.focus(&tab.focus_handle, cx);
+                        }
+                        return;
+                    }
+                    "escape" => {
+                        if let Some(tab) = self.active_tab() {
+                            window.focus(&tab.focus_handle, cx);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            // Log scrolling keys.
+            if !mods.platform && !mods.control && !mods.alt {
+                let scroll = match keystroke.key.as_str() {
+                    "up" => Some(Scroll::Delta(1)),
+                    "down" => Some(Scroll::Delta(-1)),
+                    "pageup" => Some(Scroll::PageUp),
+                    "pagedown" => Some(Scroll::PageDown),
+                    "home" => Some(Scroll::Top),
+                    "end" => Some(Scroll::Bottom),
+                    _ => None,
+                };
+                if let Some(scroll) = scroll {
+                    self.log_scroll_active(scroll);
+                    cx.notify();
+                    return;
+                }
+            }
             return;
         }
 
@@ -1794,6 +2326,52 @@ impl RootView {
             self.scroll_to_bottom();
         }
         cx.notify();
+    }
+
+    /// Apply a scroll action to the active log tab — the grid's display
+    /// offset, or the filter window's row offset — and update the follow
+    /// state. Returns `true` when the scroll landed on the live edge.
+    fn log_scroll_active(&mut self, scroll: Scroll) -> bool {
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        let Some(view) = tab.log_view.as_mut() else {
+            return false;
+        };
+        if view.filtering() {
+            // Bottom-anchored window: a bigger offset shows older rows.
+            let len = view.filtered.len() as i32;
+            let delta = match scroll {
+                Scroll::Delta(n) => n,
+                Scroll::PageUp => 10,
+                Scroll::PageDown => -10,
+                Scroll::Top => i32::MAX,
+                Scroll::Bottom => 0,
+                _ => 0,
+            };
+            let next = if delta == i32::MAX {
+                i32::MAX
+            } else {
+                view.filter_offset as i32 + delta
+            };
+            view.filter_offset = next.clamp(0, (len - 1).max(0)) as usize;
+            view.follow = view.filter_offset == 0;
+            tab.terminal.mark_dirty();
+            view.follow
+        } else {
+            tab.terminal.term.lock().scroll_display(scroll);
+            let at_bottom = matches!(scroll, Scroll::Bottom)
+                || tab
+                    .terminal
+                    .term
+                    .lock()
+                    .renderable_content()
+                    .display_offset
+                    == 0;
+            view.follow = at_bottom;
+            tab.terminal.mark_dirty();
+            at_bottom
+        }
     }
 
     /// Jump the display back to the live edge (used whenever input is sent).
@@ -2354,6 +2932,7 @@ type SelectionSegment = (usize, usize, usize);
 fn collect_runs(
     terminal: &TerminalModel,
     highlighter: Option<&LogHighlighter>,
+    overlay: Option<&LogOverlay>,
 ) -> (
     Vec<Vec<RowRun>>,
     Option<(usize, usize, CursorShape, char)>,
@@ -2463,7 +3042,7 @@ fn collect_runs(
         if !is_spacer {
             row_char_ix[row] += 1;
         }
-        let (mut fg, bg) = cell_colors(cell);
+        let (mut fg, mut bg) = cell_colors(cell);
         let mut bold = flags.contains(Flags::BOLD);
         if let Some(segments) = row_highlights.get(row) {
             if let Some((_, _, highlight_fg, highlight_bold)) = segments
@@ -2472,6 +3051,30 @@ fn collect_runs(
             {
                 fg = *highlight_fg;
                 bold |= *highlight_bold;
+            }
+        }
+        // Search matches paint a translucent accent background; the runs
+        // merge check below splits at the boundary automatically.
+        if let Some(overlay) = overlay {
+            let grid_line = indexed.point.line.0;
+            if let Some(ranges) = overlay.matches.get(&grid_line) {
+                let matched = ranges
+                    .iter()
+                    .any(|(start, end)| char_ix >= *start && char_ix < *end);
+                if matched {
+                    bg = Hsla {
+                        a: 0.30,
+                        ..theme::accent()
+                    };
+                }
+            }
+            if let Some((cur_line, (cur_start, cur_end))) = overlay.current {
+                if grid_line == cur_line && char_ix >= cur_start && char_ix < cur_end {
+                    bg = Hsla {
+                        a: 0.55,
+                        ..theme::accent()
+                    };
+                }
             }
         }
         let underline = if flags.contains(Flags::UNDERCURL) {
@@ -2534,6 +3137,127 @@ fn collect_runs(
     )
 }
 
+/// Log-render bundle: overlays for grid mode, or the filter row set.
+struct LogRender<'a> {
+    overlay: Option<&'a LogOverlay>,
+    /// Filter mode: anchored rows (oldest first) to display instead of the
+    /// grid. `filter_offset` rows are scrolled up from the live edge.
+    filter: Option<&'a [i64]>,
+    filter_offset: usize,
+    fed: i64,
+}
+
+/// Build styled runs for filter mode: only the anchored rows render, laid
+/// out bottom-anchored like a terminal (so the live edge stays put while new
+/// matching lines arrive). Each row is a sequence of runs with the log
+/// highlighter's colors and search-match backgrounds applied.
+fn collect_filtered_runs(
+    terminal: &TerminalModel,
+    highlighter: Option<&LogHighlighter>,
+    render: &LogRender,
+    screen_lines: usize,
+) -> Vec<Vec<RowRun>> {
+    let mut rows: Vec<Vec<RowRun>> = (0..screen_lines).map(|_| Vec::new()).collect();
+    let Some(anchors) = render.filter else {
+        return rows;
+    };
+    // Visible window: the last screen_lines anchors, shifted up by the
+    // filter scroll offset, anchored to the bottom of the canvas.
+    let end = anchors.len().saturating_sub(render.filter_offset);
+    let start = end.saturating_sub(screen_lines);
+    let visible = &anchors[start..end];
+    let first_row = screen_lines - visible.len();
+    let match_bg = Hsla {
+        a: 0.30,
+        ..theme::accent()
+    };
+    for (ix, anchor) in visible.iter().enumerate() {
+        let line0 = (*anchor - render.fed) as i32;
+        let Some((text, cols)) = terminal.row_text(line0) else {
+            continue;
+        };
+        let high_segments: Vec<(usize, usize, Hsla, bool)> = highlighter
+            .map(|highlighter| highlighter.highlight_line(&text))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(range, fg, bold)| {
+                (
+                    text[..range.start].chars().count(),
+                    text[..range.end].chars().count(),
+                    fg,
+                    bold,
+                )
+            })
+            .collect();
+        let match_segments: Vec<(usize, usize)> = render
+            .overlay
+            .and_then(|overlay| overlay.matches.get(&line0))
+            .cloned()
+            .unwrap_or_default();
+        let mut runs: Vec<RowRun> = Vec::new();
+        for (char_ix, ch) in text.chars().enumerate() {
+            let col = cols[char_ix];
+            let span = cols.get(char_ix + 1).copied().unwrap_or(col + 1) - col;
+            let mut fg = theme::term_fg();
+            let mut bg = theme::term_bg();
+            let mut bold = false;
+            for (start, end, seg_fg, seg_bold) in &high_segments {
+                if char_ix >= *start && char_ix < *end {
+                    fg = *seg_fg;
+                    bold = *seg_bold;
+                    break;
+                }
+            }
+            if match_segments
+                .iter()
+                .any(|(start, end)| char_ix >= *start && char_ix < *end)
+            {
+                bg = match_bg;
+            }
+            filtered_push_run(&mut runs, col, span, ch, fg, bg, bold);
+        }
+        rows[first_row + ix] = runs;
+    }
+    rows
+}
+
+/// Push one cell's worth of text into a filter-mode run list, merging with
+/// the previous run when style and geometry allow.
+fn filtered_push_run(
+    runs: &mut Vec<RowRun>,
+    col: usize,
+    span: usize,
+    ch: char,
+    fg: Hsla,
+    bg: Hsla,
+    bold: bool,
+) {
+    let mergeable = runs.last().is_some_and(|last| {
+        last.bold == bold
+            && colors_equal(last.fg, fg)
+            && colors_equal(last.bg, bg)
+            && last.underline.is_none()
+            && last.start_col + last.span_cols == col
+    });
+    if mergeable {
+        let last = runs.last_mut().unwrap();
+        last.span_cols += span;
+        last.text.push(ch);
+    } else {
+        runs.push(RowRun {
+            start_col: col,
+            span_cols: span,
+            text: ch.to_string(),
+            fg,
+            bg,
+            bold,
+            italic: false,
+            underline: None,
+            strikethrough: false,
+        });
+    }
+}
+
 fn colors_equal(a: Hsla, b: Hsla) -> bool {
     a == b
 }
@@ -2561,6 +3285,18 @@ impl RootView {
         let canvas_focus = focus_handle.clone();
         let highlighter = tab.highlighter.clone();
         let terminal_font_size = self.terminal_font_size;
+        // Log tabs: per-frame overlay + optional filter row set. Built here
+        // (UI thread, cheap) and shared with the canvas prepaint.
+        let log_render = tab.log_view.as_ref().map(|view| {
+            let fed = tab.terminal.lines_fed() as i64;
+            let overlay = LogOverlay::build(view, fed);
+            let filter = if view.filtering() {
+                Some(Arc::new(view.filtered.clone()))
+            } else {
+                None
+            };
+            (Arc::new(overlay), filter, view.filter_offset, fed)
+        });
 
         div()
             .flex_1()
@@ -2588,22 +3324,68 @@ impl RootView {
                 let pixel_delta = event.delta.pixel_delta(px(line_height));
                 let lines = (f32::from(pixel_delta.y) / line_height).round() as i32;
                 if lines != 0 {
-                    if let Some(tab) = this.active_tab() {
+                    if let Some(tab) = this.active_tab_mut() {
+                        if let Some(view) = tab.log_view.as_mut() {
+                            if view.filtering() {
+                                // Filter mode scrolls its own row window;
+                                // bottom-anchored, so a bigger offset shows
+                                // older matching rows.
+                                let len = view.filtered.len() as i32;
+                                let max = len - 1;
+                                let next =
+                                    (view.filter_offset as i32 + lines).clamp(0, max.max(0));
+                                view.filter_offset = next as usize;
+                                view.follow = view.filter_offset == 0;
+                                tab.terminal.mark_dirty();
+                                cx.notify();
+                                return;
+                            }
+                        }
                         tab.terminal.term.lock().scroll_display(Scroll::Delta(lines));
+                        // Scrolling to the very bottom resumes following;
+                        // anything else pauses at the current position.
+                        if let Some(view) = tab.log_view.as_mut() {
+                            let at_bottom = tab
+                                .terminal
+                                .term
+                                .lock()
+                                .renderable_content()
+                                .display_offset
+                                == 0;
+                            view.follow = at_bottom;
+                        }
                         tab.terminal.mark_dirty();
                         cx.notify();
                     }
                 }
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                if let Some(tab) = this.active_tab() {
+                if let Some(tab) = this.active_tab_mut() {
                     window.focus(&tab.focus_handle, cx);
-                    // Begin a selection (a plain click clears the old one and
-                    // selects nothing — `selection_end` drops empty ranges).
-                    if let Some(geometry) = tab.geometry.lock().as_ref().copied() {
-                        let (line, col, side) =
-                            terminal_grid_point(&tab.terminal, geometry, event.position);
-                        tab.terminal.selection_start(line, col, side);
+                    let filtering = tab
+                        .log_view
+                        .as_ref()
+                        .is_some_and(|view| view.filtering());
+                    if let Some(view) = tab.log_view.as_mut() {
+                        // Filter mode shows a synthetic row set; grid-based
+                        // selection and caret don't apply there.
+                        if !filtering {
+                            if let Some(geometry) = tab.geometry.lock().as_ref().copied() {
+                                let (line, _col, _side) =
+                                    terminal_grid_point(&tab.terminal, geometry, event.position);
+                                let fed = tab.terminal.lines_fed() as i64;
+                                view.caret = Some(line as i64 + fed);
+                            }
+                        }
+                    }
+                    if !filtering {
+                        // Begin a selection (a plain click clears the old one and
+                        // selects nothing — `selection_end` drops empty ranges).
+                        if let Some(geometry) = tab.geometry.lock().as_ref().copied() {
+                            let (line, col, side) =
+                                terminal_grid_point(&tab.terminal, geometry, event.position);
+                            tab.terminal.selection_start(line, col, side);
+                        }
                     }
                 }
                 cx.notify();
@@ -2631,7 +3413,9 @@ impl RootView {
             .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::hover()))
             .child(
                 canvas(
-                    move |bounds, window, _cx| {
+                    {
+                        let log_render = log_render.clone();
+                        move |bounds, window, _cx| {
                         let focused = canvas_focus.is_focused(window);
                         // Window-level mouse move (Zed's terminal does the
                         // same): with the button held and this terminal
@@ -2659,15 +3443,25 @@ impl RootView {
                                 terminal.selection_update(line, col, side);
                             }
                         });
+                        let log = log_render.as_ref().map(|(overlay, filter, offset, fed)| {
+                            LogRender {
+                                overlay: Some(overlay.as_ref()),
+                                filter: filter.as_ref().map(|rows| rows.as_slice()),
+                                filter_offset: *offset,
+                                fed: *fed,
+                            }
+                        });
                         terminal_prepaint(
                             bounds,
                             window,
                             &terminal,
                             &geometry,
                             highlighter.as_deref(),
+                            log.as_ref(),
                             focused,
                             terminal_font_size,
                         )
+                        }
                     },
                     move |_bounds, prepaint, window, cx| {
                         for quad in prepaint.backgrounds {
@@ -2757,6 +3551,7 @@ fn terminal_prepaint(
     terminal: &TerminalModel,
     geometry: &Arc<Mutex<Option<TermGeometry>>>,
     highlighter: Option<&LogHighlighter>,
+    log: Option<&LogRender>,
     focused: bool,
     font_size: f32,
 ) -> TerminalPrepaint {
@@ -2786,13 +3581,65 @@ fn terminal_prepaint(
         line_height,
     });
 
-    let (rows, cursor, selection) = collect_runs(terminal, highlighter);
+    // Filter mode replaces the data source; grid mode paints the terminal
+    // with log overlays (search matches etc.).
+    let (rows, cursor, selection, display_offset) = match log {
+        Some(log) if log.filter.is_some() => {
+            let screen = terminal.screen_lines();
+            let rows = collect_filtered_runs(terminal, highlighter, log, screen);
+            (rows, None, Vec::new(), 0i32)
+        }
+        _ => {
+            let term = terminal.term.lock();
+            let display_offset = term.renderable_content().display_offset as i32;
+            drop(term);
+            let (rows, cursor, selection) =
+                collect_runs(terminal, highlighter, log.and_then(|l| l.overlay));
+            (rows, cursor, selection, display_offset)
+        }
+    };
     // Same conversion path as `cell_colors`' default background, so plain
     // cells compare equal and skip their background fill.
     let default_bg = theme::term_bg();
 
     let mut lines = Vec::new();
     let mut backgrounds = Vec::new();
+
+    // Log markers: a gutter bar on bookmarked rows, a full-width tint on the
+    // current line (grid mode only — filter rows already stand out).
+    if let Some(log) = log {
+        if let Some(overlay) = log.overlay {
+            let screen = terminal.screen_lines();
+            let bookmark_color = theme::warning();
+            for &line0 in &overlay.bookmarks {
+                let row = line0 + display_offset;
+                if row < 0 || row as usize >= screen {
+                    continue;
+                }
+                let y = bounds.top() + line_height * row as f32;
+                backgrounds.push(fill(
+                    Bounds::new(point(bounds.left(), y), size(px(3.), line_height)),
+                    bookmark_color,
+                ));
+            }
+            if let Some(caret) = overlay.caret {
+                let row = caret + display_offset;
+                if row >= 0 && (row as usize) < screen {
+                    let y = bounds.top() + line_height * row as f32;
+                    backgrounds.push(fill(
+                        Bounds::new(
+                            point(bounds.left(), y),
+                            size(bounds.size.width, line_height),
+                        ),
+                        Hsla {
+                            a: 0.12,
+                            ..theme::selection()
+                        },
+                    ));
+                }
+            }
+        }
+    }
 
     for (row_index, runs) in rows.iter().enumerate() {
         let y = bounds.top() + line_height * row_index as f32;
@@ -3155,6 +4002,211 @@ impl RootView {
                     })),
             )
             .into_any_element()
+    }
+
+    /// Small icon-only button for the log toolbar.
+fn log_toolbar_button(
+    id: &'static str,
+    icon: &'static str,
+    tooltip_text: &'static str,
+    cx: &mut Context<RootView>,
+    on_click: impl Fn(&mut RootView, &mut Context<RootView>) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(24.))
+        .h(px(22.))
+        .rounded_sm()
+        .cursor_pointer()
+        .tooltip(tip(tooltip_text))
+        .child(svg().path(icon).w(px(13.)).h(px(13.)).text_color(theme::text()))
+        .on_click(cx.listener(move |this, _, _window, cx| on_click(this, cx)))
+        .into_any_element()
+}
+
+/// SnakeTail-style toolbar for the active log tab: follow/pause, search
+    /// with match navigation, a filter, and bookmarks. Empty for other tabs.
+    fn render_log_toolbar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return div().into_any_element();
+        };
+        if !tab.is_log() {
+            return div().into_any_element();
+        }
+        let Some(view) = tab.log_view.as_mut() else {
+            return div().into_any_element();
+        };
+        view.ensure_fields(cx);
+        let search_field = view.search_field.clone().expect("created above");
+        let filter_field = view.filter_field.clone().expect("created above");
+        let (follow, match_count, current_match, filter_count, filtering, ended) = (
+            view.follow,
+            view.matches.len(),
+            view.current_match,
+            view.filtered.len(),
+            view.filtering(),
+            matches!(&tab.kind, TabKind::Log { ended: true, .. }),
+        );
+
+        let tool_input = |field: &Entity<TextField>| -> gpui::AnyElement {
+            div()
+                .w(px(180.))
+                .px_2()
+                .py(px(1.))
+                .rounded_sm()
+                .bg(theme::bg())
+                .border_1()
+                .border_color(theme::border())
+                .child(field.clone())
+                .into_any_element()
+        };
+        let divider = || {
+            div()
+                .w(px(1.))
+                .h(px(16.))
+                .mx_1()
+                .bg(theme::border())
+                .into_any_element()
+        };
+
+        let mut bar = div()
+            .h(px(30.))
+            .w_full()
+            .px_2()
+            .gap_1()
+            .bg(theme::panel())
+            .border_b_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_row()
+            .items_center()
+            // Follow / pause.
+            .child(Self::log_toolbar_button(
+                "log-follow",
+                if follow {
+                    assets::ICON_PLAY_FILLED
+                } else {
+                    assets::ICON_DEBUG_PAUSE
+                },
+                if follow {
+                    "Following — click to pause"
+                } else {
+                    "Paused — click to follow the live edge"
+                },
+                cx,
+                |this, cx| this.log_toggle_follow(cx),
+            ))
+            .child(divider())
+            // Search.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path(assets::ICON_SEARCH)
+                            .w(px(13.))
+                            .h(px(13.))
+                            .text_color(theme::text_dim()),
+                    )
+                    .child(tool_input(&search_field)),
+            )
+            .child(
+                div()
+                    .min_w(px(48.))
+                    .text_xs()
+                    .text_color(theme::text_dim())
+                    .child(if match_count > 0 {
+                        format!(
+                            "{}/{}",
+                            current_match.map(|ix| ix + 1).unwrap_or(0),
+                            match_count
+                        )
+                    } else {
+                        String::new()
+                    }),
+            )
+            .child(Self::log_toolbar_button(
+                "log-prev-match",
+                assets::ICON_ARROW_UP,
+                "Previous match (⇧⌘G)",
+                cx,
+                |this, cx| this.log_search_navigate(false, cx),
+            ))
+            .child(Self::log_toolbar_button(
+                "log-next-match",
+                assets::ICON_ARROW_DOWN,
+                "Next match (⌘G)",
+                cx,
+                |this, cx| this.log_search_navigate(true, cx),
+            ))
+            .child(divider())
+            // Filter.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path(assets::ICON_FILTER)
+                            .w(px(13.))
+                            .h(px(13.))
+                            .text_color(if filtering {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            }),
+                    )
+                    .child(tool_input(&filter_field)),
+            )
+            .child(
+                div()
+                    .min_w(px(40.))
+                    .text_xs()
+                    .text_color(theme::text_dim())
+                    .child(if filtering { format!("{filter_count}") } else { String::new() }),
+            )
+            .child(divider())
+            // Bookmarks.
+            .child(Self::log_toolbar_button(
+                "log-bookmark",
+                assets::ICON_BOOKMARK,
+                "Toggle bookmark on the current line (⌘B)",
+                cx,
+                |this, cx| this.log_toggle_bookmark(cx),
+            ))
+            .child(Self::log_toolbar_button(
+                "log-prev-bookmark",
+                assets::ICON_ARROW_UP,
+                "Previous bookmark (⌘[)",
+                cx,
+                |this, cx| this.log_bookmark_navigate(false, cx),
+            ))
+            .child(Self::log_toolbar_button(
+                "log-next-bookmark",
+                assets::ICON_ARROW_DOWN,
+                "Next bookmark (⌘])",
+                cx,
+                |this, cx| this.log_bookmark_navigate(true, cx),
+            ));
+        if ended {
+            bar = bar.child(
+                div()
+                    .ml_auto()
+                    .px_2()
+                    .text_xs()
+                    .text_color(theme::text_dim())
+                    .child("tail ended"),
+            );
+        }
+        bar.into_any_element()
     }
 
     /// Row of tabs between header and content.
@@ -4176,9 +5228,19 @@ fn render_tree_rows(
                 .when(is_selected, |row| row.bg(theme::selection()))
                 .when(!is_selected, |row| row.hover(|row| row.bg(theme::hover())))
                 .when(highlighted, |row| row.bg(theme::drop_target()))
-                .on_click(cx.listener(move |this, _, window, cx| {
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.focus_file_tree(window, cx);
-                    this.toggle_tree_node(path.clone(), cx);
+                    // Double-click a file to open it in a log-follow tab
+                    // (SnakeTail-style); single click just selects/expands.
+                    let double = matches!(
+                        event,
+                        gpui::ClickEvent::Mouse(click) if click.down.click_count >= 2
+                    );
+                    if !is_dir && double {
+                        this.open_log_tab(path.clone(), cx);
+                    } else {
+                        this.toggle_tree_node(path.clone(), cx);
+                    }
                 }))
                 // Start dragging this entry; a small label follows the cursor
                 // (Zed's project-panel drag image). Files also start a
@@ -4553,7 +5615,15 @@ impl Render for RootView {
                     .min_h(px(0.))
                     .child(self.render_sidebar(cx))
                     .child(self.render_split_handle(cx))
-                    .child(self.render_terminal(cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(self.render_log_toolbar(cx))
+                            .child(self.render_terminal(cx).into_any_element()),
+                    ),
             )
             .child(self.render_statusbar(cx));
 

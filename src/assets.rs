@@ -33,6 +33,13 @@ const DISCONNECTED: &str = include_str!("../zed_icons/disconnected.svg");
 const FOLDER: &str = include_str!("../zed_icons/folder.svg");
 const FOLDER_OPEN: &str = include_str!("../zed_icons/folder_open.svg");
 const ARROW_RIGHT: &str = include_str!("../zed_icons/arrow_right.svg");
+const ARROW_UP: &str = include_str!("../zed_icons/arrow_up.svg");
+const ARROW_DOWN: &str = include_str!("../zed_icons/arrow_down.svg");
+const DEBUG_PAUSE: &str = include_str!("../zed_icons/debug_pause.svg");
+const PLAY_FILLED: &str = include_str!("../zed_icons/play_filled.svg");
+const BOOKMARK: &str = include_str!("../zed_icons/bookmark.svg");
+const TOOL_SEARCH: &str = include_str!("../zed_icons/tool_search.svg");
+const FILTER_FUNNEL: &str = include_str!("../zed_icons/filter_funnel.svg");
 
 /// App icon, shown next to the brand name in the header.
 pub const ICON_MAIN_EXECUTABLE: &str = "aetherium/icons/main_executable.svg";
@@ -70,6 +77,20 @@ pub const ICON_FOLDER: &str = "aetherium/icons/folder.svg";
 pub const ICON_FOLDER_OPEN: &str = "aetherium/icons/folder_open.svg";
 /// Connect button: log into the selected profile.
 pub const ICON_ARROW_RIGHT: &str = "aetherium/icons/arrow_right.svg";
+/// Log toolbar: previous match / bookmark.
+pub const ICON_ARROW_UP: &str = "aetherium/icons/arrow_up.svg";
+/// Log toolbar: next match / bookmark.
+pub const ICON_ARROW_DOWN: &str = "aetherium/icons/arrow_down.svg";
+/// Log toolbar: follow is paused (click to resume).
+pub const ICON_DEBUG_PAUSE: &str = "aetherium/icons/debug_pause.svg";
+/// Log toolbar: following the live edge.
+pub const ICON_PLAY_FILLED: &str = "aetherium/icons/play_filled.svg";
+/// Log toolbar: bookmark toggle/navigation.
+pub const ICON_BOOKMARK: &str = "aetherium/icons/bookmark.svg";
+/// Log toolbar: search input.
+pub const ICON_SEARCH: &str = "aetherium/icons/tool_search.svg";
+/// Log toolbar: filter input.
+pub const ICON_FILTER: &str = "aetherium/icons/filter_funnel.svg";
 
 const BUILD_TOOL_PATH: &str = "aetherium/icons/build_tool.svg";
 const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
@@ -162,6 +183,13 @@ impl AssetSource for EmbeddedAssets {
             ICON_FOLDER => Some(FOLDER.as_bytes()),
             ICON_FOLDER_OPEN => Some(FOLDER_OPEN.as_bytes()),
             ICON_ARROW_RIGHT => Some(ARROW_RIGHT.as_bytes()),
+            ICON_ARROW_UP => Some(ARROW_UP.as_bytes()),
+            ICON_ARROW_DOWN => Some(ARROW_DOWN.as_bytes()),
+            ICON_DEBUG_PAUSE => Some(DEBUG_PAUSE.as_bytes()),
+            ICON_PLAY_FILLED => Some(PLAY_FILLED.as_bytes()),
+            ICON_BOOKMARK => Some(BOOKMARK.as_bytes()),
+            ICON_SEARCH => Some(TOOL_SEARCH.as_bytes()),
+            ICON_FILTER => Some(FILTER_FUNNEL.as_bytes()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
