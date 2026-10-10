@@ -6718,26 +6718,23 @@ fn render_tree_rows(
                                         // the staged path, and tell the
                                         // internal drop/hover handlers to
                                         // stand down while it owns the mouse.
-                                        use raw_window_handle::{
-                                            HasWindowHandle as _, RawWindowHandle,
-                                        };
-                                        let hwnd = match window
-                                            .window_handle()
-                                            .map(|handle| handle.as_raw())
-                                        {
-                                            Ok(RawWindowHandle::Win32(handle)) => {
-                                                handle.hwnd.get() as isize
-                                            }
-                                            _ => 0,
-                                        };
+                                        // Deferred to just after this event
+                                        // dispatch: DoDragDrop blocks with a
+                                        // nested message loop, which is only
+                                        // safe once gpui's borrows are gone —
+                                        // and gpui's own mouse capture (this
+                                        // thread) is the context DoDragDrop
+                                        // requires.
                                         let cache = cache_for_download.clone();
-                                        let weak_root = weak_root.clone();
-                                        crate::windows_drag::begin_file_drag(
-                                            hwnd,
-                                            std::sync::Arc::new(move || {
-                                                cache.lock().get(&key).cloned()
-                                            }),
-                                        );
+                                        let key = (session_id, remote_for_download.clone());
+                                        cx.spawn(|_| async move {
+                                            crate::windows_drag::begin_file_drag(
+                                                std::sync::Arc::new(move || {
+                                                    cache.lock().get(&key).cloned()
+                                                }),
+                                            );
+                                        })
+                                        .detach();
                                         let _ = weak_root.update(cx, |this, _cx| {
                                             this.ole_drag_active = true;
                                         });

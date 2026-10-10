@@ -16,10 +16,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_TYMED, E_NOTIMPL,
-    E_OUTOFMEMORY, LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK,
-    STG_E_MEDIUMFULL, WPARAM,
+    E_OUTOFMEMORY, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_MEDIUMFULL,
 };
-use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
     CoUninitialize, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
     IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
@@ -31,12 +29,6 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_LBUTTON};
 use windows::Win32::UI::Shell::DROPFILES;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    PostMessageW, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_LBUTTONUP,
-    WM_QUIT, WNDCLASSW, WS_POPUP,
-};
 use windows::core::{HRESULT, Interface, Ref, implement};
 
 /// Not defined by the `windows` crate (data format not supported).
@@ -286,159 +278,38 @@ impl IDropSource_Impl for FileDrag_Impl {
     }
 }
 
-/// Kick-off message posted to the drag window: the LPARAM points at the
-/// heap-allocated [`DragStartContext`].
-const WM_START_DRAG: u32 = WM_APP;
-
-/// What the wndproc needs to run the drag: the COM pair and the app window
-/// handle for the synthetic button-up afterwards.
-struct DragStartContext {
-    data: IDataObject,
-    source: IDropSource,
-    app_hwnd: isize,
-}
-
-/// The drag must run INSIDE normal message dispatch. A bare thread that
-/// calls `DoDragDrop` at its top level starves the drag loop: the drop
-/// never reaches a target and neither drop nor cancel ever comes back
-/// (observed on Windows 11). Inside a wndproc reached through
-/// GetMessage/DispatchMessage, the modal drag loop behaves — the same
-/// shape as running it on a toolkit's main thread (GTK/Qt recipes).
-unsafe extern "system" fn drag_wndproc(
-    hwnd: windows::Win32::Foundation::HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    let _ = wparam;
-    if msg == WM_START_DRAG {
-        let ctx = unsafe { &*(lparam.0 as *const DragStartContext) };
-        let mut effect = DROPEFFECT(0);
-        let result =
-            unsafe { DoDragDrop(&ctx.data, &ctx.source, DROPEFFECT_COPY, &mut effect) };
-        log::info!(
-            "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
-            effect
-        );
-        release_ghost_drag(ctx.app_hwnd);
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_QUIT, WPARAM(0), LPARAM(0));
-        }
-        return LRESULT(0);
-    }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-}
-
-/// Run an OLE file drag for the given staged path, on a helper thread with
-/// its own capture window and message loop. `DoDragDrop` requires the mouse
-/// capture to belong to the calling thread (otherwise DRAGDROP_E_INVALIDHWND),
-/// but running it on the UI thread pumps messages through gpui's event
-/// dispatch while its interior state is borrowed and panics with
-/// "RefCell already borrowed". A hidden 0×0 popup owned by THIS thread is
-/// captured here to satisfy the thread check: a message-only window turned
-/// out NOT to hold real capture. The drag itself runs inside the thread's
-/// GetMessage/DispatchMessage loop (see [`drag_wndproc`]) — a top-level
-/// DoDragDrop on an undispatched thread starves. Afterwards a synthetic
-/// button-up releases gpui's internal drag state.
+/// Run an OLE file drag for the given staged path.
+///
+/// CALL ON THE UI THREAD, from a *deferred* gpui task — never from inside
+/// an event handler. `DoDragDrop` pumps a nested message loop; if that
+/// re-enters gpui's dispatch while a handler's borrows are live it panics
+/// ("RefCell already borrowed"). Spawned the task way runs after the
+/// current dispatch has finished, which is exactly how the `drag` crate
+/// drives this on toolkit main threads. Capture is gpui's own from the
+/// mouse-down — owned by the calling thread, as DoDragDrop requires (the
+/// helper-thread variants with message-only or hidden capture windows
+/// never satisfied it: the drag starved before reaching any target).
 // [impl->req~windows-drag-out~1]
-pub fn begin_file_drag(
-    hwnd: isize,
-    wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
-) {
-    std::thread::spawn(move || {
-        log::info!("drag-out: OLE drag thread started (app hwnd {hwnd:#x})");
-        unsafe {
-            let class = windows::core::w!("aetherium-ole-drag");
-            // Registering the same class name twice is fine; the second
-            // registration fails with ERROR_CLASS_ALREADY_EXISTS and the
-            // existing one (same wndproc) is used. A null instance means
-            // the current process for both registration and creation.
-            let _atom = RegisterClassW(&WNDCLASSW {
-                lpfnWndProc: Some(drag_wndproc),
-                lpszClassName: class,
-                ..Default::default()
-            });
-            // Hidden zero-size popup on THIS thread, for SetCapture. It
-            // must be a real (invisible) top-level window: message-only
-            // windows do not take genuine mouse capture.
-            let local = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                class,
-                windows::core::w!("aetherium-drag"),
-                WS_POPUP,
-                -100,
-                -100,
-                0,
-                0,
-                None,
-                None,
-                None,
-                None,
-            );
-            let Ok(local) = local else {
-                log::error!("drag-out: could not create the capture window");
-                return;
-            };
-            let _capture = SetCapture(local);
-            if let Err(err) = OleInitialize(None) {
-                log::error!("drag-out: OleInitialize failed: {err}");
-                let _ = ReleaseCapture();
-                let _ = DestroyWindow(local);
-                return;
-            }
-            let drag = FileDrag { wait_path };
-            // Both interfaces live on the one COM object.
-            let data: IDataObject = drag.into();
-            let Ok(source) = data.cast::<IDropSource>() else {
-                log::error!("drag-out: could not get IDropSource from the data object");
-                CoUninitialize();
-                let _ = ReleaseCapture();
-                let _ = DestroyWindow(local);
-                return;
-            };
-            let ctx = Box::into_raw(Box::new(DragStartContext {
-                data,
-                source,
-                app_hwnd: hwnd,
-            }));
-            // Start the drag from inside the message loop.
-            let _ = PostMessageW(
-                Some(local),
-                WM_START_DRAG,
-                WPARAM(0),
-                LPARAM(ctx as isize),
-            );
-            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-            // No hwnd filter: WM_QUIT is a thread message and would be
-            // invisible to a filtered GetMessage.
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            drop(Box::from_raw(ctx));
-            CoUninitialize();
-            let _ = ReleaseCapture();
-            let _ = DestroyWindow(local);
-        }
-    });
-}
-
-/// The OLE drag loop eats the real left-button-up, leaving gpui's internal
-/// drag (and its frozen drag image) stuck. Post a synthetic one at the
-/// current cursor position so gpui's state resets.
-fn release_ghost_drag(hwnd: isize) {
-    if hwnd == 0 {
+pub fn begin_file_drag(wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>) {
+    if let Err(err) = unsafe { OleInitialize(None) } {
+        log::error!("drag-out: OleInitialize failed: {err}");
         return;
     }
-    unsafe {
-        let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut _);
-        let mut point = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut point).is_err() {
-            return;
-        }
-        let mut client = point;
-        let _ = ScreenToClient(hwnd, &mut client);
-        let lparam = (((client.y as u16 as u32) << 16) | (client.x as u16 as u32)) as isize;
-        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(lparam));
-    }
+    let drag = FileDrag { wait_path };
+    // Both interfaces live on the one COM object.
+    let data: IDataObject = drag.into();
+    let Ok(source) = data.cast::<IDropSource>() else {
+        log::error!("drag-out: could not get IDropSource from the data object");
+        unsafe { CoUninitialize() };
+        return;
+    };
+    let mut effect = DROPEFFECT(0);
+    let result = unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect) };
+    log::info!(
+        "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
+        effect
+    );
+    // Balances the OleInitialize above; gpui's own initialization keeps
+    // its own reference count.
+    unsafe { CoUninitialize() };
 }
