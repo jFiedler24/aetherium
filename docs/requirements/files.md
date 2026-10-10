@@ -66,3 +66,23 @@ the changes back to the device.
 **Covers:** creq~edit-remote-files-with-local-editor~1
 
 **Needs:** impl
+
+## feat~folder-zip-download~1
+
+Right-clicking a remote directory shall offer "Download as ZIP": the
+whole folder structure streams into a single zip archive in ~/Downloads,
+preserving hierarchy and empty directories.
+
+**Covers:** creq~folder-download-as-zip~1
+
+**Needs:** req, impl
+
+## req~folder-zip-progress~1
+
+The ZIP download shall walk the tree first so the transfer progress bar
+shows byte totals, stream files without holding them in memory, honor
+the transfer cancel, and remove the partial archive on failure.
+
+**Covers:** feat~folder-zip-download~1
+
+**Needs:** impl, utest

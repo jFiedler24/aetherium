@@ -34,6 +34,12 @@ same snappy text layout, same dark aesthetic.
   are touched — anything the program SGR-colored renders exactly as intended.
   Toggle from the header highlighter button; rules live in
   `~/.config/aetherium/shell_highlight.toml`.
+- **Folder ZIP download** — right-click a remote folder → "Download as ZIP"
+  streams the whole structure (hierarchy and empty dirs preserved) into a
+  single archive in `~/Downloads`, with the usual transfer progress bar
+  (byte totals, speed, ETA, cancel).
+- **Help overlay** — the header's ? button lists every shortcut (terminal,
+  file tree, log tabs) and what the header buttons do. Esc closes it.
 - **Log follower** — right-click any remote file in the tree → **tail -f** opens a
   read-only tab that follows the file over a dedicated SSH exec channel (closing the
   tab kills the remote tail). Log tabs get regex-based highlighting: ERROR/FATAL red,

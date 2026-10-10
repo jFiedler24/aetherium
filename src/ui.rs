@@ -21,6 +21,7 @@ use gpui::{
 use parking_lot::Mutex;
 
 use crate::assets;
+use crate::collect::{self, CollectSource, COLLECT_JOB_TIMEOUT_SECS, COLLECT_MAX_BYTES, COLLECT_STEP_TIMEOUT_SECS};
 use crate::history::HistoryStore;
 use crate::log_highlight::LogHighlighter;
 use crate::profiles::{AuthMethod, Profile, ProfileStore};
@@ -540,6 +541,23 @@ enum ApiWait {
         reply: ApiResponder,
         deadline: std::time::Instant,
     },
+    /// One step of a `/logs/collect` job; the job itself holds the reply.
+    CollectStep {
+        deadline: std::time::Instant,
+    },
+}
+
+/// A `POST /logs/collect` job in progress: sources run one at a time over
+/// the target's session (each step reuses the ApiExec machinery, so only
+/// one extra exec channel is open at a time), and the per-source outcomes
+/// accumulate into the final reply.
+struct CollectJob {
+    target: String,
+    pending: std::collections::VecDeque<CollectSource>,
+    current: Option<CollectSource>,
+    outcomes: Vec<serde_json::Value>,
+    reply: ApiResponder,
+    deadline: std::time::Instant,
 }
 
 impl ApiWait {
@@ -548,7 +566,8 @@ impl ApiWait {
             ApiWait::Exec { deadline, .. }
             | ApiWait::List { deadline, .. }
             | ApiWait::Upload { deadline, .. }
-            | ApiWait::Download { deadline, .. } => *deadline,
+            | ApiWait::Download { deadline, .. }
+            | ApiWait::CollectStep { deadline } => *deadline,
         }
     }
 
@@ -557,9 +576,12 @@ impl ApiWait {
             ApiWait::Exec { reply, .. }
             | ApiWait::List { reply, .. }
             | ApiWait::Upload { reply, .. }
-            | ApiWait::Download { reply, .. } => reply,
+            | ApiWait::Download { reply, .. } => Some(reply),
+            ApiWait::CollectStep { .. } => None,
         };
-        let _ = reply.send(serde_json::json!({"ok": false, "error": message}));
+        if let Some(reply) = reply {
+            let _ = reply.send(serde_json::json!({"ok": false, "error": message}));
+        }
     }
 }
 
@@ -646,7 +668,9 @@ pub struct RootView {
     active: usize,
     next_tab_id: u64,
     /// Right-click menu in the file tree: click position + file path.
-    context_menu: Option<(Point<Pixels>, PathBuf)>,
+    /// Right-click context menu: position, path, and whether the path is a
+    /// directory (directory menus offer the ZIP download).
+    context_menu: Option<(Point<Pixels>, PathBuf, bool)>,
     /// Delete confirmation dialog: the path awaiting a final "Delete" click.
     /// Deleting is permanent over SFTP (no trash), so both the Delete key
     /// and the context menu ask first.
@@ -667,6 +691,8 @@ pub struct RootView {
     api_rx: std::sync::mpsc::Receiver<ApiRequest>,
     /// REST API calls awaiting their backend replies.
     api_pending: std::collections::HashMap<u64, ApiWait>,
+    /// A `/logs/collect` job in progress, if any (one at a time).
+    api_collect: Option<CollectJob>,
     next_api_req: u64,
     /// A `/logs` request waiting for its session to connect.
     api_pending_log: Option<PendingApiLog>,
@@ -715,6 +741,8 @@ pub struct RootView {
     shell_highlighter: Arc<LogHighlighter>,
     /// Whether shell syntax coloring is applied; header toggle, persisted.
     shell_coloring: bool,
+    /// The shortcuts & features overlay (header help button / Escape).
+    help_open: bool,
     /// Commands submitted in any session, persisted across launches and
     /// recallable with Shift+↑ / Shift+↓ (roadmap 3.4).
     history: HistoryStore,
@@ -802,6 +830,7 @@ impl RootView {
             ole_drag_active: false,
             api_rx,
             api_pending: std::collections::HashMap::new(),
+            api_collect: None,
             next_api_req: 1,
             api_pending_log: None,
             remote_edits: Vec::new(),
@@ -820,6 +849,7 @@ impl RootView {
             terminal_font_size: ui_settings.terminal_font_size,
             shell_highlighter: Arc::new(LogHighlighter::load_shell()),
             shell_coloring: ui_settings.shell_coloring,
+            help_open: false,
             history: HistoryStore::load(),
             focus_handle: cx.focus_handle(),
         };
@@ -1308,24 +1338,30 @@ impl RootView {
             }
             // REST API replies: route to the waiting HTTP request by id.
             SessionEvent::ApiExecDone { req_id, stdout, stderr, exit_status } => {
-                if let Some(ApiWait::Exec { reply, .. }) = self.api_pending.remove(&req_id) {
-                    let mut value = serde_json::json!({
-                        "ok": true,
-                        "stdout": String::from_utf8_lossy(&stdout),
-                        "stderr": String::from_utf8_lossy(&stderr),
-                        "exit_status": exit_status,
-                    });
-                    if std::str::from_utf8(&stdout).is_err() {
-                        use base64::Engine as _;
-                        value["stdout_base64"] =
-                            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&stdout));
+                match self.api_pending.remove(&req_id) {
+                    Some(ApiWait::Exec { reply, .. }) => {
+                        let mut value = serde_json::json!({
+                            "ok": true,
+                            "stdout": String::from_utf8_lossy(&stdout),
+                            "stderr": String::from_utf8_lossy(&stderr),
+                            "exit_status": exit_status,
+                        });
+                        if std::str::from_utf8(&stdout).is_err() {
+                            use base64::Engine as _;
+                            value["stdout_base64"] =
+                                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&stdout));
+                        }
+                        if std::str::from_utf8(&stderr).is_err() {
+                            use base64::Engine as _;
+                            value["stderr_base64"] =
+                                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&stderr));
+                        }
+                        let _ = reply.send(value);
                     }
-                    if std::str::from_utf8(&stderr).is_err() {
-                        use base64::Engine as _;
-                        value["stderr_base64"] =
-                            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&stderr));
+                    Some(ApiWait::CollectStep { .. }) => {
+                        self.collect_step_done(stdout, stderr, exit_status);
                     }
-                    let _ = reply.send(value);
+                    _ => {}
                 }
             }
             SessionEvent::ApiListDone { req_id, result } => {
@@ -1742,8 +1778,113 @@ impl RootView {
                         remote: path,
                     });
             }
+            ApiRequest::CollectLogs { target, reply } => {
+                // [impl->feat~rest-log-collection~1]
+                if self.api_collect.is_some() {
+                    Self::api_err(reply, "a log collection is already running");
+                    return;
+                }
+                if self.connected_tab_for(&target).is_none() {
+                    Self::api_err(reply, format!("no connected session for '{target}' — POST /sessions first"));
+                    return;
+                }
+                let mut pending: std::collections::VecDeque<CollectSource> =
+                    collect::sources().into();
+                let Some(current) = pending.pop_front() else {
+                    Self::api_err(reply, "no collect sources configured");
+                    return;
+                };
+                self.api_collect = Some(CollectJob {
+                    target,
+                    pending,
+                    current: Some(current),
+                    outcomes: Vec::new(),
+                    reply,
+                    deadline: std::time::Instant::now()
+                        + Duration::from_secs(COLLECT_JOB_TIMEOUT_SECS),
+                });
+                self.issue_collect_step();
+            }
         }
         cx.notify();
+    }
+
+    /// Send the current collect source's command to the target session.
+    fn issue_collect_step(&mut self) {
+        let Some(job) = self.api_collect.as_ref() else {
+            return;
+        };
+        let Some(source) = job.current.as_ref() else {
+            return;
+        };
+        let Some(index) = self.connected_tab_for(&job.target) else {
+            let job = self.api_collect.take().expect("checked above");
+            Self::api_err(
+                job.reply,
+                format!("session for '{}' disconnected during collection", job.target),
+            );
+            return;
+        };
+        let req_id = self.next_api_req;
+        self.next_api_req += 1;
+        self.api_pending.insert(
+            req_id,
+            ApiWait::CollectStep {
+                deadline: std::time::Instant::now()
+                    + Duration::from_secs(COLLECT_STEP_TIMEOUT_SECS),
+            },
+        );
+        self.tabs[index]
+            .session
+            .as_ref()
+            .expect("shell tab has a session")
+            .send(SessionCommand::ApiExec {
+                req_id,
+                command: source.command(),
+            });
+    }
+
+    /// Fold one finished source into the collect job and either queue the
+    /// next source or answer the waiting HTTP request.
+    // [impl->req~configurable-log-sources~1]
+    fn collect_step_done(
+        &mut self,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_status: Option<u32>,
+    ) {
+        let Some(mut job) = self.api_collect.take() else {
+            return;
+        };
+        let Some(source) = job.current.take() else {
+            self.api_collect = Some(job);
+            return;
+        };
+        let (content, truncated) = if stdout.len() > COLLECT_MAX_BYTES {
+            (stdout[..COLLECT_MAX_BYTES].to_vec(), true)
+        } else {
+            (stdout, false)
+        };
+        let note = String::from_utf8_lossy(&stderr).trim().to_string();
+        // A pipeline like `cat missing | head -c …` exits 0 while cat's
+        // complaint lands on stderr — so stderr counts as failure evidence.
+        let ok = exit_status.is_none_or(|code| code == 0) && note.is_empty();
+        job.outcomes.push(serde_json::json!({
+            "name": source.name(),
+            "kind": source.kind(),
+            "ok": ok,
+            "content": String::from_utf8_lossy(&content),
+            "bytes": content.len(),
+            "truncated": truncated,
+            "error": if ok { "" } else { &note[..note.len().min(512)] },
+        }));
+        if let Some(next) = job.pending.pop_front() {
+            job.current = Some(next);
+            self.api_collect = Some(job);
+            self.issue_collect_step();
+        } else {
+            Self::api_ok(job.reply, serde_json::json!({"ok": true, "sources": job.outcomes}));
+        }
     }
 
     /// Retry/expiry pass for REST API work, called from the event loop.
@@ -1756,8 +1897,22 @@ impl RootView {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            if let Some(wait) = self.api_pending.remove(&id) {
-                wait.fail("request timed out");
+            match self.api_pending.remove(&id) {
+                // A timed-out collect step fails the whole job; the remote
+                // command may keep running, but the reply must not hang.
+                Some(ApiWait::CollectStep { .. }) => {
+                    if let Some(job) = self.api_collect.take() {
+                        Self::api_err(job.reply, "collection step timed out");
+                    }
+                }
+                Some(wait) => wait.fail("request timed out"),
+                None => {}
+            }
+        }
+        if let Some(job) = &self.api_collect {
+            if now >= job.deadline {
+                let job = self.api_collect.take().expect("checked above");
+                Self::api_err(job.reply, "collection timed out");
             }
         }
         if let Some(pending) = &self.api_pending_log {
@@ -2143,6 +2298,37 @@ impl RootView {
         let cancel = Arc::new(AtomicBool::new(false));
         if let Some(session) = tab.session.as_ref() {
             session.download(tab.session_id, remote, cancel.clone());
+            if let Some(tab) = self.active_tab_mut() {
+                tab.transfer_cancel = Some(cancel);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Download the selected directory of the active tab into a single
+    /// .zip in ~/Downloads (recursive, with transfer progress).
+    // [impl->req~folder-zip-progress~1]
+    // [impl->feat~folder-zip-download~1]
+    fn download_zip_selected(&mut self, cx: &mut Context<Self>) {
+        let connected = self
+            .active_tab()
+            .is_some_and(|tab| tab.state == ConnState::Connected);
+        if !connected {
+            self.status = "not connected".into();
+            cx.notify();
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(remote) = tab.tree_selection.clone() else {
+            self.status = "select a folder in the tree to zip".into();
+            cx.notify();
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(session) = tab.session.as_ref() {
+            session.download_zip(tab.session_id, remote, cancel.clone());
             if let Some(tab) = self.active_tab_mut() {
                 tab.transfer_cancel = Some(cancel);
             }
@@ -4631,6 +4817,76 @@ fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui:
     move |_, cx| cx.new(|_| TextTip(text.clone())).into()
 }
 
+/// One group of rows in the help overlay.
+struct HelpSection {
+    title: &'static str,
+    rows: &'static [(&'static str, &'static str)],
+}
+
+/// The shortcut & feature reference shown by the header's help button.
+/// Keep in sync with the actual bindings in `on_terminal_key_down` and the
+/// file-tree/log-toolbar handlers.
+// [impl->req~help-shortcut-list~1]
+// [impl->feat~help-overlay~1]
+const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "Terminal",
+        rows: &[
+            ("Ctrl/⌘ + or -", "increase / decrease the terminal text size"),
+            ("Ctrl/⌘ 0", "reset the terminal text size"),
+            ("Ctrl/⌘ + scroll", "zoom the terminal text size"),
+            ("scroll", "scroll the scrollback"),
+            ("drag / double-click", "select text / select a word"),
+            (
+                "Ctrl/⌘ C with selection · Ctrl+Insert",
+                "copy the selection (Ctrl+Shift+C works too)",
+            ),
+            ("Ctrl/⌘ V · Shift+Insert", "paste (Ctrl+Shift+V works too)"),
+            ("Shift+↑ / Shift+↓", "recall cross-session command history"),
+        ],
+    },
+    HelpSection {
+        title: "File tree",
+        rows: &[
+            (
+                "double-click file",
+                "edit in a local editor; saving asks whether to sync back",
+            ),
+            (
+                "right-click",
+                "menu: tail -f, Download, Edit, VS Code, Rename, Delete — folders: Download as ZIP",
+            ),
+            ("drag & drop", "move remote entries; drop OS files to upload"),
+            (".. row", "navigate to the parent directory"),
+            ("Delete key", "delete the selected entry (asks first)"),
+        ],
+    },
+    HelpSection {
+        title: "Log follower tabs",
+        rows: &[
+            ("⌘/Ctrl F", "focus the search field"),
+            ("Enter / Shift+Enter", "next / previous search match"),
+            ("⌘/Ctrl G / Shift+G", "next / previous match (unfocused)"),
+            ("⌘/Ctrl B", "bookmark the current line"),
+            ("⌘/Ctrl [ / ]", "jump between bookmarks"),
+            ("↑ ↓ PgUp PgDn Home End", "scroll the log"),
+            ("select + copy keys", "log views are read-only but copyable"),
+        ],
+    },
+    HelpSection {
+        title: "General",
+        rows: &[
+            ("highlighter button", "toggle heuristic shell syntax coloring"),
+            ("eye button", "toggle local echo (typing lag on slow links)"),
+            ("theme dropdown", "switch between the bundled Zed themes"),
+            (
+                "REST API",
+                "http://127.0.0.1:48920 — bearer token in the config dir (api_token); GET / lists endpoints",
+            ),
+        ],
+    },
+];
+
 fn header_icon_button(
     id: &'static str,
     icon: &'static str,
@@ -4816,6 +5072,16 @@ impl RootView {
                         cx.notify();
                     })),
             )
+            .child(header_icon_button(
+                "help",
+                assets::ICON_CIRCLE_HELP,
+                "Shortcuts & features",
+                cx,
+                |this, _window, cx| {
+                    this.help_open = !this.help_open;
+                    cx.notify();
+                },
+            ))
             .child(
                 div()
                     .id("theme")
@@ -6451,21 +6717,24 @@ fn render_tree_rows(
                     );
                 }))
                 .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::drop_target()))
-                // Right-click a file for the context menu (e.g. tail -f).
-                .when(!node.entry.is_dir, |row| {
-                    let menu_path = node.entry.path.clone();
-                    row.on_mouse_down(
-                        MouseButton::Right,
+                // Right-click for the context menu: files get the full
+                // action set, directories the ZIP download.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    {
+                        let menu_path = node.entry.path.clone();
+                        let menu_is_dir = node.entry.is_dir;
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             this.focus_file_tree(window, cx);
                             if let Some(tab) = this.active_tab_mut() {
                                 tab.tree_selection = Some(menu_path.clone());
                             }
-                            this.context_menu = Some((event.position, menu_path.clone()));
+                            this.context_menu =
+                                Some((event.position, menu_path.clone(), menu_is_dir));
                             cx.notify();
-                        }),
-                    )
-                })
+                        })
+                    },
+                )
                 .child(
                     // Leading glyph: disclosure chevron for directories,
                     // a file icon for files (Zed project-panel layout).
@@ -6635,6 +6904,11 @@ impl Render for RootView {
             // and the file tree does not have focus (a handled FileTree key
             // binding never reaches this listener).
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if this.help_open && event.keystroke.key.as_str() == "escape" {
+                    this.help_open = false;
+                    cx.notify();
+                    return;
+                }
                 if this.theme_menu && event.keystroke.key.as_str() == "escape" {
                     this.theme_menu = false;
                     cx.notify();
@@ -6780,17 +7054,156 @@ impl Render for RootView {
 
         // Right-click context menu from the file tree, painted above
         // everything else: a transparent layer to dismiss, then the menu.
-        if let Some((position, path)) = self.context_menu.clone() {
-            // The tail -f closure captures `path` by move; the other items
-            // get their own clone.
-            let vscode_path = path.clone();
-            let edit_path = path.clone();
-            let file_name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let delete_path = path.clone();
-            let rename_path = path.clone();
+        // Directories offer the recursive ZIP download; files the full
+        // action set.
+        if let Some((position, path, is_dir)) = self.context_menu.clone() {
+            let mut menu = div()
+                .id("context-menu")
+                .absolute()
+                .left(position.x)
+                .top(position.y)
+                .min_w(px(160.))
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::border())
+                .rounded_md()
+                .p_1()
+                .flex()
+                .flex_col()
+                .shadow_md();
+            if is_dir {
+                menu = menu.child(
+                    div()
+                        .id("context-menu-zip")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme::text())
+                        .hover(|item| item.bg(theme::selection()))
+                        .child(format!(
+                            "Download {} as ZIP",
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string())
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.context_menu = None;
+                            this.download_zip_selected(cx);
+                        })),
+                );
+            } else {
+                // The tail -f closure captures `path` by move; the other
+                // items get their own clone.
+                let vscode_path = path.clone();
+                let edit_path = path.clone();
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let delete_path = path.clone();
+                let rename_path = path.clone();
+                menu = menu
+                    .child(
+                        div()
+                            .id("context-menu-tail")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child(format!(
+                                "tail -f {}",
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string())
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_log_tab(path.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-download")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child("Download")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.download_selected(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-edit")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child(format!("Edit {file_name}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_remote_edit(edit_path.clone(), EditorChoice::Default, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-vscode")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child("Open in VS Code")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_remote_edit(vscode_path.clone(), EditorChoice::VsCode, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-rename")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child("Rename")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.context_menu = None;
+                                this.start_rename(rename_path.clone(), window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-delete")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::danger())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child("Delete")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.ask_delete(delete_path.clone(), cx);
+                            })),
+                    );
+            }
             root = root
                 .child(
                     div()
@@ -6810,128 +7223,127 @@ impl Render for RootView {
                         })),
                 )
                 .child(
+                    // Swallow presses that start inside the menu so they
+                    // never reach the dismiss layer (same race as the theme
+                    // menu: the dismiss would close the menu between a
+                    // row's mouse-down and mouse-up).
+                    menu.on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    })),
+                );
+        }
+
+        // Help overlay: shortcuts & features, centered and scrollable.
+        // Escape or a click outside the panel closes it.
+        if self.help_open {
+            let mut panel = div()
+                .id("help-panel")
+                .w(px(540.))
+                .max_h(px(560.))
+                .overflow_y_scroll()
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::border())
+                .rounded_lg()
+                .shadow_md()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
                     div()
-                        .id("context-menu")
-                        .absolute()
-                        .left(position.x)
-                        .top(position.y)
-                        .min_w(px(160.))
-                        .bg(theme::panel())
-                        .border_1()
-                        .border_color(theme::border())
-                        .rounded_md()
-                        .p_1()
                         .flex()
-                        .flex_col()
-                        .shadow_md()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
                         .child(
                             div()
-                                .id("context-menu-tail")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(theme::text())
-                                .hover(|item| item.bg(theme::selection()))
-                                .child(format!(
-                                    "tail -f {}",
-                                    path.file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| path.display().to_string())
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_log_tab(path.clone(), cx);
-                                })),
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(theme::accent())
+                                .child("aetherium — shortcuts & features"),
                         )
                         .child(
                             div()
-                                .id("context-menu-download")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
                                 .text_xs()
-                                .text_color(theme::text())
-                                .hover(|item| item.bg(theme::selection()))
-                                .child("Download")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.context_menu = None;
-                                    this.download_selected(cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-menu-edit")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(theme::text())
-                                .hover(|item| item.bg(theme::selection()))
-                                .child(format!("Edit {file_name}"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.start_remote_edit(edit_path.clone(), EditorChoice::Default, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-menu-vscode")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(theme::text())
-                                .hover(|item| item.bg(theme::selection()))
-                                .child("Open in VS Code")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.start_remote_edit(vscode_path.clone(), EditorChoice::VsCode, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-menu-rename")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(theme::text())
-                                .hover(|item| item.bg(theme::selection()))
-                                .child("Rename")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.context_menu = None;
-                                    this.start_rename(rename_path.clone(), window, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-menu-delete")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(theme::danger())
-                                .hover(|item| item.bg(theme::selection()))
-                                .child("Delete")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.context_menu = None;
-                                    this.ask_delete(delete_path.clone(), cx);
-                                })),
-                        )
-                        // Swallow presses that start inside the menu so they
-                        // never reach the dismiss layer below (same race as
-                        // the theme menu: the dismiss would close the menu
-                        // between a row's mouse-down and mouse-up).
-                        .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
-                            cx.stop_propagation();
+                                .text_color(theme::text_dim())
+                                .child("Esc to close"),
+                        ),
+                );
+            for section in HELP_SECTIONS {
+                let mut block = div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .pb_1()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(section.title),
+                    );
+                for (keys, description) in section.rows {
+                    block = block.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap_3()
+                            .py_0p5()
+                            .child(
+                                div()
+                                    .w(px(210.))
+                                    .flex_none()
+                                    .font_family(theme::FONT_MONO)
+                                    .text_xs()
+                                    .text_color(theme::accent())
+                                    .child(*keys),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_xs()
+                                    .text_color(theme::text_dim())
+                                    .child(*description),
+                            ),
+                    );
+                }
+                panel = panel.child(block);
+            }
+            root = root
+                .child(
+                    div()
+                        .id("help-overlay")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.help_open = false;
+                            cx.notify();
                         }))
-                        .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
-                            cx.stop_propagation();
-                        })),
+                        .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                            this.help_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            // Swallow presses inside the panel so they don't
+                            // hit the dismiss layer (same race as the menus).
+                            panel
+                                .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                }))
+                                .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                })),
+                        ),
                 );
         }
 
@@ -7184,5 +7596,22 @@ mod tests {
         let mut inverse = Cell::default();
         inverse.flags.insert(Flags::INVERSE);
         assert!(!cell_is_uncolored(&inverse));
+    }
+
+    // [utest->req~help-shortcut-list~1]
+    #[test]
+    fn help_sections_are_well_formed() {
+        assert!(!HELP_SECTIONS.is_empty());
+        for section in HELP_SECTIONS {
+            assert!(!section.title.is_empty());
+            assert!(
+                !section.rows.is_empty(),
+                "section {} lists no shortcuts",
+                section.title
+            );
+            for (keys, description) in section.rows {
+                assert!(!keys.is_empty() && !description.is_empty());
+            }
+        }
     }
 }

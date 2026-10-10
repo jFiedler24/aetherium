@@ -45,6 +45,7 @@ with HTTP 200; auth/transport failures use 401/404/504.
 | GET | `/status` | Saved profiles (names + `user@host:port` summaries) and open tabs with connection state. **Start here to discover targets.** |
 | POST | `/sessions` | `{"target": "<profile name>"}` — opens a visible shell tab and connects. Idempotent: reconnects stale tabs. |
 | POST | `/logs` | `{"target": …, "path": "/var/log/syslog"}` — opens a SnakeTail-style log-follow view (auto-waits for connect, up to 30 s). |
+| POST | `/logs/collect` | `{"target": …}` — one-call diagnostics bundle: runs the built-in source set and any extras from `collect.toml`, replying with one entry per source. See below. |
 | POST | `/exec` | `{"target": …, "command": "uptime", "timeout_secs": 60}` → `stdout`, `stderr`, `exit_status` (`*_base64` added for non-UTF-8 output). Requires a connected session. |
 | GET | `/files?target=…&path=…` | List a remote directory (`entries`: name/path/is_dir/size/modified). |
 | GET | `/file?target=…&path=…` | Download a file → `{"size": n, "content_base64": …}`. |
@@ -80,6 +81,49 @@ def api(method, path, body=None, raw=None):
 # print(os:=api("POST", "/exec", {"target": "raspberry3bplus", "command": "hostname"}))
 # api("PUT", "/file?target=raspberry3bplus&path=/etc/motd", raw=b"hello\n")
 ```
+
+## Log collection (`POST /logs/collect`)
+
+One call pulls the common Linux diagnostics from a target into a single
+JSON response — built for AI triage:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"target": "raspberry3bplus"}' \
+     http://127.0.0.1:48920/logs/collect
+```
+
+Reply: `{"ok": true, "sources": [{"name", "kind", "ok", "content",
+"bytes", "truncated", "error"}, …]}`.
+
+- **Built-in sources**: `dmesg`, `journalctl -b --no-pager -n 2000`,
+  and the files `/var/log/syslog`, `/var/log/messages`,
+  `/var/log/kern.log`, `/var/log/auth.log`, `/var/log/daemon.log`,
+  `/var/log/dmesg`.
+- **Configurable extras**: `collect.toml` in the aetherium config dir
+  adds per-user sources, e.g. to also grab an application log and a
+  service status:
+
+  ```toml
+  files = ["/app/sovd/sovd.log"]
+  commands = ["systemctl status sovd --no-pager"]
+  ```
+
+  With that file, the collection includes `dmesg`, the journal, the
+  built-in /var/log files, **and** `/app/sovd/sovd.log` plus the
+  `systemctl status` output — each as its own source entry. Restart the
+  app after editing `collect.toml`.
+- Sources run **sequentially** over the target's connected session (one
+  exec channel at a time); each entry reports its own `ok`/`error`, a
+  missing file or unsupported command never aborts the rest.
+- `content` is capped at 512 KiB per source with `truncated: true` when
+  the cap cut it; files are fetched via `cat | head -c 512289` so huge
+  logs cannot flood memory.
+- Requires a connected session (`POST /sessions` first). Only one
+  collection can run at a time; the whole job times out after 300 s,
+  each source after 45 s.
+- This endpoint is read-only and never opens UI tabs — it only controls
+  the existing session, per the API's contract.
 
 ## Notes and limits
 

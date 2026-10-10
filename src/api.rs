@@ -47,6 +47,12 @@ pub enum ApiRequest {
         content: Vec<u8>,
         reply: Responder,
     },
+    /// Collect the common Linux logs plus the configured extra sources
+    /// (`collect.toml`) from the target; replies with one entry per source.
+    CollectLogs {
+        target: String,
+        reply: Responder,
+    },
 }
 
 pub type Responder = std_mpsc::Sender<Value>;
@@ -342,6 +348,14 @@ fn handle_connection(
             content: request.body.clone(),
             reply: tx,
         }),
+        ("POST", "/logs/collect") => {
+            // [impl->feat~rest-log-collection~1]
+            let body = json_body(&request);
+            Some(ApiRequest::CollectLogs {
+                target: target_of(&request, &body),
+                reply: tx,
+            })
+        }
         _ => None,
     };
 
@@ -407,6 +421,10 @@ fn docs(token: &str) -> Value {
             {"method": "POST", "path": "/logs", "description": "Open a SnakeTail-style log-follow view of a remote file.",
              "params": {"target": "profile name", "path": "remote file path"},
              "example": {"target": "raspberry3bplus", "path": "/var/log/syslog"}},
+            {"method": "POST", "path": "/logs/collect", "description": "Collect the common Linux logs (dmesg, journalctl, /var/log/{syslog,messages,kern,auth,daemon}.log) plus extra sources from collect.toml in the config dir. Runs each source on the target and replies with one entry per source: content (≤512 KiB, truncated flag), ok, error.",
+             "params": {"target": "profile name"},
+             "example": {"target": "raspberry3bplus"},
+             "config_example": "collect.toml: files = [\"/app/sovd/sovd.log\"], commands = [\"systemctl status sovd --no-pager\"]"},
             {"method": "POST", "path": "/exec", "description": "Run a command on the target's connected session.",
              "params": {"target": "profile name", "command": "shell command", "timeout_secs": "optional, default 60"},
              "example": {"target": "raspberry3bplus", "command": "uptime"}},

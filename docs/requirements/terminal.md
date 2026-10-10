@@ -99,3 +99,23 @@ htop and friends render exactly as intended.
 **Covers:** feat~shell-syntax-coloring~1
 
 **Needs:** impl, utest
+
+## feat~help-overlay~1
+
+A header button shall open an in-app help overlay listing the app's
+shortcuts and features per surface (terminal, file tree, log tabs,
+general), dismissible with Escape or a click outside.
+
+**Covers:** creq~in-app-help~1
+
+**Needs:** req, impl
+
+## req~help-shortcut-list~1
+
+The help overlay's shortcut list shall stay in sync with the real
+bindings (zoom keys, copy/paste, history recall, log-tab keys) and cover
+the file-tree actions including the folder ZIP download.
+
+**Covers:** feat~help-overlay~1
+
+**Needs:** impl, utest

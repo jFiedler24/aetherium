@@ -38,3 +38,25 @@ existing SSH sessions — no hidden parallel connections.
 **Covers:** feat~rest-api~1
 
 **Needs:** impl
+
+## feat~rest-log-collection~1
+
+`POST /logs/collect` shall gather the common Linux logs (kernel ring
+buffer, journal, classic /var/log files) from a target into one JSON
+response, plus extra files and commands configured in `collect.toml`.
+
+**Covers:** creq~collect-linux-logs~1
+
+**Needs:** req, impl
+
+## req~configurable-log-sources~1
+
+The collection sources shall be a built-in set plus per-source entries
+from `collect.toml` in the config directory (`files`, `commands`).
+Each source runs independently over the target's session (one exec
+channel at a time) and reports its own ok/error/truncated state, with
+per-source content capped at 512 KiB.
+
+**Covers:** feat~rest-log-collection~1
+
+**Needs:** impl, utest

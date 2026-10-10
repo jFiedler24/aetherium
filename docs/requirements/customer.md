@@ -87,3 +87,24 @@ programs that print no ANSI colors of their own should still get readable
 syntax colors.
 
 **Tags:** terminal
+
+## creq~in-app-help~1
+
+Add a help button that shows the shortcuts etc. — one place in the app
+listing every key binding and what the buttons do.
+
+**Tags:** usability
+
+## creq~folder-download-as-zip~1
+
+Right-clicking a remote folder should offer downloading the whole folder
+structure as a zip, with a progress bar while it runs.
+
+**Tags:** files
+
+## creq~collect-linux-logs~1
+
+A REST action shall collect the most common Linux logs from a target plus
+a configurable set of files, so an AI can pull diagnostics in one call.
+
+**Tags:** integration, ai

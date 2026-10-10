@@ -15,6 +15,8 @@ mod profiles;
 mod session;
 #[path = "../terminal_model.rs"]
 mod terminal_model;
+#[path = "../zip.rs"]
+mod zip;
 
 use std::time::Duration;
 

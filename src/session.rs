@@ -44,6 +44,11 @@ pub enum Command {
     /// Download a remote file or directory (recursively) into ~/Downloads.
     /// Set `cancel` to abort the transfer (checked between chunks).
     Download { session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool> },
+    /// Download a remote directory (recursively) into a single .zip in
+    /// ~/Downloads, preserving structure and empty directories. Set
+    /// `cancel` to abort the transfer (checked between chunks); the
+    /// partial archive is removed.
+    DownloadZip { session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool> },
     /// Download a remote file to a temp directory for drag-out. The UI is
     /// notified via `Event::TempDownloadReady` when the file is available
     /// locally; `cache` additionally receives the staged path directly on
@@ -230,6 +235,11 @@ impl SessionHandle {
 
     pub fn download(&self, session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool>) {
         self.send(Command::Download { session_id, remote, cancel });
+    }
+
+    /// Download a remote directory tree into a single .zip in ~/Downloads.
+    pub fn download_zip(&self, session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool>) {
+        self.send(Command::DownloadZip { session_id, remote, cancel });
     }
 
     /// Download a remote file to a temp directory for drag-out.
@@ -668,6 +678,14 @@ async fn command_loop(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             download(&sftp, &event_tx, &remote, &cancel).await;
+                        });
+                    }
+                    Some(Command::DownloadZip { session_id, remote, cancel }) => {
+                        let _ = session_id;
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            download_zip(&sftp, &event_tx, &remote, &cancel).await;
                         });
                     }
                     Some(Command::DownloadToTemp {
@@ -1424,6 +1442,191 @@ fn unique_download_path(dir: &std::path::Path, name: &str) -> PathBuf {
     }
     // Absurd number of collisions; let the create fail downstream.
     dir.join(name)
+}
+
+/// One member of a walked remote tree, with its archive-relative name.
+struct RemoteMember {
+    /// Archive-relative name (`/`-separated; directories end in `/`).
+    rel: String,
+    /// Absolute remote path.
+    remote: String,
+    size: u64,
+    is_dir: bool,
+}
+
+/// Walk a remote directory tree into a flat member list with sizes. A
+/// failure to list the root itself aborts the walk; unreadable subtrees
+/// are skipped — for a download a partial archive beats no archive.
+async fn collect_remote_tree(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &std::path::Path,
+) -> Result<Vec<RemoteMember>> {
+    let mut members = Vec::new();
+    collect_remote_tree_into(sftp, remote, "", &mut members).await?;
+    Ok(members)
+}
+
+async fn collect_remote_tree_into(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &std::path::Path,
+    prefix: &str,
+    members: &mut Vec<RemoteMember>,
+) -> Result<()> {
+    let entries = sftp
+        .read_dir(remote.to_string_lossy().into_owned())
+        .await
+        .with_context(|| format!("listing remote {}", remote.display()))?;
+    for entry in entries {
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let path = entry.path();
+        if entry.file_type().is_dir() {
+            members.push(RemoteMember {
+                rel: format!("{rel}/"),
+                remote: path.clone(),
+                size: 0,
+                is_dir: true,
+            });
+            Box::pin(collect_remote_tree_into(
+                sftp,
+                std::path::Path::new(&path),
+                &rel,
+                members,
+            ))
+            .await?;
+        } else {
+            members.push(RemoteMember {
+                rel,
+                remote: path,
+                size: entry.metadata().len(),
+                is_dir: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Download a remote directory tree into a single stored (uncompressed)
+/// .zip in ~/Downloads, preserving structure including empty directories.
+/// The tree is walked first so the progress bar can show byte totals;
+/// `cancel` aborts between chunks and removes the partial archive.
+// [impl->req~folder-zip-progress~1]
+async fn download_zip(
+    sftp: &russh_sftp::client::SftpSession,
+    event_tx: &std_mpsc::Sender<Event>,
+    remote: &std::path::Path,
+    cancel: &AtomicBool,
+) {
+    let Some(home) = dirs::home_dir() else {
+        let _ = event_tx.send(Event::Error("zip download: no home directory".into()));
+        return;
+    };
+    let downloads = home.join("Downloads");
+    if let Err(err) = std::fs::create_dir_all(&downloads) {
+        let _ = event_tx.send(Event::Error(format!(
+            "zip download: creating {}: {err}",
+            downloads.display()
+        )));
+        return;
+    }
+    let base = remote
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    let target = unique_download_path(&downloads, &format!("{base}.zip"));
+    let label = format!("zip {} → {}", remote.display(), target.display());
+
+    let members = match collect_remote_tree(sftp, remote).await {
+        Ok(members) => members,
+        Err(err) => {
+            let _ = event_tx.send(Event::Error(format!("{label}: {err:#}")));
+            return;
+        }
+    };
+    let total = members
+        .iter()
+        .filter(|member| !member.is_dir)
+        .map(|member| member.size)
+        .sum();
+    let _ = event_tx.send(Event::TransferStarted { label: label.clone() });
+    let mut progress = TransferProgress::new(event_tx, &label, total);
+
+    let result = zip_members(sftp, &target, &members, &mut progress, cancel).await;
+    match result {
+        Ok(()) => {
+            let _ = event_tx.send(Event::TransferDone { label });
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&target);
+            if cancel.load(Ordering::Relaxed) {
+                let _ = event_tx.send(Event::TransferCancelled { label });
+            } else {
+                let _ = event_tx.send(Event::Error(format!("{label}: {err:#}")));
+            }
+        }
+    }
+}
+
+/// Stream every walked file into the archive at `target`.
+async fn zip_members(
+    sftp: &russh_sftp::client::SftpSession,
+    target: &std::path::Path,
+    members: &[RemoteMember],
+    progress: &mut TransferProgress<'_>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let file = std::fs::File::create(target)
+        .with_context(|| format!("creating {}", target.display()))?;
+    let mut zip = crate::zip::ZipWriter::new(file);
+    // Directory entries first, so the hierarchy exists before any payload
+    // and empty folders survive the round trip.
+    for member in members.iter().filter(|member| member.is_dir) {
+        let name = crate::zip::sanitize_name(&member.rel)
+            .unwrap_or_else(|| member.rel.trim_end_matches('/').to_string());
+        zip.add_directory(&format!("{name}/"))
+            .context("zip: adding directory entry")?;
+    }
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    for member in members.iter().filter(|member| !member.is_dir) {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        let name = crate::zip::sanitize_name(&member.rel)
+            .with_context(|| format!("zip: unsafe member name {}", member.rel))?;
+        zip.begin_file(&name).context("zip: beginning entry")?;
+        let mut remote_file = sftp
+            .open(member.remote.clone())
+            .await
+            .with_context(|| format!("opening remote {}", member.remote))?;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("cancelled");
+            }
+            let read = remote_file
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("reading remote {}", member.remote))?;
+            if read == 0 {
+                break;
+            }
+            zip.write_data(&buffer[..read]).context("zip: writing entry")?;
+            progress.add(read as u64);
+        }
+        zip.end_file().context("zip: finishing entry")?;
+        remote_file
+            .close()
+            .await
+            .with_context(|| format!("closing remote {}", member.remote))?;
+    }
+    zip.finish().context("zip: finishing archive")?;
+    Ok(())
 }
 
 /// Authenticate according to the profile's auth method; fail unless the
