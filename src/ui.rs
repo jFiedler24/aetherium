@@ -6727,14 +6727,14 @@ fn render_tree_rows(
                                         // requires.
                                         let cache = cache_for_download.clone();
                                         let key = (session_id, remote_for_download.clone());
-                                        cx.spawn(|_| async move {
-                                            crate::windows_drag::begin_file_drag(
-                                                std::sync::Arc::new(move || {
-                                                    cache.lock().get(&key).cloned()
-                                                }),
-                                            );
-                                        })
-                                        .detach();
+                                        let wait: std::sync::Arc<
+                                            dyn Fn() -> Option<PathBuf> + Send + Sync,
+                                        > = std::sync::Arc::new(move || {
+                                            cache.lock().get(&key).cloned()
+                                        });
+                                        cx.defer(move |_| {
+                                            crate::windows_drag::begin_file_drag(wait);
+                                        });
                                         let _ = weak_root.update(cx, |this, _cx| {
                                             this.ole_drag_active = true;
                                         });
