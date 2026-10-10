@@ -58,3 +58,44 @@ icon is unambiguous; connection state shall be shown as a colored icon.
 **Covers:** creq~slick-modern-ui~1
 
 **Needs:** impl
+
+## feat~terminal-font-zoom~1
+
+The terminal text size shall be increaseable and decreaseable at runtime,
+via keyboard shortcuts and the mouse wheel, with a one-key reset to the
+default; the chosen size persists across launches.
+
+**Covers:** creq~zoom-terminal-text~1
+
+**Needs:** req, impl
+
+## req~font-zoom-shortcuts~1
+
+Zoom is bound to the platform modifier (cmd +/- / cmd 0, cmd+wheel) on
+macOS; on Windows and Linux, where that modifier is the Windows key, the
+same actions are additionally bound to ctrl.
+
+**Covers:** feat~terminal-font-zoom~1
+
+**Needs:** impl
+
+## feat~shell-syntax-coloring~1
+
+Shell tabs shall get heuristic syntax coloring for output the remote
+program left uncolored, toggled from the header and configurable via
+regex rules in the config directory.
+
+**Covers:** creq~colorize-uncolored-terminal~1
+
+**Needs:** req, impl
+
+## req~uncolored-cell-coloring~1
+
+Highlight rules may recolor only cells still carrying the terminal's
+default foreground/background: any SGR color the program set (bright
+text, backgrounds, inverse video) stays untouched, so `ls --color`, vim,
+htop and friends render exactly as intended.
+
+**Covers:** feat~shell-syntax-coloring~1
+
+**Needs:** impl, utest

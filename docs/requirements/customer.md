@@ -73,3 +73,17 @@ MobaXterm): edit, save, and the tool asks whether to sync the changes
 back to the device.
 
 **Tags:** files, integration
+
+## creq~zoom-terminal-text~1
+
+I want to be able to increase and decrease the text size in the terminal.
+
+**Tags:** usability, terminal
+
+## creq~colorize-uncolored-terminal~1
+
+For uncolored terminals the tool should do the coloring — output from
+programs that print no ANSI colors of their own should still get readable
+syntax colors.
+
+**Tags:** terminal

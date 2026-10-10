@@ -706,13 +706,67 @@ pub struct RootView {
     /// echo is deduplicated on arrival) — the fix for typing lag on
     /// high-latency links. Toggleable from the header.
     local_echo: bool,
-    /// Zoomable terminal font size (cmd +/-, cmd+wheel); the grid re-measures
-    /// and the PTY resizes automatically.
+    /// Zoomable terminal font size (cmd/ctrl +/-, cmd/ctrl+wheel); the grid
+    /// re-measures and the PTY resizes automatically. Persisted across
+    /// launches in `ui.toml`.
     terminal_font_size: f32,
+    /// Heuristic syntax coloring for shell output the remote program left
+    /// uncolored; loaded once at startup (rules from `shell_highlight.toml`).
+    shell_highlighter: Arc<LogHighlighter>,
+    /// Whether shell syntax coloring is applied; header toggle, persisted.
+    shell_coloring: bool,
     /// Commands submitted in any session, persisted across launches and
     /// recallable with Shift+↑ / Shift+↓ (roadmap 3.4).
     history: HistoryStore,
     focus_handle: FocusHandle,
+}
+
+/// Persisted UI knobs: the terminal font zoom and the shell coloring
+/// toggle. Hand-parsed `key = value` lines, same style as `theme.toml`.
+struct UiSettings {
+    terminal_font_size: f32,
+    shell_coloring: bool,
+}
+
+impl UiSettings {
+    fn defaults() -> Self {
+        Self {
+            terminal_font_size: TERMINAL_FONT_SIZE,
+            shell_coloring: true,
+        }
+    }
+
+    fn load() -> Self {
+        let mut settings = Self::defaults();
+        let Ok(text) = std::fs::read_to_string(crate::crypto::config_dir().join("ui.toml"))
+        else {
+            return settings;
+        };
+        for (key, value) in text.lines().filter_map(|line| line.split_once('=')) {
+            match key.trim() {
+                "terminal_font_size" => {
+                    if let Ok(size) = value.trim().parse::<f32>() {
+                        settings.terminal_font_size = size.clamp(8., 32.);
+                    }
+                }
+                "shell_coloring" => settings.shell_coloring = value.trim() != "false",
+                _ => {}
+            }
+        }
+        settings
+    }
+
+    fn save(&self) {
+        if let Err(err) = std::fs::write(
+            crate::crypto::config_dir().join("ui.toml"),
+            format!(
+                "terminal_font_size = {}\nshell_coloring = {}\n",
+                self.terminal_font_size, self.shell_coloring
+            ),
+        ) {
+            eprintln!("aetherium: saving ui settings: {err:#}");
+        }
+    }
 }
 
 impl RootView {
@@ -724,6 +778,7 @@ impl RootView {
         let (terminal_wake_tx, terminal_wake_rx) =
             tokio::sync::mpsc::unbounded_channel::<()>();
         let store = ProfileStore::load();
+        let ui_settings = UiSettings::load();
         // Pre-select the first profile so Connect works with one click.
         let selected = (!store.profiles.is_empty()).then_some(0);
         let view = Self {
@@ -762,7 +817,9 @@ impl RootView {
             terminal_wake_tx,
             temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             local_echo: true,
-            terminal_font_size: TERMINAL_FONT_SIZE,
+            terminal_font_size: ui_settings.terminal_font_size,
+            shell_highlighter: Arc::new(LogHighlighter::load_shell()),
+            shell_coloring: ui_settings.shell_coloring,
             history: HistoryStore::load(),
             focus_handle: cx.focus_handle(),
         };
@@ -2782,10 +2839,17 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Font zoom: cmd +/- / cmd 0 (like Zed's terminal). Handled before
-        // the tab borrow; these keys never reach the PTY.
+        // Font zoom: cmd +/- / cmd 0 (like Zed's terminal). On Windows/Linux
+        // gpui's `platform` modifier is the Windows key, so ctrl takes over
+        // there — Ctrl+wheel zooms too. Handled before the tab borrow; these
+        // keys never reach the PTY.
+        // [impl->req~font-zoom-shortcuts~1]
         let zoom_mods = &event.keystroke.modifiers;
-        if zoom_mods.platform && !zoom_mods.control && !zoom_mods.alt {
+        #[cfg(target_os = "macos")]
+        let zoom_pressed = zoom_mods.platform && !zoom_mods.control && !zoom_mods.alt;
+        #[cfg(not(target_os = "macos"))]
+        let zoom_pressed = !zoom_mods.alt && (zoom_mods.platform || zoom_mods.control);
+        if zoom_pressed {
             match event.keystroke.key.as_str() {
                 "=" | "+" => {
                     self.zoom_terminal(1.0, cx);
@@ -2796,11 +2860,7 @@ impl RootView {
                     return;
                 }
                 "0" => {
-                    self.terminal_font_size = TERMINAL_FONT_SIZE;
-                    for tab in &self.tabs {
-                        tab.terminal.mark_dirty();
-                    }
-                    cx.notify();
+                    self.reset_terminal_font(cx);
                     return;
                 }
                 _ => {}
@@ -3148,19 +3208,45 @@ impl RootView {
         cx.notify();
     }
 
-    /// Zoom the terminal font by `delta` pixels (cmd +/-, cmd+wheel), clamped
-    /// to a sane range. The grid re-measures on the next frame and the PTY
-    /// resize follows via the repaint loop's geometry check.
+    /// Zoom the terminal font by `delta` pixels (cmd/ctrl +/-, cmd/ctrl+wheel),
+    /// clamped to a sane range. The grid re-measures on the next frame and the
+    /// PTY resize follows via the repaint loop's geometry check; the size
+    /// persists across launches.
+    // [impl->req~font-zoom-shortcuts~1]
     fn zoom_terminal(&mut self, delta: f32, cx: &mut Context<Self>) {
         let new_size = (self.terminal_font_size + delta).clamp(8.0, 32.0);
         if (new_size - self.terminal_font_size).abs() < f32::EPSILON {
             return;
         }
         self.terminal_font_size = new_size;
+        self.save_ui_settings();
         for tab in &self.tabs {
             tab.terminal.mark_dirty();
         }
         cx.notify();
+    }
+
+    /// Back to the default terminal font size (cmd/ctrl 0).
+    // [impl->req~font-zoom-shortcuts~1]
+    // [impl->feat~terminal-font-zoom~1]
+    fn reset_terminal_font(&mut self, cx: &mut Context<Self>) {
+        if (self.terminal_font_size - TERMINAL_FONT_SIZE).abs() < f32::EPSILON {
+            return;
+        }
+        self.terminal_font_size = TERMINAL_FONT_SIZE;
+        self.save_ui_settings();
+        for tab in &self.tabs {
+            tab.terminal.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    fn save_ui_settings(&self) {
+        UiSettings {
+            terminal_font_size: self.terminal_font_size,
+            shell_coloring: self.shell_coloring,
+        }
+        .save();
     }
 
     fn toggle_tree_node(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -3569,6 +3655,18 @@ fn cell_colors(cell: &Cell) -> (Hsla, Hsla) {
     (fg, bg)
 }
 
+/// True when the cell carries no colors of its own — the program never set
+/// a foreground/background (nor inverse video), so heuristic syntax coloring
+/// may paint it. Anything SGR-colored (`ls --color`, vim, htop, …) fails
+/// this check and renders exactly as the program intended.
+// [impl->req~uncolored-cell-coloring~1]
+// [impl->feat~shell-syntax-coloring~1]
+fn cell_is_uncolored(cell: &Cell) -> bool {
+    matches!(cell.fg, Color::Named(NamedColor::Foreground))
+        && matches!(cell.bg, Color::Named(NamedColor::Background))
+        && !cell.flags.contains(Flags::INVERSE)
+}
+
 // --- terminal rendering -----------------------------------------------------
 
 /// Style-relevant cell flags; runs merge only when all of these match.
@@ -3729,13 +3827,15 @@ fn collect_runs(
         }
         let (mut fg, mut bg) = cell_colors(cell);
         let mut bold = flags.contains(Flags::BOLD);
-        if let Some(segments) = row_highlights.get(row) {
-            if let Some((_, _, highlight_fg, highlight_bold)) = segments
-                .iter()
-                .find(|(start, end, _, _)| char_ix >= *start && char_ix < *end)
-            {
-                fg = *highlight_fg;
-                bold |= *highlight_bold;
+        if cell_is_uncolored(cell) {
+            if let Some(segments) = row_highlights.get(row) {
+                if let Some((_, _, highlight_fg, highlight_bold)) = segments
+                    .iter()
+                    .find(|(start, end, _, _)| char_ix >= *start && char_ix < *end)
+                {
+                    fg = *highlight_fg;
+                    bold |= *highlight_bold;
+                }
             }
         }
         // Search matches paint a translucent accent background; the runs
@@ -3969,7 +4069,15 @@ impl RootView {
         let geometry = tab.geometry.clone();
         let focus_handle = tab.focus_handle.clone();
         let canvas_focus = focus_handle.clone();
-        let highlighter = tab.highlighter.clone();
+        // Log tabs use their own rule set; shell tabs get the heuristic shell
+        // coloring while the toggle is on (uncolored cells only).
+        let highlighter = if tab.is_log() {
+            tab.highlighter.clone()
+        } else if self.shell_coloring {
+            Some(self.shell_highlighter.clone())
+        } else {
+            None
+        };
         let terminal_font_size = self.terminal_font_size;
         // Log tabs: per-frame overlay + optional filter row set. Built here
         // (UI thread, cheap) and shared with the canvas prepaint.
@@ -3992,9 +4100,13 @@ impl RootView {
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(Self::on_terminal_key_down))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                // cmd+wheel zooms the terminal font (like Zed); a plain wheel
-                // scrolls the scrollback.
-                if event.modifiers.platform {
+                // cmd+wheel zooms the terminal font on macOS, ctrl+wheel on
+                // Windows/Linux (like Zed); a plain wheel scrolls the scrollback.
+                #[cfg(target_os = "macos")]
+                let zoom_wheel = event.modifiers.platform;
+                #[cfg(not(target_os = "macos"))]
+                let zoom_wheel = event.modifiers.platform || event.modifiers.control;
+                if zoom_wheel {
                     let pixel_delta = event.delta.pixel_delta(px(20.));
                     let steps = (f32::from(pixel_delta.y) / 20.).round();
                     if steps != 0.0 {
@@ -4661,6 +4773,49 @@ impl RootView {
                     cx.notify();
                 },
             ))
+            .child(
+                div()
+                    .id("toggle-shell-coloring")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(28.))
+                    .h(px(26.))
+                    .rounded_sm()
+                    .bg(theme::button())
+                    .hover(|style| style.bg(theme::button_hover()))
+                    .active(|style| style.opacity(0.8))
+                    .cursor_pointer()
+                    .tooltip(tip(if self.shell_coloring {
+                        "Shell coloring: on"
+                    } else {
+                        "Shell coloring: off"
+                    }))
+                    .child(
+                        svg()
+                            .path(assets::ICON_HIGHLIGHTER)
+                            .w(px(14.))
+                            .h(px(14.))
+                            .text_color(if self.shell_coloring {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.shell_coloring = !this.shell_coloring;
+                        this.save_ui_settings();
+                        this.status = if this.shell_coloring {
+                            "shell syntax coloring on (uncolored output only)".into()
+                        } else {
+                            "shell syntax coloring off".into()
+                        };
+                        for tab in &this.tabs {
+                            tab.terminal.mark_dirty();
+                        }
+                        cx.notify();
+                    })),
+            )
             .child(
                 div()
                     .id("theme")
@@ -7002,3 +7157,32 @@ impl Render for RootView {
 // confirms and Escape cancels. RenameEntry opens the inline rename editor.
 // Handlers live on the file-tree container.
 gpui::actions!(file_tree, [DeleteEntry, CancelDelete, ConfirmDelete, RenameEntry]);
+
+#[cfg(test)]
+// [utest->req~uncolored-cell-coloring~1]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncolored_cells_are_detected() {
+        // A cell exactly as the terminal emulator defaults it: the program
+        // printed plain text, no SGR styling.
+        assert!(cell_is_uncolored(&Cell::default()));
+
+        let mut fg = Cell::default();
+        fg.fg = Color::Named(NamedColor::Red);
+        assert!(!cell_is_uncolored(&fg));
+
+        let mut bg = Cell::default();
+        bg.bg = Color::Named(NamedColor::Blue);
+        assert!(!cell_is_uncolored(&bg));
+
+        let mut indexed = Cell::default();
+        indexed.fg = Color::Indexed(196);
+        assert!(!cell_is_uncolored(&indexed));
+
+        let mut inverse = Cell::default();
+        inverse.flags.insert(Flags::INVERSE);
+        assert!(!cell_is_uncolored(&inverse));
+    }
+}

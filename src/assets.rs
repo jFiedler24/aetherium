@@ -42,6 +42,7 @@ const TOOL_SEARCH: &str = include_str!("../zed_icons/tool_search.svg");
 const FILTER_FUNNEL: &str = include_str!("../zed_icons/filter_funnel.svg");
 const LOCK: &str = include_str!("../zed_icons/lock.svg");
 const LOCK_OFF: &str = include_str!("../zed_icons/lock_off.svg");
+const HIGHLIGHTER: &str = include_str!("../zed_icons/highlighter.svg");
 
 /// App icon, shown next to the brand name in the header.
 pub const ICON_MAIN_EXECUTABLE: &str = "aetherium/icons/main_executable.svg";
@@ -97,6 +98,8 @@ pub const ICON_FILTER: &str = "aetherium/icons/filter_funnel.svg";
 pub const ICON_LOCK: &str = "aetherium/icons/lock.svg";
 /// Sessions list: no connected session for the profile.
 pub const ICON_LOCK_OFF: &str = "aetherium/icons/lock_off.svg";
+/// Header: heuristic shell syntax coloring is on.
+pub const ICON_HIGHLIGHTER: &str = "aetherium/icons/highlighter.svg";
 
 const BUILD_TOOL_PATH: &str = "aetherium/icons/build_tool.svg";
 const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
@@ -199,6 +202,7 @@ impl AssetSource for EmbeddedAssets {
             ICON_FILTER => Some(FILTER_FUNNEL.as_bytes()),
             ICON_LOCK => Some(LOCK.as_bytes()),
             ICON_LOCK_OFF => Some(LOCK_OFF.as_bytes()),
+            ICON_HIGHLIGHTER => Some(HIGHLIGHTER.as_bytes()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

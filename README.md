@@ -25,6 +25,15 @@ same snappy text layout, same dark aesthetic.
 - **Remote terminal** (right pane) — real PTY shell (`xterm-256color`) rendered on a
   GPU canvas via `alacritty_terminal` grid + gpui text shaping. Full color support
   (16/256/truecolor), bold/dim/inverse/hidden attributes, block/beam/underline cursor.
+  Font zoom with cmd/ctrl +/- / cmd/ctrl 0 / cmd/ctrl+wheel (persisted in
+  `~/.config/aetherium/ui.toml`).
+- **Shell syntax coloring** — programs that print no ANSI colors of their own
+  (plain `ls`, `ping`, build output, …) still get readable heuristic colors:
+  errors bold red, warnings amber, success words green, timestamps cyan, numbers
+  pale green, URLs blue, quoted strings and paths tinted. Only uncolored cells
+  are touched — anything the program SGR-colored renders exactly as intended.
+  Toggle from the header highlighter button; rules live in
+  `~/.config/aetherium/shell_highlight.toml`.
 - **Log follower** — right-click any remote file in the tree → **tail -f** opens a
   read-only tab that follows the file over a dedicated SSH exec channel (closing the
   tab kills the remote tail). Log tabs get regex-based highlighting: ERROR/FATAL red,
