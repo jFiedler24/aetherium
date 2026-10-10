@@ -31,6 +31,7 @@ use crate::session::{
 use crate::terminal_model::TerminalModel;
 use crate::text_field::{Backtab, Tab, TextField};
 use crate::theme;
+use crate::api::{self, ApiRequest, Responder as ApiResponder};
 
 const TERMINAL_FONT_SIZE: f32 = 13.0;
 /// Line height tracks the (zoomable) font size with this ratio.
@@ -476,8 +477,7 @@ impl LogView {
 
 /// Per-frame painting data for a log tab's overlays, built on the UI thread
 /// and passed into the canvas prepaint.
-struct LogOverlay {
-    /// Search-match char ranges per alacritty line index.
+struct LogOverlay {    /// Search-match char ranges per alacritty line index.
     matches: std::collections::HashMap<i32, Vec<(usize, usize)>>,
     /// The active match gets a stronger background.
     current: Option<(i32, (usize, usize))>,
@@ -517,6 +517,55 @@ enum AuthKind {
     Password,
     KeyFile,
     Agent,
+}
+
+/// A REST API call awaiting its backend reply, keyed by request id.
+enum ApiWait {
+    Exec {
+        reply: ApiResponder,
+        deadline: std::time::Instant,
+    },
+    List {
+        reply: ApiResponder,
+        deadline: std::time::Instant,
+    },
+    Upload {
+        reply: ApiResponder,
+        deadline: std::time::Instant,
+    },
+    Download {
+        reply: ApiResponder,
+        deadline: std::time::Instant,
+    },
+}
+
+impl ApiWait {
+    fn deadline(&self) -> std::time::Instant {
+        match self {
+            ApiWait::Exec { deadline, .. }
+            | ApiWait::List { deadline, .. }
+            | ApiWait::Upload { deadline, .. }
+            | ApiWait::Download { deadline, .. } => *deadline,
+        }
+    }
+
+    fn fail(self, message: &str) {
+        let reply = match self {
+            ApiWait::Exec { reply, .. }
+            | ApiWait::List { reply, .. }
+            | ApiWait::Upload { reply, .. }
+            | ApiWait::Download { reply, .. } => reply,
+        };
+        let _ = reply.send(serde_json::json!({"ok": false, "error": message}));
+    }
+}
+
+/// A `/logs` request whose target session is still connecting.
+struct PendingApiLog {
+    target: String,
+    path: PathBuf,
+    reply: ApiResponder,
+    deadline: std::time::Instant,
 }
 
 /// State of the inline profile add/edit form.
@@ -572,6 +621,13 @@ pub struct RootView {
     /// file-tree drop/hover handling must stand down (set when the OLE drag
     /// starts, cleared on the next real mouse-down).
     ole_drag_active: bool,
+    /// Incoming REST API requests (drained by the event loop).
+    api_rx: std::sync::mpsc::Receiver<ApiRequest>,
+    /// REST API calls awaiting their backend replies.
+    api_pending: std::collections::HashMap<u64, ApiWait>,
+    next_api_req: u64,
+    /// A `/logs` request waiting for its session to connect.
+    api_pending_log: Option<PendingApiLog>,
     /// Which sidebar view is shown.
     sidebar_tab: SidebarTab,
     /// Current width of the sidebar, dragged via the splitter.
@@ -615,7 +671,11 @@ pub struct RootView {
 }
 
 impl RootView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        api_rx: std::sync::mpsc::Receiver<ApiRequest>,
+        api_info: Option<api::ApiInfo>,
+    ) -> Self {
         let (terminal_wake_tx, terminal_wake_rx) =
             tokio::sync::mpsc::unbounded_channel::<()>();
         let store = ProfileStore::load();
@@ -626,7 +686,10 @@ impl RootView {
             selected,
             form: None,
             recents: RecentStore::load(),
-            status: "not connected".to_string(),
+            status: match api_info {
+                Some(ref info) => format!("REST API: {}", api::url(info)),
+                None => "not connected".to_string(),
+            },
             tabs: Vec::new(),
             active: 0,
             next_tab_id: 0,
@@ -637,6 +700,10 @@ impl RootView {
             tree_drag_target: None,
             tree_dragging: None,
             ole_drag_active: false,
+            api_rx,
+            api_pending: std::collections::HashMap::new(),
+            next_api_req: 1,
+            api_pending_log: None,
             sidebar_tab: SidebarTab::Sessions,
             sidebar_width: px(260.),
             show_file_details: false,
@@ -760,6 +827,12 @@ impl RootView {
                             handled = true;
                         }
                     }
+                    // REST API requests from the local HTTP layer.
+                    while let Ok(request) = this.api_rx.try_recv() {
+                        this.handle_api_request(request, cx);
+                        handled = true;
+                    }
+                    this.api_tick(cx);
                     this.log_view_upkeep(cx);
                     if handled {
                         cx.notify();
@@ -1089,6 +1162,75 @@ impl RootView {
                 let label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Error, format!("{label}: {message}"));
             }
+            // REST API replies: route to the waiting HTTP request by id.
+            SessionEvent::ApiExecDone { req_id, stdout, stderr, exit_status } => {
+                if let Some(ApiWait::Exec { reply, .. }) = self.api_pending.remove(&req_id) {
+                    let mut value = serde_json::json!({
+                        "ok": true,
+                        "stdout": String::from_utf8_lossy(&stdout),
+                        "stderr": String::from_utf8_lossy(&stderr),
+                        "exit_status": exit_status,
+                    });
+                    if std::str::from_utf8(&stdout).is_err() {
+                        use base64::Engine as _;
+                        value["stdout_base64"] =
+                            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&stdout));
+                    }
+                    if std::str::from_utf8(&stderr).is_err() {
+                        use base64::Engine as _;
+                        value["stderr_base64"] =
+                            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&stderr));
+                    }
+                    let _ = reply.send(value);
+                }
+            }
+            SessionEvent::ApiListDone { req_id, result } => {
+                if let Some(ApiWait::List { reply, .. }) = self.api_pending.remove(&req_id) {
+                    let value = match result {
+                        Ok(entries) => serde_json::json!({
+                            "ok": true,
+                            "entries": entries.iter().map(|entry| serde_json::json!({
+                                "name": entry.name,
+                                "path": entry.path.display().to_string(),
+                                "is_dir": entry.is_dir,
+                                "size": entry.size,
+                                "modified": entry.modified,
+                            })).collect::<Vec<_>>(),
+                        }),
+                        Err(message) => serde_json::json!({"ok": false, "error": message}),
+                    };
+                    let _ = reply.send(value);
+                }
+            }
+            SessionEvent::ApiUploadDone { req_id, result } => {
+                if let Some(ApiWait::Upload { reply, .. }) = self.api_pending.remove(&req_id) {
+                    let value = match result {
+                        Ok(bytes) => serde_json::json!({"ok": true, "bytes": bytes}),
+                        Err(message) => serde_json::json!({"ok": false, "error": message}),
+                    };
+                    let _ = reply.send(value);
+                }
+            }
+            SessionEvent::ApiDownloadDone { req_id, result } => {
+                if let Some(ApiWait::Download { reply, .. }) = self.api_pending.remove(&req_id) {
+                    let value = match result {
+                        Ok((local, size)) => match std::fs::read(&local) {
+                            Ok(bytes) => {
+                                let _ = std::fs::remove_file(&local);
+                                use base64::Engine as _;
+                                serde_json::json!({
+                                    "ok": true,
+                                    "size": size,
+                                    "content_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                                })
+                            }
+                            Err(err) => serde_json::json!({"ok": false, "error": format!("reading {}: {err}", local.display())}),
+                        },
+                        Err(message) => serde_json::json!({"ok": false, "error": message}),
+                    };
+                    let _ = reply.send(value);
+                }
+            }
         }
     }
 
@@ -1136,6 +1278,13 @@ impl RootView {
             cx.notify();
             return;
         }
+        self.spawn_shell_tab(profile, cx);
+        self.context_menu = None;
+    }
+
+    /// Build, connect, and activate a visible shell tab; returns its index.
+    /// Shared by the Connect button and the REST API's `/sessions`.
+    fn spawn_shell_tab(&mut self, profile: Profile, cx: &mut Context<Self>) -> usize {
         let terminal = TerminalModel::new(80, 24);
         terminal.set_wake_channel(Some(self.terminal_wake_tx.clone()));
         let session = SessionHandle::spawn(terminal.clone());
@@ -1171,8 +1320,8 @@ impl RootView {
         session.connect(profile);
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
-        self.context_menu = None;
         cx.notify();
+        self.tabs.len() - 1
     }
 
     /// Open a new read-only tab that follows a remote file via `tail -f`,
@@ -1235,6 +1384,244 @@ impl RootView {
         self.active = self.tabs.len() - 1;
         self.context_menu = None;
         cx.notify();
+    }
+
+    // --- REST API (see api.rs) ------------------------------------------------
+
+    /// Index of the connected shell tab for `target` (profile name or
+    /// `user@host:port` summary), if any.
+    fn connected_tab_for(&self, target: &str) -> Option<usize> {
+        self.tabs.iter().position(|tab| {
+            !tab.is_log()
+                && tab.state == ConnState::Connected
+                && tab
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.name == target || p.summary() == target)
+        })
+    }
+
+    /// Open a visible shell tab for `target`, or use the existing one.
+    /// A disconnected tab is reconnected, not left stale.
+    fn api_open_session(&mut self, target: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            !tab.is_log()
+                && tab
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.name == target || p.summary() == target)
+        }) {
+            if self.tabs[index].state == ConnState::Disconnected {
+                self.active = index;
+                self.reconnect_tab(cx);
+            }
+            return Ok(());
+        }
+        let profile = self
+            .store
+            .profiles
+            .iter()
+            .find(|p| p.name == target || p.summary() == target)
+            .cloned()
+            .ok_or_else(|| format!("unknown target '{target}' (see GET /status)"))?;
+        if needs_login_prompt(&profile) {
+            return Err(format!(
+                "profile '{target}' needs credentials — fill them in the UI first"
+            ));
+        }
+        self.spawn_shell_tab(profile, cx);
+        Ok(())
+    }
+
+    fn api_ok(reply: ApiResponder, value: serde_json::Value) {
+        let _ = reply.send(value);
+    }
+
+    fn api_err(reply: ApiResponder, message: impl Into<String>) {
+        let _ = reply.send(serde_json::json!({"ok": false, "error": message.into()}));
+    }
+
+    /// Handle one request forwarded by the HTTP layer. Runs on the UI thread.
+    fn handle_api_request(&mut self, request: ApiRequest, cx: &mut Context<Self>) {
+        match request {
+            ApiRequest::Status { reply } => {
+                let profiles: Vec<serde_json::Value> = self
+                    .store
+                    .profiles
+                    .iter()
+                    .map(|profile| {
+                        serde_json::json!({
+                            "name": profile.name,
+                            "summary": profile.summary(),
+                        })
+                    })
+                    .collect();
+                let tabs: Vec<serde_json::Value> = self
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        serde_json::json!({
+                            "id": tab.id,
+                            "target": tab.profile.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
+                            "kind": if tab.is_log() { "log" } else { "shell" },
+                            "state": match tab.display_state() {
+                                ConnState::Connected => "connected",
+                                ConnState::Connecting => "connecting",
+                                ConnState::Disconnected => "disconnected",
+                            },
+                            "status": tab.status,
+                        })
+                    })
+                    .collect();
+                Self::api_ok(reply, serde_json::json!({"ok": true, "profiles": profiles, "tabs": tabs}));
+            }
+            ApiRequest::OpenSession { target, reply } => match self.api_open_session(&target, cx) {
+                Ok(()) => Self::api_ok(reply, serde_json::json!({"ok": true})),
+                Err(message) => Self::api_err(reply, message),
+            },
+            ApiRequest::OpenLog { target, path, reply } => {
+                if let Some(index) = self.connected_tab_for(&target) {
+                    self.activate_tab(index, cx);
+                    self.open_log_tab(PathBuf::from(&path), cx);
+                    Self::api_ok(reply, serde_json::json!({"ok": true}));
+                } else {
+                    match self.api_open_session(&target, cx) {
+                        Ok(()) => {
+                            // The session needs a moment to connect; the poll
+                            // loop opens the view once it is up.
+                            self.api_pending_log = Some(PendingApiLog {
+                                target,
+                                path: PathBuf::from(path),
+                                reply,
+                                deadline: std::time::Instant::now() + Duration::from_secs(30),
+                            });
+                        }
+                        Err(message) => Self::api_err(reply, message),
+                    }
+                }
+            }
+            ApiRequest::Exec { target, command, timeout_secs, reply } => {
+                let Some(index) = self.connected_tab_for(&target) else {
+                    Self::api_err(reply, format!("no connected session for '{target}' — POST /sessions first"));
+                    return;
+                };
+                let req_id = self.next_api_req;
+                self.next_api_req += 1;
+                self.api_pending.insert(
+                    req_id,
+                    ApiWait::Exec {
+                        reply,
+                        deadline: std::time::Instant::now() + Duration::from_secs(timeout_secs + 10),
+                    },
+                );
+                self.tabs[index]
+                    .session
+                    .as_ref()
+                    .expect("shell tab has a session")
+                    .send(SessionCommand::ApiExec { req_id, command });
+            }
+            ApiRequest::ListFiles { target, path, reply } => {
+                let Some(index) = self.connected_tab_for(&target) else {
+                    Self::api_err(reply, format!("no connected session for '{target}' — POST /sessions first"));
+                    return;
+                };
+                let req_id = self.next_api_req;
+                self.next_api_req += 1;
+                self.api_pending.insert(
+                    req_id,
+                    ApiWait::List {
+                        reply,
+                        deadline: std::time::Instant::now() + Duration::from_secs(70),
+                    },
+                );
+                self.tabs[index]
+                    .session
+                    .as_ref()
+                    .expect("shell tab has a session")
+                    .send(SessionCommand::ApiList { req_id, path: PathBuf::from(path) });
+            }
+            ApiRequest::DownloadFile { target, path, reply } => {
+                let Some(index) = self.connected_tab_for(&target) else {
+                    Self::api_err(reply, format!("no connected session for '{target}' — POST /sessions first"));
+                    return;
+                };
+                let req_id = self.next_api_req;
+                self.next_api_req += 1;
+                self.api_pending.insert(
+                    req_id,
+                    ApiWait::Download {
+                        reply,
+                        deadline: std::time::Instant::now() + Duration::from_secs(70),
+                    },
+                );
+                self.tabs[index]
+                    .session
+                    .as_ref()
+                    .expect("shell tab has a session")
+                    .send(SessionCommand::ApiDownload { req_id, remote: path });
+            }
+            ApiRequest::UploadFile { target, path, content, reply } => {
+                let Some(index) = self.connected_tab_for(&target) else {
+                    Self::api_err(reply, format!("no connected session for '{target}' — POST /sessions first"));
+                    return;
+                };
+                // Stage the content into a temp file; the backend streams it.
+                let temp_dir = std::env::temp_dir().join("aetherium").join("api-upload");
+                let staged = temp_dir.join(format!("{}-{}", uuid::Uuid::new_v4(), path.replace('/', "_")));
+                let write = std::fs::create_dir_all(&temp_dir)
+                    .and_then(|()| std::fs::write(&staged, &content));
+                if let Err(err) = write {
+                    Self::api_err(reply, format!("staging upload: {err}"));
+                    return;
+                }
+                let req_id = self.next_api_req;
+                self.next_api_req += 1;
+                self.api_pending.insert(
+                    req_id,
+                    ApiWait::Upload {
+                        reply,
+                        deadline: std::time::Instant::now() + Duration::from_secs(70),
+                    },
+                );
+                self.tabs[index]
+                    .session
+                    .as_ref()
+                    .expect("shell tab has a session")
+                    .send(SessionCommand::ApiUpload {
+                        req_id,
+                        local: staged,
+                        remote: path,
+                    });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Retry/expiry pass for REST API work, called from the event loop.
+    fn api_tick(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let expired: Vec<u64> = self
+            .api_pending
+            .iter()
+            .filter(|(_, wait)| wait.deadline() <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(wait) = self.api_pending.remove(&id) {
+                wait.fail("request timed out");
+            }
+        }
+        if let Some(pending) = &self.api_pending_log {
+            if now >= pending.deadline {
+                let pending = self.api_pending_log.take().expect("checked above");
+                Self::api_err(pending.reply, format!("session for '{}' did not connect in time", pending.target));
+            } else if let Some(index) = self.connected_tab_for(&pending.target) {
+                let pending = self.api_pending_log.take().expect("checked above");
+                self.activate_tab(index, cx);
+                self.open_log_tab(pending.path, cx);
+                Self::api_ok(pending.reply, serde_json::json!({"ok": true}));
+            }
+        }
     }
 
     /// Activate a tab, focusing its terminal on the next frame.
@@ -2352,7 +2739,6 @@ impl RootView {
                 Scroll::PageDown => -10,
                 Scroll::Top => i32::MAX,
                 Scroll::Bottom => 0,
-                _ => 0,
             };
             let next = if delta == i32::MAX {
                 i32::MAX
@@ -5219,6 +5605,8 @@ fn render_tree_rows(
         let tree_drop_path = path.clone();
         let temp_download_cache = temp_download_cache.clone();
         let weak_root = cx.weak_entity();
+        #[cfg(not(windows))]
+        let _ = &weak_root;
 
         // Renaming this entry: swap its row for the inline editor.
         if let Some(ed) = editor.filter(|ed| ed.target.as_ref() == Some(&node.entry.path)) {
@@ -5272,6 +5660,8 @@ fn render_tree_rows(
                         let session_id = session_id;
                         let cache_for_download = temp_download_cache.clone();
                         move |drag, click_offset, window, cx| {
+                            #[cfg(not(windows))]
+                            let _ = &window;
                             // Kick off a temp download in the background so
                             // the file is (hopefully) ready by the time the
                             // drag leaves the window. An already-staged copy

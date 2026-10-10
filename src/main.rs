@@ -8,6 +8,7 @@
 // is unavailable there, so the logger mirrors to a file (see below).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod api;
 mod assets;
 mod crypto;
 mod history;
@@ -100,6 +101,18 @@ fn main() {
             origin: point(px(60.), px(60.)),
             size: size(px(1200.), px(760.)),
         };
+        // Local REST API for AI/script control of the running UI. The advert
+        // goes to the log (stderr on macOS/Linux, <config>/aetherium.log on
+        // Windows) and the status bar.
+        let (api_tx, api_rx) = std::sync::mpsc::channel();
+        let api_info = api::start(api_tx);
+        if let Some(info) = api_info.as_ref() {
+            log::info!(
+                "REST API listening on {} (bearer token: {})",
+                api::url(info),
+                info.token_path.display()
+            );
+        }
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -110,7 +123,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(RootView::new),
+            move |_, cx| cx.new(|cx| RootView::new(cx, api_rx, api_info)),
         )
         .expect("open main window");
         cx.activate(true);

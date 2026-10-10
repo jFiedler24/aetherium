@@ -68,6 +68,17 @@ pub enum Command {
     TailFile { tail_id: u64, terminal: TerminalModel, path: String },
     /// Stop the tail with the given id (tab closed).
     CloseTail { tail_id: u64 },
+    /// Run a command to completion on a dedicated exec channel and report
+    /// back via `Event::ApiExecDone`. Used by the local REST API; terminal
+    /// and SFTP traffic of the owning tab keep flowing meanwhile.
+    ApiExec { req_id: u64, command: String },
+    /// List a remote directory for the REST API.
+    ApiList { req_id: u64, path: PathBuf },
+    /// Upload a local file to an exact remote path (replacing any existing
+    /// file) for the REST API.
+    ApiUpload { req_id: u64, local: PathBuf, remote: String },
+    /// Download a remote file to a temp path for the REST API.
+    ApiDownload { req_id: u64, remote: String },
     Disconnect,
 }
 
@@ -113,6 +124,27 @@ pub enum Event {
     TailEnded { tab_id: u64 },
     /// The `tail -f` could not be started for the given tab id.
     TailError { tab_id: u64, message: String },
+    /// REST API: a command finished. `exit_status` is the remote exit code
+    /// when the server reported one.
+    ApiExecDone {
+        req_id: u64,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_status: Option<u32>,
+    },
+    /// REST API: a directory listing finished.
+    ApiListDone {
+        req_id: u64,
+        result: Result<Vec<FileEntry>, String>,
+    },
+    /// REST API: an upload finished.
+    ApiUploadDone { req_id: u64, result: Result<u64, String> },
+    /// REST API: a download finished; the payload is the local temp path and
+    /// the file size.
+    ApiDownloadDone {
+        req_id: u64,
+        result: Result<(PathBuf, u64), String>,
+    },
 }
 
 /// One entry of a remote directory listing.
@@ -475,6 +507,109 @@ async fn command_loop(
                         // Dropping the sender resolves the receiver in the
                         // reader task, which then drops the channel.
                         tails.remove(&tail_id);
+                    }
+                    Some(Command::ApiExec { req_id, command }) => {
+                        // A dedicated exec channel, like tail uses; the reply
+                        // carries the collected stdout/stderr.
+                        match handle.channel_open_session().await {
+                            Ok(mut channel) => {
+                                let started = channel
+                                    .exec(true, command.clone())
+                                    .await
+                                    .map_err(|err| format!("{err}"));
+                                if let Err(message) = started {
+                                    let _ = event_tx.send(Event::ApiExecDone {
+                                        req_id,
+                                        stdout: Vec::new(),
+                                        stderr: message.into_bytes(),
+                                        exit_status: None,
+                                    });
+                                } else {
+                                    let event_tx = event_tx.clone();
+                                    tokio::spawn(async move {
+                                        let mut stdout = Vec::new();
+                                        let mut stderr = Vec::new();
+                                        let mut exit_status = None;
+                                        loop {
+                                            match channel.wait().await {
+                                                Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+                                                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                                    stderr.extend_from_slice(&data)
+                                                }
+                                                // Eof arrives before the
+                                                // exit-status record; only
+                                                // Close (or the channel
+                                                // dropping) ends the read.
+                                                Some(ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
+                                                Some(ChannelMsg::Close) | None => break,
+                                                Some(_) => {}
+                                            }
+                                        }
+                                        let _ = event_tx.send(Event::ApiExecDone {
+                                            req_id,
+                                            stdout,
+                                            stderr,
+                                            exit_status,
+                                        });
+                                    });
+                                }
+                            }
+                            Err(err) => {
+                                let _ = event_tx.send(Event::ApiExecDone {
+                                    req_id,
+                                    stdout: Vec::new(),
+                                    stderr: format!("opening channel: {err}").into_bytes(),
+                                    exit_status: None,
+                                });
+                            }
+                        }
+                    }
+                    Some(Command::ApiList { req_id, path }) => {
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = sftp
+                                .read_dir(path.to_string_lossy().into_owned())
+                                .await
+                                .map(|read_dir| {
+                                    read_dir
+                                        .map(|entry| {
+                                            let metadata = entry.metadata();
+                                            FileEntry {
+                                                name: entry.file_name(),
+                                                path: PathBuf::from(entry.path()),
+                                                is_dir: entry.file_type().is_dir(),
+                                                size: metadata.len(),
+                                                modified: metadata
+                                                    .modified()
+                                                    .ok()
+                                                    .and_then(|t| {
+                                                        t.duration_since(std::time::UNIX_EPOCH).ok()
+                                                    })
+                                                    .map(|d| d.as_secs()),
+                                            }
+                                        })
+                                        .collect::<Vec<FileEntry>>()
+                                })
+                                .map_err(|err| format!("listing {}: {err}", path.display()));
+                            let _ = event_tx.send(Event::ApiListDone { req_id, result });
+                        });
+                    }
+                    Some(Command::ApiUpload { req_id, local, remote }) => {
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = api_upload(&sftp, &local, &remote).await;
+                            let _ = event_tx.send(Event::ApiUploadDone { req_id, result });
+                        });
+                    }
+                    Some(Command::ApiDownload { req_id, remote }) => {
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = api_download(&sftp, &remote).await;
+                            let _ = event_tx.send(Event::ApiDownloadDone { req_id, result });
+                        });
                     }
                     Some(Command::ListDir { session_id, path }) => {
                         // read_dir can be slow on high-latency links; run it
@@ -1071,6 +1206,85 @@ async fn download_to_temp(
             )));
         }
     }
+}
+
+/// Upload one local file to an exact remote path for the REST API,
+/// replacing any existing file. Returns the byte count.
+async fn api_upload(
+    sftp: &russh_sftp::client::SftpSession,
+    local: &std::path::Path,
+    remote: &str,
+) -> Result<u64, String> {
+    use std::io::Read as _;
+    let mut local_file =
+        std::fs::File::open(local).map_err(|err| format!("opening {}: {err}", local.display()))?;
+    let mut remote_file = sftp
+        .create(remote.to_string())
+        .await
+        .map_err(|err| format!("creating remote {remote}: {err}"))?;
+    let mut written = 0u64;
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    loop {
+        let read = local_file
+            .read(&mut buffer)
+            .map_err(|err| format!("reading {}: {err}", local.display()))?;
+        if read == 0 {
+            break;
+        }
+        remote_file
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|err| format!("writing remote {remote}: {err}"))?;
+        written += read as u64;
+    }
+    remote_file
+        .close()
+        .await
+        .map_err(|err| format!("closing remote {remote}: {err}"))?;
+    Ok(written)
+}
+
+/// Download a remote file to a fresh temp path for the REST API. Returns the
+/// local path and the byte count.
+async fn api_download(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+) -> Result<(PathBuf, u64), String> {
+    let name = std::path::Path::new(remote)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    let temp_dir = std::env::temp_dir().join("aetherium").join("api");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|err| format!("creating {}: {err}", temp_dir.display()))?;
+    let local = temp_dir.join(format!("{}-{}", Uuid::new_v4(), name));
+    let mut local_file = std::fs::File::create(&local)
+        .map_err(|err| format!("creating {}: {err}", local.display()))?;
+    let mut remote_file = sftp
+        .open(remote.to_string())
+        .await
+        .map_err(|err| format!("opening remote {remote}: {err}"))?;
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    loop {
+        let read = remote_file
+            .read(&mut buffer)
+            .await
+            .map_err(|err| format!("reading remote {remote}: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        use std::io::Write as _;
+        local_file
+            .write_all(&buffer[..read])
+            .map_err(|err| format!("writing {}: {err}", local.display()))?;
+        size += read as u64;
+    }
+    remote_file
+        .close()
+        .await
+        .map_err(|err| format!("closing remote {remote}: {err}"))?;
+    Ok((local, size))
 }
 
 /// Delete a remote entry. Directories go recursively (children first)
