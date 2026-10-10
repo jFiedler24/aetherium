@@ -34,10 +34,11 @@ use windows::Win32::UI::Shell::{
     DROPFILES, DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, PostMessageW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_TIMER,
+    CallNextHookEx, GetClassNameW, GetCursorPos, GetWindowThreadProcessId, PostMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_GETMESSAGE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, MSG,
 };
 use windows::core::{HRESULT, Interface, Ref, implement};
 
@@ -291,6 +292,31 @@ impl IDropSource_Impl for FileDrag_Impl {
 /// Subclass id for the input eater installed while an OLE drag runs.
 const DRAG_SUBCLASS_ID: usize = 0xA37E;
 
+/// Set while an outgoing drag runs: the hook below nulls OLE's apartment
+/// marshalling messages so they can't re-enter gpui mid-borrow.
+static DRAG_OUT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// OLE marshals IDropTarget calls into gpui's STA via SendMessage to the
+/// hidden "OleMainThreadWndClass" window. While our drag callback holds
+/// gpui's borrow, dispatching that would panic (RefCell already borrowed),
+/// so the hook nulls the message — the RPC side gets a harmless error and
+/// the drop effect over our own window becomes NONE, which is right
+/// anyway mid-drag-out.
+unsafe extern "system" fn com_shield_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && DRAG_OUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        let msg = unsafe { &mut *(lparam.0 as *mut MSG) };
+        if !msg.hwnd.0.is_null() {
+            let mut class = [0u16; 32];
+            let len = unsafe { GetClassNameW(msg.hwnd, &mut class) };
+            if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "OleMainThreadWndClass" {
+                msg.message = WM_NULL;
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
 /// Messages that would re-enter gpui's dispatch (and its held RefCell
 /// borrows) while `DoDragDrop` pumps its nested loop. OLE tracks the
 /// physical mouse itself, so gpui must not see input until the drag ends;
@@ -355,8 +381,12 @@ pub fn begin_file_drag(app_hwnd: isize, wait_path: Arc<dyn Fn() -> Option<PathBu
         return;
     };
     let hwnd = HWND(app_hwnd as *mut _);
+    let mut hook = None;
     if app_hwnd != 0 {
+        DRAG_OUT_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
+            let thread_id = GetWindowThreadProcessId(hwnd, None);
+            hook = SetWindowsHookExW(WH_GETMESSAGE, Some(com_shield_hook), None, thread_id).ok();
             let _ = SetWindowSubclass(
                 hwnd,
                 Some(input_eater_subclass),
@@ -371,6 +401,10 @@ pub fn begin_file_drag(app_hwnd: isize, wait_path: Arc<dyn Fn() -> Option<PathBu
         "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
         effect
     );
+    DRAG_OUT_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some(hook) = hook {
+        unsafe { let _ = UnhookWindowsHookEx(hook); }
+    }
     if app_hwnd != 0 {
         unsafe {
             let _ = RemoveWindowSubclass(hwnd, Some(input_eater_subclass), DRAG_SUBCLASS_ID);
