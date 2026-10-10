@@ -1433,13 +1433,18 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
     let result = match &profile.auth {
         AuthMethod::Password { password } => {
             // Prefer silent key-based auth (agent, then a default key file);
-            // only send the password if the server still needs it.
+            // then "none" auth (some devices, e.g. BeagleBone over USB,
+            // accept it); only send the password if the server still
+            // needs it — mirroring OpenSSH's order.
             match try_silent_auth(handle, &profile.username).await {
                 Some(result) => result,
-                None => handle
-                    .authenticate_password(profile.username.clone(), password.clone())
-                    .await
-                    .context("password authentication")?,
+                None => match try_none_auth(handle, &profile.username).await {
+                    Some(result) => result,
+                    None => handle
+                        .authenticate_password(profile.username.clone(), password.clone())
+                        .await
+                        .context("password authentication")?,
+                },
             }
         }
         AuthMethod::KeyFile { path, passphrase } => {
@@ -1467,11 +1472,9 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
                 .context("publickey authentication")?
         }
         AuthMethod::Agent => {
-            // The agent is preferred, but like OpenSSH we fall back to the
-            // default key files when the agent is unreachable or holds no
-            // accepted identity — on Windows this is the common case, since
-            // `ssh` CLI works via default keys while its agent service is
-            // stopped.
+            // The agent is preferred, but like OpenSSH we fall back: agent
+            // (incl. Pageant on Windows), then the default key files, then
+            // "none" auth — some devices accept it.
             match authenticate_with_agent(handle, &profile.username).await {
                 Ok(result @ AuthResult::Success) => result,
                 agent_result => {
@@ -1480,11 +1483,14 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
                     );
                     match try_default_key_auth(handle, &profile.username).await {
                         Some(result) => result,
-                        None => {
-                            return Err(anyhow!(
-                                "ssh-agent has no accepted identity and no default key worked"
-                            ))
-                        }
+                        None => match try_none_auth(handle, &profile.username).await {
+                            Some(result) => result,
+                            None => {
+                                return Err(anyhow!(
+                                    "no agent identity, default key, or none-auth worked"
+                                ))
+                            }
+                        },
                     }
                 }
             }
@@ -1594,31 +1600,79 @@ async fn try_default_key_auth(
     }
 }
 
-/// Connect to the platform's ssh agent, boxing the stream so the rest of
-/// the agent code is platform-independent.
-#[cfg(unix)]
-// [impl->req~agent-auth~1]
-async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<AgentBox>> {
-    use russh::keys::agent::client::AgentClient;
-    Ok(AgentClient::connect_env().await?.dynamic())
+/// Try SSH "none" authentication — the implicit first method OpenSSH
+/// itself attempts. Gadget devices (BeagleBone over USB, some embedded
+/// boards) accept it for root; servers that don't simply fail fast.
+// [impl->req~none-auth-fallback~1]
+async fn try_none_auth(
+    handle: &mut Handle<ClientHandler>,
+    username: &str,
+) -> Option<AuthResult> {
+    match handle.authenticate_none(username.to_owned()).await {
+        Ok(result @ AuthResult::Success) => {
+            log::info!("auth: server accepted 'none' authentication");
+            Some(result)
+        }
+        Ok(_) => None,
+        Err(err) => {
+            log::info!("auth: 'none' auth not accepted: {err}");
+            None
+        }
+    }
 }
 
-/// Windows: try the OpenSSH service's agent pipe first (this is what
-/// `ssh.exe` talks to), then fall back to PuTTY's Pageant.
-#[cfg(windows)]
+/// Connect to an ssh agent and list its identities, boxed so the rest of
+/// the agent code is platform-independent. On Windows the OpenSSH agent
+/// pipe can connect successfully and still drop the conversation ("early
+/// eof" when the service is in a bad state) — a broken pipe therefore
+/// falls back to Pageant before giving up, since keys often live there.
 // [impl->req~agent-auth~1]
-async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<AgentBox>> {
+async fn connect_and_list_identities(
+) -> Result<(
+    russh::keys::agent::client::AgentClient<AgentBox>,
+    Vec<russh::keys::agent::AgentIdentity>,
+)> {
     use russh::keys::agent::client::AgentClient;
-    let openssh_pipe = r"\\.\pipe\openssh-ssh-agent";
-    match AgentClient::connect_named_pipe(openssh_pipe).await {
-        Ok(client) => {
-            log::info!("auth: connected to the OpenSSH agent pipe");
-            Ok(client.dynamic())
+
+    #[cfg(unix)]
+    {
+        let mut agent = AgentClient::connect_env()
+            .await
+            .context("connecting to ssh-agent (SSH_AUTH_SOCK)")?;
+        let identities = agent
+            .request_identities()
+            .await
+            .context("listing ssh-agent identities")?;
+        return Ok((agent.dynamic(), identities));
+    }
+
+    #[cfg(windows)]
+    {
+        let openssh_pipe = r"\\.\pipe\openssh-ssh-agent";
+        match AgentClient::connect_named_pipe(openssh_pipe).await {
+            Ok(mut client) => match client.request_identities().await {
+                Ok(identities) => {
+                    log::info!("auth: using the OpenSSH agent pipe");
+                    return Ok((client.dynamic(), identities));
+                }
+                Err(err) => {
+                    log::warn!(
+                        "auth: OpenSSH agent pipe dropped the request ({err}); trying Pageant"
+                    );
+                }
+            },
+            Err(err) => {
+                log::info!("auth: OpenSSH agent pipe unavailable ({err}); trying Pageant");
+            }
         }
-        Err(err) => {
-            log::info!("auth: OpenSSH agent pipe unavailable ({err}); trying Pageant");
-            Ok(AgentClient::connect_pageant().await?.dynamic())
-        }
+        let mut pageant = AgentClient::connect_pageant()
+            .await
+            .context("connecting to Pageant")?;
+        let identities = pageant
+            .request_identities()
+            .await
+            .context("listing Pageant identities")?;
+        Ok((pageant.dynamic(), identities))
     }
 }
 
@@ -1629,15 +1683,8 @@ async fn authenticate_with_agent(
     username: &str,
 ) -> Result<AuthResult> {
     use russh::keys::agent::AgentIdentity;
-    use russh::keys::agent::client::AgentClient;
 
-    let mut agent: AgentClient<AgentBox> = connect_agent()
-        .await
-        .context("connecting to ssh-agent")?;
-    let identities = agent
-        .request_identities()
-        .await
-        .context("listing ssh-agent identities")?;
+    let (mut agent, identities) = connect_and_list_identities().await?;
     let hash = handle.best_supported_rsa_hash().await?.flatten();
 
     // Try each public-key identity in turn; certificates are not supported

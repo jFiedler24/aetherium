@@ -88,4 +88,4 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "aetherium $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" $(find dist -maxdepth 1 -type f) --title "aetherium $GITHUB_REF_NAME" --generate-notes

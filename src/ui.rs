@@ -5837,6 +5837,13 @@ fn render_tree_rows(
         let is_dir = node.entry.is_dir;
         let is_selected = selected == Some(&node.entry.path);
         let highlighted = is_dir && drag_highlight == Some(&node.entry.path);
+        // Loaded directories with no children disclose nothing: no chevron.
+        // Unloaded ones keep theirs (contents unknown — may expand).
+        let expandable = node
+            .children
+            .as_ref()
+            .map(|children| !children.is_empty())
+            .unwrap_or(true);
         let row_path = path.clone();
         let drag_move_path = path.clone();
         let external_drop_path = path.clone();
@@ -6096,9 +6103,12 @@ fn render_tree_rows(
                     )
                 })
                 .child(
-                    // Leading glyph: disclosure chevron for directories, a
-                    // file icon for files (Zed project-panel layout).
-                    if is_dir {
+                    // Leading glyph: disclosure chevron for directories,
+                    // a file icon for files (Zed project-panel layout).
+                    // Directories that loaded with no children get no
+                    // chevron — nothing to disclose. Unloaded directories
+                    // keep theirs: the contents are still unknown.
+                    if is_dir && expandable {
                         svg()
                             .path(assets::ICON_CHEVRON_RIGHT)
                             .w(px(14.))
@@ -6110,6 +6120,8 @@ fn render_tree_rows(
                                 )))
                             })
                             .into_any_element()
+                    } else if is_dir {
+                        div().w(px(14.)).h(px(14.)).into_any_element()
                     } else {
                         svg()
                             .path(assets::ICON_FILE)

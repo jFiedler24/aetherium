@@ -63,6 +63,16 @@ directory before using a stored password.
 
 **Needs:** impl
 
+## req~none-auth-fallback~1
+
+When neither agent nor default keys authenticate, the app shall attempt
+SSH "none" authentication (the implicit first method of OpenSSH),
+which gadget devices such as BeagleBone boards accept for root.
+
+**Covers:** feat~silent-key-auth~1
+
+**Needs:** impl
+
 ## feat~windows-parity~1
 
 On Windows the app shall behave like the macOS build: GUI subsystem
