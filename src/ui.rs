@@ -48,6 +48,7 @@ enum ConnState {
 }
 
 /// One node of the lazily-loaded remote file tree.
+#[derive(Clone)]
 struct TreeNode {
     entry: FileEntry,
     expanded: bool,
@@ -263,6 +264,8 @@ struct SessionTab {
     focus_handle: FocusHandle,
     tree: Vec<TreeNode>,
     root_path: Option<PathBuf>,
+    /// Parent directory a `..` navigation is waiting a listing for.
+    pending_tree_root: Option<PathBuf>,
     /// Incremented on each connect; stale dir listings from previous
     /// sessions are dropped when their tag mismatches.
     session_id: u64,
@@ -996,6 +999,37 @@ impl RootView {
                         .cmp(&a.entry.is_dir)
                         .then_with(|| a.entry.name.to_lowercase().cmp(&b.entry.name.to_lowercase()))
                 });
+                // A `..` navigation: the listed directory becomes the new
+                // tree root, keeping the previous root visible (expanded)
+                // inside it.
+                if tab.pending_tree_root.take().as_deref() == Some(path.as_path()) {
+                    let parent_entry = FileEntry {
+                        name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string()),
+                        path: path.clone(),
+                        is_dir: true,
+                        size: 0,
+                        modified: None,
+                    };
+                    if let Some(old_root) = tab.tree.first().cloned() {
+                        if let Some(slot) = entries
+                            .iter_mut()
+                            .find(|node| node.entry.path == old_root.entry.path)
+                        {
+                            *slot = old_root;
+                        }
+                    }
+                    tab.tree = vec![TreeNode {
+                        entry: parent_entry,
+                        expanded: true,
+                        loading: false,
+                        children: Some(entries),
+                    }];
+                    tab.root_path = Some(path.clone());
+                    return;
+                }
                 if let Some(node) = find_node(&mut tab.tree, &path) {
                     node.children = Some(entries);
                     node.loading = false;
@@ -1358,6 +1392,7 @@ impl RootView {
             focus_handle: cx.focus_handle(),
             tree: Vec::new(),
             root_path: None,
+            pending_tree_root: None,
             session_id: 1,
             terminal_focus_pending: false,
             geometry: Arc::new(Mutex::new(None)),
@@ -1422,6 +1457,7 @@ impl RootView {
             focus_handle: cx.focus_handle(),
             tree: Vec::new(),
             root_path: None,
+            pending_tree_root: None,
             session_id: 0,
             terminal_focus_pending: true,
             geometry: Arc::new(Mutex::new(None)),
@@ -5435,8 +5471,85 @@ fn log_toolbar_button(
             .into_any_element()
     }
 
+    /// Re-root the file tree at the current root's parent (".."
+    /// navigation, MobaXterm style). The listing handler swaps the root
+    /// when the parent's entries arrive.
+    // [impl->req~tree-parent-navigation~1]
+    fn navigate_tree_up(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if tab.state != ConnState::Connected {
+            return;
+        }
+        let Some(root) = tab.root_path.clone() else {
+            return;
+        };
+        let Some(parent) = root.parent().map(PathBuf::from) else {
+            return;
+        };
+        if parent == root {
+            return; // filesystem root has no "up"
+        }
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
+        let session_id = tab.session_id;
+        tab.pending_tree_root = Some(parent.clone());
+        session.list_dir(session_id, parent);
+        cx.notify();
+    }
+
+    /// Render an "up one level" row at the top of the file tree when the
+    /// current root has a parent directory.
+    fn tree_up_row(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let can_go_up = self.active_tab().is_some_and(|tab| {
+            let Some(root) = tab.root_path.as_ref() else {
+                return false;
+            };
+            root.parent().is_some_and(|parent| parent != root.as_path())
+        });
+        if !can_go_up {
+            return None;
+        }
+        Some(
+            div()
+                .id("tree-up")
+                .h(px(24.))
+                .ml(px(4.))
+                .mr(px(4.))
+                .px(px(6.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .tooltip(tip("Up one level"))
+                .hover(|row| row.bg(theme::hover()))
+                .child(
+                    svg()
+                        .path(assets::ICON_ARROW_UP)
+                        .w(px(14.))
+                        .h(px(14.))
+                        .text_color(theme::text_dim()),
+                )
+                .child(
+                    div()
+                        .text_color(theme::text_dim())
+                        .child(".."),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.navigate_tree_up(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_file_tree(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut rows = Vec::new();
+        // Built before the immutable borrows below (it needs &mut self).
+        let up_row = self.tree_up_row(cx);
         let empty: Vec<TreeNode> = Vec::new();
         let (tree, tree_selection, connected, tree_focus) = match self.active_tab() {
             Some(tab) => (
@@ -5462,6 +5575,9 @@ fn log_toolbar_button(
                     .into_any_element(),
             );
         } else {
+            if let Some(up_row) = up_row {
+                rows.push(up_row);
+            }
             let tab = self.active_tab();
             render_tree_rows(
                 tree,

@@ -19,6 +19,16 @@ terminal session.
 
 **Needs:** impl
 
+## req~tree-parent-navigation~1
+
+The file tree shall offer an "up one level" (`..`) row whenever the
+current root has a parent directory; activating it re-roots the tree at
+the parent, keeping the previous root visible and expanded inside it.
+
+**Covers:** feat~file-tree~1
+
+**Needs:** impl
+
 ## feat~transfer-progress~1
 
 Uploads and downloads shall show a graphical progress bar with size,
