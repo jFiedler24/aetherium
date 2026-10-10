@@ -16,12 +16,13 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_TYMED, E_NOTIMPL,
-    E_OUTOFMEMORY, LPARAM, OLE_E_ADVISENOTSUPPORTED, POINT, S_OK, STG_E_MEDIUMFULL, WPARAM,
+    E_OUTOFMEMORY, LPARAM, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_MEDIUMFULL,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
     CoUninitialize, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
-    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
@@ -39,6 +40,8 @@ use windows::core::{HRESULT, Interface, Ref, implement};
 
 /// Not defined by the `windows` crate (data format not supported).
 const DATA_E_FORMATETC: HRESULT = HRESULT(0x80040064_u32 as i32);
+/// The input and output formats are identical (canonical-format query).
+const DATA_S_SAMEFORMATETC: HRESULT = HRESULT(0x0004_0130);
 
 /// One COM object implementing both the data object (one CF_HDROP whose path
 /// resolves when the target asks) and the drop source.
@@ -54,7 +57,81 @@ const STAGING_DEADLINE: Duration = Duration::from_secs(15);
 fn matches_hdrop(format: &FORMATETC) -> bool {
     format.cfFormat == CF_HDROP.0
         && format.dwAspect == DVASPECT_CONTENT.0
-        && format.tymed == TYMED_HGLOBAL.0 as u32
+        && (format.lindex == -1 || format.lindex == 0)
+        && format.tymed & (TYMED_HGLOBAL.0 as u32) != 0
+}
+
+/// The one format we advertise: CF_HDROP as a moveable global.
+fn hdrop_formatetc() -> FORMATETC {
+    FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+/// Enumerator over the data object's formats. Drop targets (Explorer
+/// included) typically learn what a drag offers through `EnumFormatEtc`;
+/// failing it — the old behavior — makes targets reject the drag outright,
+/// which surfaced as "the drop never leaves the window".
+#[implement(IEnumFORMATETC)]
+struct FormatEnumerator {
+    formats: Vec<FORMATETC>,
+    index: std::sync::Mutex<usize>,
+}
+
+impl IEnumFORMATETC_Impl for FormatEnumerator_Impl {
+    fn Next(
+        &self,
+        celt: u32,
+        rgelt: *mut FORMATETC,
+        pcelt_fetched: *mut u32,
+    ) -> HRESULT {
+        let mut index = self.index.lock().unwrap();
+        let available = self.formats.len().saturating_sub(*index);
+        let count = (celt as usize).min(available);
+        if count > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.formats.as_ptr().add(*index), rgelt, count);
+            }
+            *index += count;
+        }
+        if !pcelt_fetched.is_null() {
+            unsafe { *pcelt_fetched = count as u32 };
+        }
+        if count == celt as usize {
+            S_OK
+        } else {
+            S_FALSE
+        }
+    }
+
+    fn Skip(&self, celt: u32) -> windows::core::Result<()> {
+        let mut index = self.index.lock().unwrap();
+        let next = *index + celt as usize;
+        if next <= self.formats.len() {
+            *index = next;
+            Ok(())
+        } else {
+            *index = self.formats.len();
+            Err(windows::core::Error::from(S_FALSE))
+        }
+    }
+
+    fn Reset(&self) -> windows::core::Result<()> {
+        *self.index.lock().unwrap() = 0;
+        Ok(())
+    }
+
+    fn Clone(&self) -> windows::core::Result<IEnumFORMATETC> {
+        let enumerator = FormatEnumerator {
+            formats: self.formats.clone(),
+            index: std::sync::Mutex::new(*self.index.lock().unwrap()),
+        };
+        Ok(enumerator.into())
+    }
 }
 
 /// Build a CF_HDROP STGMEDIUM holding `path`: a `DROPFILES` header followed
@@ -147,7 +224,7 @@ impl IDataObject_Impl for FileDrag_Impl {
         unsafe {
             (*pformatetcout).ptd = std::ptr::null_mut();
         }
-        E_NOTIMPL
+        DATA_S_SAMEFORMATETC
     }
 
     fn SetData(
@@ -159,8 +236,15 @@ impl IDataObject_Impl for FileDrag_Impl {
         Err(E_NOTIMPL.into())
     }
 
-    fn EnumFormatEtc(&self, _dwdirection: u32) -> windows::core::Result<IEnumFORMATETC> {
-        Err(E_NOTIMPL.into())
+    fn EnumFormatEtc(&self, dwdirection: u32) -> windows::core::Result<IEnumFORMATETC> {
+        // DATADIR_GET (1) is what drag targets ask for; DATADIR_SET gets an
+        // empty enumerator instead of an error.
+        let formats = if dwdirection == 1 { vec![hdrop_formatetc()] } else { Vec::new() };
+        Ok(FormatEnumerator {
+            formats,
+            index: std::sync::Mutex::new(0),
+        }
+        .into())
     }
 
     fn DAdvise(
@@ -240,7 +324,7 @@ pub fn begin_file_drag(
             let _capture = SetCapture(local);
             if let Err(err) = OleInitialize(None) {
                 log::error!("drag-out: OleInitialize failed: {err}");
-                ReleaseCapture();
+                let _ = ReleaseCapture();
                 let _ = DestroyWindow(local);
                 return;
             }
@@ -250,7 +334,7 @@ pub fn begin_file_drag(
             let Ok(source) = data.cast::<IDropSource>() else {
                 log::error!("drag-out: could not get IDropSource from the data object");
                 CoUninitialize();
-                ReleaseCapture();
+                let _ = ReleaseCapture();
                 let _ = DestroyWindow(local);
                 return;
             };
@@ -261,7 +345,7 @@ pub fn begin_file_drag(
                 effect
             );
             CoUninitialize();
-            ReleaseCapture();
+            let _ = ReleaseCapture();
             let _ = DestroyWindow(local);
         }
         release_ghost_drag(hwnd);
