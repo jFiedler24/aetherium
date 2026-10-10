@@ -4,6 +4,10 @@
 //! The SVG icon set in `aetherium_icons_dark_v2/` is embedded via
 //! [`assets::EmbeddedAssets`].
 
+// GUI-subsystem binary on Windows: no console window next to the UI. stderr
+// is unavailable there, so the logger mirrors to a file (see below).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod assets;
 mod crypto;
 mod history;
@@ -15,6 +19,8 @@ mod terminal_model;
 mod text_field;
 mod theme;
 mod ui;
+#[cfg(windows)]
+mod windows_drag;
 
 use gpui::{
     App, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
@@ -23,20 +29,35 @@ use gpui::{
 use crate::ui::{CancelDelete, ConfirmDelete, DeleteEntry, RenameEntry, RootView};
 
 /// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
-/// errors) are visible when running the binary directly.
-struct StderrLogger;
+/// errors) are visible when running the binary directly. On Windows the
+/// binary is a GUI app without a console, so there the lines are appended to
+/// `<config dir>/aetherium.log` instead.
+struct AppLogger;
 
-impl log::Log for StderrLogger {
+impl log::Log for AppLogger {
     fn enabled(&self, _: &log::Metadata) -> bool {
         true
     }
     fn log(&self, record: &log::Record) {
-        eprintln!("[{}] {}", record.level(), record.args());
+        let line = format!("[{}] {}", record.level(), record.args());
+        #[cfg(windows)]
+        {
+            let path = crate::crypto::config_dir().join("aetherium.log");
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+        eprintln!("{line}");
     }
     fn flush(&self) {}
 }
 
-static LOGGER: StderrLogger = StderrLogger;
+static LOGGER: AppLogger = AppLogger;
 
 fn main() {
     let _ = log::set_logger(&LOGGER);

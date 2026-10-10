@@ -185,6 +185,7 @@ dependencies = [
  "log",
  "parking_lot",
  "rand 0.8.8",
+ "raw-window-handle",
  "regex",
  "russh",
  "russh-sftp",
@@ -193,6 +194,8 @@ dependencies = [
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "uuid",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "winresource",
 ]
 

@@ -568,6 +568,10 @@ pub struct RootView {
     tree_drag_target: Option<TreeDragTarget>,
     /// Entry being dragged in the file tree (set when a drag starts moving).
     tree_dragging: Option<DraggedEntry>,
+    /// Windows-only: our own OLE drag owns the pointer, so gpui's internal
+    /// file-tree drop/hover handling must stand down (set when the OLE drag
+    /// starts, cleared on the next real mouse-down).
+    ole_drag_active: bool,
     /// Which sidebar view is shown.
     sidebar_tab: SidebarTab,
     /// Current width of the sidebar, dragged via the splitter.
@@ -632,6 +636,7 @@ impl RootView {
             tree_editor: None,
             tree_drag_target: None,
             tree_dragging: None,
+            ole_drag_active: false,
             sidebar_tab: SidebarTab::Sessions,
             sidebar_width: px(260.),
             show_file_details: false,
@@ -3360,6 +3365,8 @@ impl RootView {
                 }
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                // A real press ends any OLE drag's stand-down period.
+                this.ole_drag_active = false;
                 if let Some(tab) = this.active_tab_mut() {
                     window.focus(&tab.focus_handle, cx);
                     let filtering = tab
@@ -4884,10 +4891,16 @@ fn log_toolbar_button(
                 }
             }))
             .on_drop(cx.listener(|this, dragged: &DraggedEntry, _, cx| {
+                if this.ole_drag_active {
+                    return;
+                }
                 this.drop_tree_entry(dragged.clone(), TreeDragTarget::Background, cx);
             }))
             .on_drag_move::<DraggedEntry>(cx.listener(
                 |this, event: &DragMoveEvent<DraggedEntry>, _, cx| {
+                    if this.ole_drag_active {
+                        return;
+                    }
                     let is_current = matches!(this.tree_drag_target, Some(TreeDragTarget::Background));
                     if event.bounds.contains(&event.event.position) {
                         if !is_current {
@@ -5205,6 +5218,7 @@ fn render_tree_rows(
         let external_drop_path = path.clone();
         let tree_drop_path = path.clone();
         let temp_download_cache = temp_download_cache.clone();
+        let weak_root = cx.weak_entity();
 
         // Renaming this entry: swap its row for the inline editor.
         if let Some(ed) = editor.filter(|ed| ed.target.as_ref() == Some(&node.entry.path)) {
@@ -5257,7 +5271,7 @@ fn render_tree_rows(
                         let session_for_download = session.cloned();
                         let session_id = session_id;
                         let cache_for_download = temp_download_cache.clone();
-                        move |drag, click_offset, _window, cx| {
+                        move |drag, click_offset, window, cx| {
                             // Kick off a temp download in the background so
                             // the file is (hopefully) ready by the time the
                             // drag leaves the window. An already-staged copy
@@ -5276,6 +5290,37 @@ fn render_tree_rows(
                                             remote_for_download.clone(),
                                             cache_for_download.clone(),
                                         );
+                                    }
+                                    #[cfg(windows)]
+                                    {
+                                        // gpui has no outgoing file drags on
+                                        // Windows — run our own OLE drag with
+                                        // the staged path, and tell the
+                                        // internal drop/hover handlers to
+                                        // stand down while it owns the mouse.
+                                        use raw_window_handle::{
+                                            HasWindowHandle as _, RawWindowHandle,
+                                        };
+                                        let hwnd = match window
+                                            .window_handle()
+                                            .map(|handle| handle.as_raw())
+                                        {
+                                            Ok(RawWindowHandle::Win32(handle)) => {
+                                                handle.hwnd.get() as isize
+                                            }
+                                            _ => 0,
+                                        };
+                                        let cache = cache_for_download.clone();
+                                        let weak_root = weak_root.clone();
+                                        crate::windows_drag::begin_file_drag(
+                                            hwnd,
+                                            std::sync::Arc::new(move || {
+                                                cache.lock().get(&key).cloned()
+                                            }),
+                                        );
+                                        let _ = weak_root.update(cx, |this, _cx| {
+                                            this.ole_drag_active = true;
+                                        });
                                     }
                                 }
                             }
@@ -5347,6 +5392,9 @@ fn render_tree_rows(
                 })
                 .on_drag_move::<DraggedEntry>(cx.listener(
                     move |this, event: &DragMoveEvent<DraggedEntry>, window, cx| {
+                        if this.ole_drag_active {
+                            return;
+                        }
                         let is_current = matches!(
                             &this.tree_drag_target,
                             Some(TreeDragTarget::Row { path, .. }) if path == &drag_move_path
@@ -5388,6 +5436,9 @@ fn render_tree_rows(
                     this.upload_dropped_paths(&paths.paths().to_vec(), target, cx);
                 }))
                 .on_drop(cx.listener(move |this, dragged: &DraggedEntry, _, cx| {
+                    if this.ole_drag_active {
+                        return;
+                    }
                     this.drop_tree_entry(
                         dragged.clone(),
                         TreeDragTarget::Row {

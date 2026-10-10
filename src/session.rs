@@ -1246,18 +1246,7 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> 
                 .await
                 .context("publickey authentication")?
         }
-        AuthMethod::Agent => {
-            #[cfg(unix)]
-            {
-                authenticate_with_agent(handle, &profile.username).await?
-            }
-            #[cfg(windows)]
-            {
-                return Err(anyhow!(
-                    "ssh-agent authentication is not supported on Windows yet"
-                ));
-            }
-        }
+        AuthMethod::Agent => authenticate_with_agent(handle, &profile.username).await?,
     };
 
     match result {
@@ -1311,11 +1300,17 @@ fn detect_default_ssh_key() -> Option<PathBuf> {
 /// the caller should fall back to the stored password — so only a definite
 /// `AuthResult::Success` is reported back.
 async fn try_silent_auth(handle: &mut Handle<ClientHandler>, username: &str) -> Option<AuthResult> {
+    // Unix: SSH_AUTH_SOCK tells us an agent is supposed to exist. Windows:
+    // connecting to a missing agent fails fast, so just try it.
     #[cfg(unix)]
     if std::env::var_os("SSH_AUTH_SOCK").is_some() {
         if let Ok(result @ AuthResult::Success) = authenticate_with_agent(handle, username).await {
             return Some(result);
         }
+    }
+    #[cfg(windows)]
+    if let Ok(result @ AuthResult::Success) = authenticate_with_agent(handle, username).await {
+        return Some(result);
     }
     let key_path = detect_default_ssh_key()?;
     let key = russh::keys::load_secret_key(&key_path, None).ok()?;
@@ -1329,7 +1324,28 @@ async fn try_silent_auth(handle: &mut Handle<ClientHandler>, username: &str) -> 
     }
 }
 
+/// Connect to the platform's ssh agent, boxing the stream so the rest of
+/// the agent code is platform-independent.
 #[cfg(unix)]
+async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<AgentBox>> {
+    use russh::keys::agent::client::AgentClient;
+    Ok(AgentClient::connect_env().await?.dynamic())
+}
+
+/// Windows: try the OpenSSH service's agent pipe first (this is what
+/// `ssh.exe` talks to), then fall back to PuTTY's Pageant.
+#[cfg(windows)]
+async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<AgentBox>> {
+    use russh::keys::agent::client::AgentClient;
+    let openssh_pipe = r"\\.\pipe\openssh-ssh-agent";
+    match AgentClient::connect_named_pipe(openssh_pipe).await {
+        Ok(client) => Ok(client.dynamic()),
+        Err(_) => Ok(AgentClient::connect_pageant().await?.dynamic()),
+    }
+}
+
+type AgentBox = Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>;
+
 async fn authenticate_with_agent(
     handle: &mut Handle<ClientHandler>,
     username: &str,
@@ -1337,9 +1353,9 @@ async fn authenticate_with_agent(
     use russh::keys::agent::AgentIdentity;
     use russh::keys::agent::client::AgentClient;
 
-    let mut agent = AgentClient::connect_env()
+    let mut agent: AgentClient<AgentBox> = connect_agent()
         .await
-        .context("connecting to ssh-agent (SSH_AUTH_SOCK)")?;
+        .context("connecting to ssh-agent")?;
     let identities = agent
         .request_identities()
         .await
