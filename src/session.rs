@@ -1565,14 +1565,32 @@ async fn try_default_key_auth(
     username: &str,
 ) -> Option<AuthResult> {
     let key_path = detect_default_ssh_key()?;
-    let key = russh::keys::load_secret_key(&key_path, None).ok()?;
+    log::info!("auth: trying default key {}", key_path.display());
+    let key = match russh::keys::load_secret_key(&key_path, None) {
+        Ok(key) => key,
+        Err(err) => {
+            log::warn!(
+                "auth: cannot load {}: {err} — encrypted keys need a KeyFile \
+                 profile with a passphrase, or 'ssh-add' into the agent",
+                key_path.display()
+            );
+            return None;
+        }
+    };
     let hash = handle.best_supported_rsa_hash().await.ok()?.flatten();
     match handle
         .authenticate_publickey(username.to_owned(), PrivateKeyWithHashAlg::new(Arc::new(key), hash))
         .await
     {
         Ok(result @ AuthResult::Success) => Some(result),
-        _ => None,
+        Ok(_) => {
+            log::info!("auth: server rejected key {}", key_path.display());
+            None
+        }
+        Err(err) => {
+            log::warn!("auth: key auth with {} failed: {err}", key_path.display());
+            None
+        }
     }
 }
 
@@ -1593,8 +1611,14 @@ async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<Agent
     use russh::keys::agent::client::AgentClient;
     let openssh_pipe = r"\\.\pipe\openssh-ssh-agent";
     match AgentClient::connect_named_pipe(openssh_pipe).await {
-        Ok(client) => Ok(client.dynamic()),
-        Err(_) => Ok(AgentClient::connect_pageant().await?.dynamic()),
+        Ok(client) => {
+            log::info!("auth: connected to the OpenSSH agent pipe");
+            Ok(client.dynamic())
+        }
+        Err(err) => {
+            log::info!("auth: OpenSSH agent pipe unavailable ({err}); trying Pageant");
+            Ok(AgentClient::connect_pageant().await?.dynamic())
+        }
     }
 }
 

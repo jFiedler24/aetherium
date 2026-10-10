@@ -197,40 +197,41 @@ impl IDropSource_Impl for FileDrag_Impl {
     }
 }
 
-/// Start an OLE file drag for the given staged path, from a fresh thread so
-/// gpui's own (internal) drag tracking is unaffected. `hwnd` is the app
-/// window used to synthesize the button-up that the OLE loop consumes, so
-/// gpui doesn't think the button stays pressed.
+/// Run an OLE file drag for the given staged path. Must be called on the
+/// thread that owns `hwnd` — the same thread that saw the mouse go down:
+/// `DoDragDrop` validates the drag source window, and a cross-thread call
+/// fails with DRAGDROP_E_INVALIDHWND (0x80040102). The call blocks for the
+/// duration of the drag; the OS paints the drag feedback, so the frozen UI
+/// is invisible to the user. Afterwards a synthetic button-up releases
+/// gpui's internal drag state (same thread now, so PostMessage works).
 // [impl->req~windows-drag-out~1]
 pub fn begin_file_drag(
     hwnd: isize,
     wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
 ) {
-    std::thread::spawn(move || {
-        log::info!("drag-out: OLE drag thread started (hwnd {hwnd:#x})");
-        unsafe {
-            if let Err(err) = OleInitialize(None) {
-                log::error!("drag-out: OleInitialize failed: {err}");
-                return;
-            }
-            let drag = FileDrag { wait_path };
-            // Both interfaces live on the one COM object.
-            let data: IDataObject = drag.into();
-            let Ok(source) = data.cast::<IDropSource>() else {
-                log::error!("drag-out: could not get IDropSource from the data object");
-                CoUninitialize();
-                return;
-            };
-            let mut effect = DROPEFFECT(0);
-            let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
-            log::info!(
-                "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
-                effect
-            );
-            CoUninitialize();
+    log::info!("drag-out: starting OLE drag (hwnd {hwnd:#x})");
+    unsafe {
+        if let Err(err) = OleInitialize(None) {
+            log::error!("drag-out: OleInitialize failed: {err}");
+            return;
         }
-        release_ghost_drag(hwnd);
-    });
+        let drag = FileDrag { wait_path };
+        // Both interfaces live on the one COM object.
+        let data: IDataObject = drag.into();
+        let Ok(source) = data.cast::<IDropSource>() else {
+            log::error!("drag-out: could not get IDropSource from the data object");
+            CoUninitialize();
+            return;
+        };
+        let mut effect = DROPEFFECT(0);
+        let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+        log::info!(
+            "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
+            effect
+        );
+        CoUninitialize();
+    }
+    release_ghost_drag(hwnd);
 }
 
 /// The OLE drag loop eats the real left-button-up, leaving gpui's internal
