@@ -6725,6 +6725,18 @@ fn render_tree_rows(
                                         // and gpui's own mouse capture (this
                                         // thread) is the context DoDragDrop
                                         // requires.
+                                        use raw_window_handle::{
+                                            HasWindowHandle as _, RawWindowHandle,
+                                        };
+                                        let hwnd = match window
+                                            .window_handle()
+                                            .map(|handle| handle.as_raw())
+                                        {
+                                            Ok(RawWindowHandle::Win32(handle)) => {
+                                                handle.hwnd.get() as isize
+                                            }
+                                            _ => 0,
+                                        };
                                         let cache = cache_for_download.clone();
                                         let key = (session_id, remote_for_download.clone());
                                         let wait: std::sync::Arc<
@@ -6733,7 +6745,7 @@ fn render_tree_rows(
                                             cache.lock().get(&key).cloned()
                                         });
                                         cx.defer(move |_| {
-                                            crate::windows_drag::begin_file_drag(wait);
+                                            crate::windows_drag::begin_file_drag(hwnd, wait);
                                         });
                                         let _ = weak_root.update(cx, |this, _cx| {
                                             this.ole_drag_active = true;

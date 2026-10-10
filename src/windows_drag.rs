@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_TYMED, E_NOTIMPL,
-    E_OUTOFMEMORY, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_MEDIUMFULL,
+    E_OUTOFMEMORY, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_MEDIUMFULL,
+    WPARAM, LPARAM, LRESULT,
 };
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
     CoUninitialize, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
     IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
@@ -28,7 +30,15 @@ use windows::Win32::System::Ole::{
     OleInitialize,
 };
 use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_LBUTTON};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::UI::Shell::{
+    DROPFILES, DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, PostMessageW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_TIMER,
+};
 use windows::core::{HRESULT, Interface, Ref, implement};
 
 /// Not defined by the `windows` crate (data format not supported).
@@ -278,19 +288,60 @@ impl IDropSource_Impl for FileDrag_Impl {
     }
 }
 
+/// Subclass id for the input eater installed while an OLE drag runs.
+const DRAG_SUBCLASS_ID: usize = 0xA37E;
+
+/// Messages that would re-enter gpui's dispatch (and its held RefCell
+/// borrows) while `DoDragDrop` pumps its nested loop. OLE tracks the
+/// physical mouse itself, so gpui must not see input until the drag ends;
+/// paint/timer messages are swallowed too (they would render or flush
+/// effects mid-borrow). Everything else — COM plumbing above all — passes
+/// through untouched.
+unsafe extern "system" fn input_eater_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEMOVE
+        | WM_LBUTTONDOWN
+        | WM_LBUTTONUP
+        | WM_LBUTTONDBLCLK
+        | WM_RBUTTONDOWN
+        | WM_RBUTTONUP
+        | WM_RBUTTONDBLCLK
+        | WM_MBUTTONDOWN
+        | WM_MBUTTONUP
+        | WM_MBUTTONDBLCLK
+        | WM_MOUSEWHEEL
+        | WM_MOUSEHWHEEL
+        | WM_SETCURSOR
+        | WM_KEYDOWN
+        | WM_KEYUP
+        | WM_CHAR
+        | WM_PAINT
+        | WM_TIMER => LRESULT(0),
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
+}
+
 /// Run an OLE file drag for the given staged path.
 ///
-/// CALL ON THE UI THREAD, from a *deferred* gpui task — never from inside
-/// an event handler. `DoDragDrop` pumps a nested message loop; if that
-/// re-enters gpui's dispatch while a handler's borrows are live it panics
-/// ("RefCell already borrowed"). Spawned the task way runs after the
-/// current dispatch has finished, which is exactly how the `drag` crate
-/// drives this on toolkit main threads. Capture is gpui's own from the
-/// mouse-down — owned by the calling thread, as DoDragDrop requires (the
-/// helper-thread variants with message-only or hidden capture windows
-/// never satisfied it: the drag starved before reaching any target).
+/// CALL ON THE UI THREAD, from a *deferred* gpui callback — never from
+/// inside an event handler. `DoDragDrop` pumps a nested message loop; if
+/// gpui dispatched that input normally it would re-enter dispatch while
+/// the caller holds borrows and panic ("RefCell already borrowed"), so an
+/// input-eating window subclass shields the gpui window for the drag's
+/// duration. Capture is gpui's own from the mouse-down — owned by the
+/// calling thread, as DoDragDrop requires (helper-thread variants with
+/// their own capture windows never satisfied it: the drag starved before
+/// reaching any target). Afterwards the subclass comes off and a synthetic
+/// button-up releases gpui's internal drag state.
 // [impl->req~windows-drag-out~1]
-pub fn begin_file_drag(wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>) {
+pub fn begin_file_drag(app_hwnd: isize, wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>) {
     if let Err(err) = unsafe { OleInitialize(None) } {
         log::error!("drag-out: OleInitialize failed: {err}");
         return;
@@ -303,13 +354,50 @@ pub fn begin_file_drag(wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>
         unsafe { CoUninitialize() };
         return;
     };
+    let hwnd = HWND(app_hwnd as *mut _);
+    if app_hwnd != 0 {
+        unsafe {
+            let _ = SetWindowSubclass(
+                hwnd,
+                Some(input_eater_subclass),
+                DRAG_SUBCLASS_ID,
+                0,
+            );
+        }
+    }
     let mut effect = DROPEFFECT(0);
     let result = unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect) };
     log::info!(
         "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
         effect
     );
+    if app_hwnd != 0 {
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(input_eater_subclass), DRAG_SUBCLASS_ID);
+        }
+    }
+    release_ghost_drag(app_hwnd);
     // Balances the OleInitialize above; gpui's own initialization keeps
     // its own reference count.
     unsafe { CoUninitialize() };
+}
+
+/// The real button-up was swallowed during the drag (the input eater), so
+/// gpui's internal drag state is still armed. Post a synthetic one at the
+/// current cursor position so it resets.
+fn release_ghost_drag(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd as *mut _);
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point).is_err() {
+            return;
+        }
+        let mut client = point;
+        let _ = ScreenToClient(hwnd, &mut client);
+        let lparam = (((client.y as u16 as u32) << 16) | (client.x as u16 as u32)) as isize;
+        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(lparam));
+    }
 }
