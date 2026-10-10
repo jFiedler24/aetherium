@@ -1986,6 +1986,15 @@ impl RootView {
             })
             .cloned()
         {
+            // A double click fires twice; don't start a second connect while
+            // one for the same profile is already running.
+            if self
+                .tabs
+                .iter()
+                .any(|tab| !tab.is_log() && tab.state == ConnState::Connecting && tab.profile.as_ref().is_some_and(|p| p.name == profile.name))
+            {
+                return;
+            }
             self.connect_profile(profile, window, cx);
         } else {
             self.form = Some(ProfileForm::from_fields(
@@ -5336,11 +5345,24 @@ fn log_toolbar_button(
         section.into_any_element()
     }
 
+    /// Whether a connected shell tab exists for the given target.
+    fn is_connected_for(&self, host: &str, port: u16, username: &str) -> bool {
+        self.tabs.iter().any(|tab| {
+            !tab.is_log()
+                && tab.state == ConnState::Connected
+                && tab
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.host == host && p.port == port && p.username == username)
+        })
+    }
+
     fn render_recents(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let now = now_unix();
         let mut rows = Vec::new();
         for (ix, entry) in self.recents.entries.iter().enumerate() {
             let subtitle = format!("{} · {}", entry.profile_name, relative_time(now, entry.connected_at_unix));
+            let connected = self.is_connected_for(&entry.host, entry.port, &entry.username);
             rows.push(
                 div()
                     .id(SharedString::from(format!("recent:{ix}")))
@@ -5359,6 +5381,23 @@ fn log_toolbar_button(
                             .flex_row()
                             .items_center()
                             .gap_1()
+                            .child(
+                                // Closed lock = a session is connected; open
+                                // lock = not connected.
+                                svg()
+                                    .path(if connected {
+                                        assets::ICON_LOCK
+                                    } else {
+                                        assets::ICON_LOCK_OFF
+                                    })
+                                    .w(px(13.))
+                                    .h(px(13.))
+                                    .text_color(if connected {
+                                        theme::success()
+                                    } else {
+                                        theme::text_dim()
+                                    }),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -5421,6 +5460,7 @@ fn log_toolbar_button(
         let mut rows = Vec::new();
         for (ix, profile) in self.store.profiles.iter().enumerate() {
             let is_selected = self.selected == Some(ix);
+            let connected = self.is_connected_for(&profile.host, profile.port, &profile.username);
             rows.push(
                 div()
                     .id(ix)
@@ -5431,20 +5471,57 @@ fn log_toolbar_button(
                     .cursor_pointer()
                     .when(is_selected, |row| row.bg(theme::selection()))
                     .hover(|row| row.bg(theme::hover()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    // Single click selects; double click connects right away
+                    // (MobaXterm habit).
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         this.selected = Some(ix);
+                        let double = matches!(
+                            event,
+                            gpui::ClickEvent::Mouse(click) if click.down.click_count >= 2
+                        );
+                        if double {
+                            if let Some(profile) = this.store.profiles.get(ix).cloned() {
+                                this.connect_profile(profile, window, cx);
+                                return;
+                            }
+                        }
                         cx.notify();
                     }))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .child(profile.name.clone())
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                // Closed lock = a session is connected; open
+                                // lock = not connected.
+                                svg()
+                                    .path(if connected {
+                                        assets::ICON_LOCK
+                                    } else {
+                                        assets::ICON_LOCK_OFF
+                                    })
+                                    .w(px(13.))
+                                    .h(px(13.))
+                                    .text_color(if connected {
+                                        theme::success()
+                                    } else {
+                                        theme::text_dim()
+                                    }),
+                            )
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(theme::text_dim())
-                                    .child(profile.summary()),
+                                    .flex()
+                                    .flex_col()
+                                    .min_w(px(0.))
+                                    .child(profile.name.clone())
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::text_dim())
+                                            .child(profile.summary()),
+                                    ),
                             ),
                     )
                     .into_any_element(),

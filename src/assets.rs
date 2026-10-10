@@ -40,6 +40,8 @@ const PLAY_FILLED: &str = include_str!("../zed_icons/play_filled.svg");
 const BOOKMARK: &str = include_str!("../zed_icons/bookmark.svg");
 const TOOL_SEARCH: &str = include_str!("../zed_icons/tool_search.svg");
 const FILTER_FUNNEL: &str = include_str!("../zed_icons/filter_funnel.svg");
+const LOCK: &str = include_str!("../zed_icons/lock.svg");
+const LOCK_OFF: &str = include_str!("../zed_icons/lock_off.svg");
 
 /// App icon, shown next to the brand name in the header.
 pub const ICON_MAIN_EXECUTABLE: &str = "aetherium/icons/main_executable.svg";
@@ -91,6 +93,10 @@ pub const ICON_BOOKMARK: &str = "aetherium/icons/bookmark.svg";
 pub const ICON_SEARCH: &str = "aetherium/icons/tool_search.svg";
 /// Log toolbar: filter input.
 pub const ICON_FILTER: &str = "aetherium/icons/filter_funnel.svg";
+/// Sessions list: the profile has a connected session.
+pub const ICON_LOCK: &str = "aetherium/icons/lock.svg";
+/// Sessions list: no connected session for the profile.
+pub const ICON_LOCK_OFF: &str = "aetherium/icons/lock_off.svg";
 
 const BUILD_TOOL_PATH: &str = "aetherium/icons/build_tool.svg";
 const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
@@ -191,6 +197,8 @@ impl AssetSource for EmbeddedAssets {
             ICON_BOOKMARK => Some(BOOKMARK.as_bytes()),
             ICON_SEARCH => Some(TOOL_SEARCH.as_bytes()),
             ICON_FILTER => Some(FILTER_FUNNEL.as_bytes()),
+            ICON_LOCK => Some(LOCK.as_bytes()),
+            ICON_LOCK_OFF => Some(LOCK_OFF.as_bytes()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
