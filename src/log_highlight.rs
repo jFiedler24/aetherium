@@ -143,8 +143,8 @@ impl LogHighlighter {
     }
 
     fn load_from(file_name: &str, default_toml: &str) -> Self {
-        let path =
-            dirs::config_dir().map(|dir| dir.join("aetherium").join(file_name));
+        // crypto::config_dir honors the AETHERIUM_CONFIG_DIR override.
+        let path = Some(crate::crypto::config_dir().join(file_name));
         let text = path
             .as_ref()
             .and_then(|path| std::fs::read_to_string(path).ok());

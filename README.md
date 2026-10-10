@@ -6,6 +6,11 @@ same snappy text layout, same dark aesthetic.
 
 [![Build](https://github.com/jFiedler24/aetherium/actions/workflows/build.yml/badge.svg)](https://github.com/jFiedler24/aetherium/actions/workflows/build.yml)
 
+![aetherium following a remote log: SnakeTail-style toolbar, regex syntax
+highlighting (errors bold red, warnings amber, timestamps cyan), connection
+state icons in the session
+list](docs/images/log-follower.png)
+
 ## Features
 
 - **Multiple tabs** — every connection opens in its own tab with an independent

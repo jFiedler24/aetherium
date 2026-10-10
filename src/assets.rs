@@ -140,10 +140,7 @@ pub fn load_bundled_fonts(cx: &mut App) {
 /// the app's font families are named after them and gpui falls back to the
 /// system fonts when they are absent.
 pub fn load_user_fonts(cx: &mut App) {
-    let Some(config_dir) = dirs::config_dir() else {
-        return;
-    };
-    let fonts_dir = config_dir.join("aetherium").join("fonts");
+    let fonts_dir = crate::crypto::config_dir().join("fonts");
     let Ok(entries) = std::fs::read_dir(&fonts_dir) else {
         return;
     };

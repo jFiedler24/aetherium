@@ -38,12 +38,10 @@ pub struct RecentStore {
 }
 
 impl RecentStore {
-    /// Default location: `~/.config/aetherium/recents.toml`.
+    /// Default location: `~/.config/aetherium/recents.toml` (or
+    /// `$AETHERIUM_CONFIG_DIR/aetherium/recents.toml` when overridden).
     pub fn default_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("aetherium")
-            .join("recents.toml")
+        crate::crypto::config_dir().join("recents.toml")
     }
 
     /// Load from the default location, creating an empty store (and parent

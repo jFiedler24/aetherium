@@ -3090,6 +3090,7 @@ impl RootView {
         // Terminal semantics). The keystroke never reaches the PTY.
         // Placed before the read-only check so log tabs, whose whole
         // point is reading, are copyable too.
+        #[cfg(windows)]
         let has_selection = terminal.has_selection();
         #[cfg(windows)]
         let copy = keystroke.key == "c"
@@ -7242,7 +7243,10 @@ impl Render for RootView {
             let mut panel = div()
                 .id("help-panel")
                 .w(px(540.))
-                .max_h(px(560.))
+                // Fixed (not max) height: the overflow scrollbar must engage
+                // whenever the content exceeds it — with content-sized
+                // max_h some layouts never became scrollable.
+                .h(px(560.))
                 .overflow_y_scroll()
                 .bg(theme::panel())
                 .border_1()
