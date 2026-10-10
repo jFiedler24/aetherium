@@ -30,7 +30,11 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_LBUTTON};
 use windows::Win32::UI::Shell::DROPFILES;
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, PostMessageW, WM_LBUTTONUP};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, GetCursorPos, HWND_MESSAGE, PostMessageW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_LBUTTONUP,
+};
 use windows::core::{HRESULT, Interface, Ref, implement};
 
 /// Not defined by the `windows` crate (data format not supported).
@@ -197,41 +201,71 @@ impl IDropSource_Impl for FileDrag_Impl {
     }
 }
 
-/// Run an OLE file drag for the given staged path. Must be called on the
-/// thread that owns `hwnd` — the same thread that saw the mouse go down:
-/// `DoDragDrop` validates the drag source window, and a cross-thread call
-/// fails with DRAGDROP_E_INVALIDHWND (0x80040102). The call blocks for the
-/// duration of the drag; the OS paints the drag feedback, so the frozen UI
-/// is invisible to the user. Afterwards a synthetic button-up releases
-/// gpui's internal drag state (same thread now, so PostMessage works).
+/// Run an OLE file drag for the given staged path, on a helper thread with
+/// its own capture window. `DoDragDrop` requires the mouse capture to
+/// belong to the calling thread (otherwise DRAGDROP_E_INVALIDHWND), but
+/// running it on the UI thread pumps messages through gpui's event
+/// dispatch while its interior state is borrowed and panics with
+/// "RefCell already borrowed". A message-only window created on this
+/// thread and captured here satisfies the thread check without touching
+/// the UI thread at all. Afterwards a synthetic button-up releases gpui's
+/// internal drag state.
 // [impl->req~windows-drag-out~1]
 pub fn begin_file_drag(
     hwnd: isize,
     wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
 ) {
-    log::info!("drag-out: starting OLE drag (hwnd {hwnd:#x})");
-    unsafe {
-        if let Err(err) = OleInitialize(None) {
-            log::error!("drag-out: OleInitialize failed: {err}");
-            return;
-        }
-        let drag = FileDrag { wait_path };
-        // Both interfaces live on the one COM object.
-        let data: IDataObject = drag.into();
-        let Ok(source) = data.cast::<IDropSource>() else {
-            log::error!("drag-out: could not get IDropSource from the data object");
+    std::thread::spawn(move || {
+        log::info!("drag-out: OLE drag thread started (app hwnd {hwnd:#x})");
+        unsafe {
+            // Message-only window owned by THIS thread, for SetCapture.
+            let local = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("Static"),
+                windows::core::w!("aetherium-drag"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            );
+            let Ok(local) = local else {
+                log::error!("drag-out: could not create the capture window");
+                return;
+            };
+            let _capture = SetCapture(local);
+            if let Err(err) = OleInitialize(None) {
+                log::error!("drag-out: OleInitialize failed: {err}");
+                ReleaseCapture();
+                let _ = DestroyWindow(local);
+                return;
+            }
+            let drag = FileDrag { wait_path };
+            // Both interfaces live on the one COM object.
+            let data: IDataObject = drag.into();
+            let Ok(source) = data.cast::<IDropSource>() else {
+                log::error!("drag-out: could not get IDropSource from the data object");
+                CoUninitialize();
+                ReleaseCapture();
+                let _ = DestroyWindow(local);
+                return;
+            };
+            let mut effect = DROPEFFECT(0);
+            let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+            log::info!(
+                "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
+                effect
+            );
             CoUninitialize();
-            return;
-        };
-        let mut effect = DROPEFFECT(0);
-        let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
-        log::info!(
-            "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
-            effect
-        );
-        CoUninitialize();
-    }
-    release_ghost_drag(hwnd);
+            ReleaseCapture();
+            let _ = DestroyWindow(local);
+        }
+        release_ghost_drag(hwnd);
+    });
 }
 
 /// The OLE drag loop eats the real left-button-up, leaving gpui's internal
