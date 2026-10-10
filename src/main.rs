@@ -67,6 +67,26 @@ static LOGGER: AppLogger = AppLogger;
 fn main() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
+    // Rootcausing crashes on Windows builds needs the panic's location and
+    // backtrace in the log file; the default hook only writes to stderr,
+    // which a GUI-subsystem binary discards.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let message = if let Some(text) = info.payload().downcast_ref::<&str>() {
+            (*text).to_string()
+        } else if let Some(text) = info.payload().downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "<non-string payload>".to_string()
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>").to_string();
+        log::error!("PANIC on thread '{name}' at {location}: {message}\n{backtrace}");
+    }));
     // Bundled Zed themes + the saved preference, before any rendering.
     theme::init();
     gpui_platform::application()

@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_TYMED, E_NOTIMPL,
     E_OUTOFMEMORY, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_MEDIUMFULL,
-    WPARAM, LPARAM, LRESULT,
 };
-use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
     CoUninitialize, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
     IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
@@ -30,16 +28,8 @@ use windows::Win32::System::Ole::{
     OleInitialize,
 };
 use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_LBUTTON};
-use windows::Win32::UI::Shell::{
-    DROPFILES, DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClassNameW, GetCursorPos, GetWindowThreadProcessId, PostMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_GETMESSAGE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, MSG,
-};
+use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_TIMER};
 use windows::core::{HRESULT, Interface, Ref, implement};
 
 /// Not defined by the `windows` crate (data format not supported).
@@ -289,85 +279,70 @@ impl IDropSource_Impl for FileDrag_Impl {
     }
 }
 
-/// Subclass id for the input eater installed while an OLE drag runs.
-const DRAG_SUBCLASS_ID: usize = 0xA37E;
+/// One-shot timer id used to kick the drag outside any gpui dispatch.
+const DRAG_TIMER_ID: usize = 0xA37F;
 
-/// Set while an outgoing drag runs: the hook below nulls OLE's apartment
-/// marshalling messages so they can't re-enter gpui mid-borrow.
-static DRAG_OUT_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The staged-path resolver handed from the drag gesture to the timer proc.
+static PENDING_DRAG: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>>,
+> = std::sync::Mutex::new(None);
 
-/// OLE marshals IDropTarget calls into gpui's STA via SendMessage to the
-/// hidden "OleMainThreadWndClass" window. While our drag callback holds
-/// gpui's borrow, dispatching that would panic (RefCell already borrowed),
-/// so the hook nulls the message — the RPC side gets a harmless error and
-/// the drop effect over our own window becomes NONE, which is right
-/// anyway mid-drag-out.
-unsafe extern "system" fn com_shield_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && DRAG_OUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        let msg = unsafe { &mut *(lparam.0 as *mut MSG) };
-        if !msg.hwnd.0.is_null() {
-            let mut class = [0u16; 32];
-            let len = unsafe { GetClassNameW(msg.hwnd, &mut class) };
-            if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "OleMainThreadWndClass" {
-                msg.message = WM_NULL;
-            }
-        }
-    }
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
-}
-
-/// Messages that would re-enter gpui's dispatch (and its held RefCell
-/// borrows) while `DoDragDrop` pumps its nested loop. OLE tracks the
-/// physical mouse itself, so gpui must not see input until the drag ends;
-/// paint/timer messages are swallowed too (they would render or flush
-/// effects mid-borrow). Everything else — COM plumbing above all — passes
-/// through untouched.
-unsafe extern "system" fn input_eater_subclass(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    match msg {
-        WM_MOUSEMOVE
-        | WM_LBUTTONDOWN
-        | WM_LBUTTONUP
-        | WM_LBUTTONDBLCLK
-        | WM_RBUTTONDOWN
-        | WM_RBUTTONUP
-        | WM_RBUTTONDBLCLK
-        | WM_MBUTTONDOWN
-        | WM_MBUTTONUP
-        | WM_MBUTTONDBLCLK
-        | WM_MOUSEWHEEL
-        | WM_MOUSEHWHEEL
-        | WM_SETCURSOR
-        | WM_KEYDOWN
-        | WM_KEYUP
-        | WM_CHAR
-        | WM_PAINT
-        | WM_TIMER => LRESULT(0),
-        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
-    }
-}
-
-/// Run an OLE file drag for the given staged path.
+/// Schedule an outgoing OLE file drag for the staged path.
 ///
-/// CALL ON THE UI THREAD, from a *deferred* gpui callback — never from
-/// inside an event handler. `DoDragDrop` pumps a nested message loop; if
-/// gpui dispatched that input normally it would re-enter dispatch while
-/// the caller holds borrows and panic ("RefCell already borrowed"), so an
-/// input-eating window subclass shields the gpui window for the drag's
-/// duration. Capture is gpui's own from the mouse-down — owned by the
-/// calling thread, as DoDragDrop requires (helper-thread variants with
-/// their own capture windows never satisfied it: the drag starved before
-/// reaching any target). Afterwards the subclass comes off and a synthetic
-/// button-up releases gpui's internal drag state.
+/// The actual `DoDragDrop` runs in a `SetTimer` TIMERPROC, which Windows
+/// invokes while gpui's thread sits in `GetMessage` — BETWEEN message
+/// dispatches, holding no gpui borrow. Every earlier design failed on
+/// borrow conflicts: running DoDragDrop inside a gpui callback (event
+/// handler, defer) held the `AppCell` borrow across the whole nested
+/// pump, and gpui activity that interleaved with the drag — executor
+/// tasks on Windows thread-pool threads, COM marshalling of gpui's own
+/// registered IDropTarget into this thread — then panicked with
+/// "RefCell already borrowed". Between dispatches no borrow is held, so
+/// the nested pump's messages each take short sequential borrows and
+/// everything (COM calls in both directions, gpui's drop-target
+/// notifications) works as designed. gpui's mouse capture from the
+/// button-down belongs to this thread, which is exactly what DoDragDrop
+/// requires.
 // [impl->req~windows-drag-out~1]
-pub fn begin_file_drag(app_hwnd: isize, wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>) {
+pub fn schedule_file_drag(
+    app_hwnd: isize,
+    wait_path: std::sync::Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
+) {
+    if app_hwnd == 0 {
+        return;
+    }
+    *PENDING_DRAG.lock().unwrap() = Some(wait_path);
+    unsafe {
+        // 1 ms; the proc kills the timer regardless (uElapse=0's meaning
+        // is ambiguous on some Windows versions).
+        SetTimer(
+            Some(HWND(app_hwnd as *mut _)),
+            DRAG_TIMER_ID,
+            1,
+            Some(drag_timer_proc),
+        );
+    }
+}
+
+unsafe extern "system" fn drag_timer_proc(hwnd: HWND, msg: u32, id: usize, _time: u32) {
+    if msg != WM_TIMER || id != DRAG_TIMER_ID {
+        return;
+    }
+    unsafe {
+        let _ = KillTimer(Some(hwnd), DRAG_TIMER_ID);
+    }
+    let wait = PENDING_DRAG.lock().unwrap().take();
+    if let Some(wait) = wait {
+        run_file_drag(wait);
+    }
+}
+
+/// The drag itself. Runs between gpui dispatches (see
+/// [`schedule_file_drag`]): DoDragDrop's nested pump handles each message
+/// with its own short borrow, gpui receives the real button-up through
+/// that pump and ends its internal drag, and the drop target under the
+/// cursor gets the staged CF_HDROP.
+fn run_file_drag(wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>) {
     if let Err(err) = unsafe { OleInitialize(None) } {
         log::error!("drag-out: OleInitialize failed: {err}");
         return;
@@ -380,58 +355,13 @@ pub fn begin_file_drag(app_hwnd: isize, wait_path: Arc<dyn Fn() -> Option<PathBu
         unsafe { CoUninitialize() };
         return;
     };
-    let hwnd = HWND(app_hwnd as *mut _);
-    let mut hook = None;
-    if app_hwnd != 0 {
-        DRAG_OUT_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            let thread_id = GetWindowThreadProcessId(hwnd, None);
-            hook = SetWindowsHookExW(WH_GETMESSAGE, Some(com_shield_hook), None, thread_id).ok();
-            let _ = SetWindowSubclass(
-                hwnd,
-                Some(input_eater_subclass),
-                DRAG_SUBCLASS_ID,
-                0,
-            );
-        }
-    }
     let mut effect = DROPEFFECT(0);
     let result = unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect) };
     log::info!(
         "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
         effect
     );
-    DRAG_OUT_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-    if let Some(hook) = hook {
-        unsafe { let _ = UnhookWindowsHookEx(hook); }
-    }
-    if app_hwnd != 0 {
-        unsafe {
-            let _ = RemoveWindowSubclass(hwnd, Some(input_eater_subclass), DRAG_SUBCLASS_ID);
-        }
-    }
-    release_ghost_drag(app_hwnd);
     // Balances the OleInitialize above; gpui's own initialization keeps
     // its own reference count.
     unsafe { CoUninitialize() };
-}
-
-/// The real button-up was swallowed during the drag (the input eater), so
-/// gpui's internal drag state is still armed. Post a synthetic one at the
-/// current cursor position so it resets.
-fn release_ghost_drag(hwnd: isize) {
-    if hwnd == 0 {
-        return;
-    }
-    unsafe {
-        let hwnd = HWND(hwnd as *mut _);
-        let mut point = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut point).is_err() {
-            return;
-        }
-        let mut client = point;
-        let _ = ScreenToClient(hwnd, &mut client);
-        let lparam = (((client.y as u16 as u32) << 16) | (client.x as u16 as u32)) as isize;
-        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(lparam));
-    }
 }

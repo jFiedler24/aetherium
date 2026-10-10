@@ -6718,13 +6718,13 @@ fn render_tree_rows(
                                         // the staged path, and tell the
                                         // internal drop/hover handlers to
                                         // stand down while it owns the mouse.
-                                        // Deferred to just after this event
-                                        // dispatch: DoDragDrop blocks with a
-                                        // nested message loop, which is only
-                                        // safe once gpui's borrows are gone —
-                                        // and gpui's own mouse capture (this
-                                        // thread) is the context DoDragDrop
-                                        // requires.
+                                        // The drag itself starts from a
+                                        // SetTimer TIMERPROC (see
+                                        // schedule_file_drag): Windows calls
+                                        // it between gpui's message
+                                        // dispatches, so DoDragDrop's nested
+                                        // pump never runs under a gpui
+                                        // borrow.
                                         use raw_window_handle::{
                                             HasWindowHandle as _, RawWindowHandle,
                                         };
@@ -6739,14 +6739,12 @@ fn render_tree_rows(
                                         };
                                         let cache = cache_for_download.clone();
                                         let key = (session_id, remote_for_download.clone());
-                                        let wait: std::sync::Arc<
-                                            dyn Fn() -> Option<PathBuf> + Send + Sync,
-                                        > = std::sync::Arc::new(move || {
-                                            cache.lock().get(&key).cloned()
-                                        });
-                                        cx.defer(move |_| {
-                                            crate::windows_drag::begin_file_drag(hwnd, wait);
-                                        });
+                                        crate::windows_drag::schedule_file_drag(
+                                            hwnd,
+                                            std::sync::Arc::new(move || {
+                                                cache.lock().get(&key).cloned()
+                                            }),
+                                        );
                                         let _ = weak_root.update(cx, |this, _cx| {
                                             this.ole_drag_active = true;
                                         });
