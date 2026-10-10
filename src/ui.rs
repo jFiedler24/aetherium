@@ -2839,12 +2839,21 @@ impl RootView {
             }
         }
 
-        // Copy: cmd-c (macOS) / ctrl-shift-c. Copies the selection; the
-        // keystroke never reaches the PTY (ctrl-shift-c would otherwise
-        // send ^C). Placed before the read-only check so log tabs, whose
-        // whole point is reading, are copyable too.
-        let copy = keystroke.key == "c" && ((mods.control && mods.shift) || mods.platform);
-        if copy {
+        // Copy: cmd-c (macOS) / ctrl-shift-c / ctrl+insert everywhere; on
+        // Windows also plain Ctrl+C while a selection exists (Windows
+        // Terminal semantics). The keystroke never reaches the PTY.
+        // Placed before the read-only check so log tabs, whose whole
+        // point is reading, are copyable too.
+        let has_selection = terminal.has_selection();
+        #[cfg(windows)]
+        let copy = keystroke.key == "c"
+            && (mods.platform
+                || (mods.control && mods.shift && !mods.alt)
+                || (mods.control && !mods.alt && has_selection));
+        #[cfg(not(windows))]
+        let copy = keystroke.key == "c" && ((mods.control && mods.shift && !mods.alt) || mods.platform);
+        let copy_insert = keystroke.key == "insert" && mods.control && !mods.alt && !mods.shift;
+        if copy || copy_insert {
             if let Some(text) = terminal.selected_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 let len = text.len() as u64;
@@ -2952,9 +2961,16 @@ impl RootView {
             return;
         }
 
-        // Paste: ctrl-shift-v (Linux) or platform-v (macOS).
-        let paste = keystroke.key == "v"
-            && ((mods.control && mods.shift) || mods.platform);
+        // Paste: cmd-v (macOS) / ctrl-shift-v everywhere; on Windows also
+        // plain Ctrl+V and shift+insert (Windows Terminal / conhost
+        // conventions). ctrl-v without shift still reaches the PTY on
+        // other platforms (quoted-insert for readline/emacs users).
+        #[cfg(windows)]
+        let paste = (keystroke.key == "v" && mods.control && !mods.alt)
+            || (keystroke.key == "insert" && mods.shift && !mods.control && !mods.alt);
+        #[cfg(not(windows))]
+        let paste = (keystroke.key == "v" && ((mods.control && mods.shift && !mods.alt) || mods.platform))
+            || (keystroke.key == "insert" && mods.shift && !mods.control && !mods.alt);
         if paste {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                 let mode = *terminal.term.lock().mode();
