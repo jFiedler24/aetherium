@@ -568,6 +568,45 @@ struct PendingApiLog {
     deadline: std::time::Instant,
 }
 
+/// Which local editor to open a staged file with.
+#[derive(Clone, Copy, PartialEq)]
+enum EditorChoice {
+    /// The OS default editor (`open`, `xdg-open`, Explorer) or
+    /// `$AETHERIUM_EDITOR` when set.
+    Default,
+    /// VS Code explicitly.
+    VsCode,
+}
+
+/// An editor launch waiting for its staging download to finish.
+struct PendingEditorOpen {
+    session_id: u64,
+    remote: PathBuf,
+    editor: EditorChoice,
+}
+
+/// A remote file open in a local editor (MobaXterm-style remote editing):
+/// the temp copy is watched, and every save asks whether to sync back.
+struct RemoteEdit {
+    session_id: u64,
+    remote: PathBuf,
+    local: PathBuf,
+    /// Profile summary, for the sync dialog text.
+    target: String,
+    mtime: std::time::SystemTime,
+    size: u64,
+}
+
+/// The pending "upload back to the device?" question for a modified temp
+/// copy.
+#[derive(Clone)]
+struct EditSyncAsk {
+    session_id: u64,
+    remote: PathBuf,
+    local: PathBuf,
+    target: String,
+}
+
 /// State of the inline profile add/edit form.
 struct ProfileForm {
     editing: Option<usize>,
@@ -628,6 +667,13 @@ pub struct RootView {
     next_api_req: u64,
     /// A `/logs` request waiting for its session to connect.
     api_pending_log: Option<PendingApiLog>,
+    /// Remote files open in a local editor, watched for writes.
+    remote_edits: Vec<RemoteEdit>,
+    /// Editor opens waiting for their staging download.
+    pending_editor_open: Vec<PendingEditorOpen>,
+    /// The "sync back?" dialog state, one question at a time.
+    edit_sync_ask: Option<EditSyncAsk>,
+    last_edit_scan: std::time::Instant,
     /// Which sidebar view is shown.
     sidebar_tab: SidebarTab,
     /// Current width of the sidebar, dragged via the splitter.
@@ -653,10 +699,6 @@ pub struct RootView {
     /// when the drag ends inside the app, when the session disconnects or its
     /// tab closes, and every staged file is purged on the next app launch.
     temp_download_cache: TempDownloadCache,
-    /// (session, remote path) pairs staged via the context menu's
-    /// "Open in VS Code" entry: when the staging download finishes, the
-    /// local temp file is handed to VS Code.
-    pending_vscode_open: Vec<(u64, PathBuf)>,
     /// Instant local echo of printable keystrokes (the server's identical
     /// echo is deduplicated on arrival) — the fix for typing lag on
     /// high-latency links. Toggleable from the header.
@@ -704,6 +746,10 @@ impl RootView {
             api_pending: std::collections::HashMap::new(),
             next_api_req: 1,
             api_pending_log: None,
+            remote_edits: Vec::new(),
+            pending_editor_open: Vec::new(),
+            edit_sync_ask: None,
+            last_edit_scan: std::time::Instant::now(),
             sidebar_tab: SidebarTab::Sessions,
             sidebar_width: px(260.),
             show_file_details: false,
@@ -712,7 +758,6 @@ impl RootView {
             logs_scroll_pending: false,
             terminal_wake_tx,
             temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            pending_vscode_open: Vec::new(),
             local_echo: true,
             terminal_font_size: TERMINAL_FONT_SIZE,
             history: HistoryStore::load(),
@@ -823,7 +868,7 @@ impl RootView {
                             continue;
                         };
                         while let Some(event) = session.try_recv_event() {
-                            this.handle_tab_event(index, event);
+                            this.handle_tab_event(index, event, cx);
                             handled = true;
                         }
                     }
@@ -834,6 +879,7 @@ impl RootView {
                     }
                     this.api_tick(cx);
                     this.log_view_upkeep(cx);
+                    this.edit_scan(cx);
                     if handled {
                         cx.notify();
                     }
@@ -888,7 +934,7 @@ impl RootView {
         }
     }
 
-    fn handle_tab_event(&mut self, index: usize, event: SessionEvent) {
+    fn handle_tab_event(&mut self, index: usize, event: SessionEvent, cx: &mut Context<Self>) {
         match event {
             SessionEvent::Connected { home_dir } => {
                 let tab = &mut self.tabs[index];
@@ -1135,21 +1181,28 @@ impl RootView {
                 drop(cache);
                 log::info!("drag-out: staged {} (session {session_id})", remote.display());
                 self.tabs[index].status = format!("staged {} for drag-out", remote.display());
-                // A "Open in VS Code" request is satisfied by the same
-                // staging download.
-                let key = (session_id, remote.clone());
-                if self.pending_vscode_open.contains(&key) {
-                    self.pending_vscode_open.retain(|pending| *pending != key);
-                    match Self::launch_vscode(&local) {
-                        Ok(()) => {
-                            self.tabs[index].status =
-                                format!("opened {} in VS Code", remote.display());
-                        }
-                        Err(err) => {
-                            log::warn!("vscode: {err:#}");
-                            self.tabs[index].status = format!("VS Code: {err:#}");
-                        }
-                    }
+                // An editor request ("Edit locally" / "Open in VS Code") is
+                // satisfied by the same staging download; the file is now
+                // watched for writes.
+                if let Some(position) = self
+                    .pending_editor_open
+                    .iter()
+                    .position(|pending| pending.session_id == session_id && pending.remote == remote)
+                {
+                    let pending = self.pending_editor_open.remove(position);
+                    let target = self.tabs[index]
+                        .profile
+                        .as_ref()
+                        .map(|profile| profile.summary())
+                        .unwrap_or_default();
+                    self.begin_remote_edit(
+                        session_id,
+                        remote,
+                        local,
+                        target,
+                        pending.editor,
+                        cx,
+                    );
                 }
             }
             SessionEvent::TailEnded { tab_id } => {
@@ -2331,10 +2384,10 @@ impl RootView {
         self.start_rename(remote, window, cx);
     }
 
-    /// Stage a remote file locally and open the temp copy in VS Code.
-    /// (Remote editing with write-back is a separate, larger feature — this
-    /// opens a local snapshot.)
-    fn open_in_vscode(&mut self, remote: PathBuf, cx: &mut Context<Self>) {
+    /// Stage a remote file locally and open the temp copy in a local
+    /// editor (MobaXterm-style remote editing). The temp copy is watched;
+    /// every save pops a "sync back to the device?" dialog.
+    fn start_remote_edit(&mut self, remote: PathBuf, editor: EditorChoice, cx: &mut Context<Self>) {
         self.context_menu = None;
         let connected = self
             .active_tab()
@@ -2349,28 +2402,202 @@ impl RootView {
         };
         let session = tab.session.clone();
         let session_id = tab.session_id;
+        let target = tab
+            .profile
+            .as_ref()
+            .map(|profile| profile.summary())
+            .unwrap_or_default();
+        // Already staged (or waiting): just (re)open the editor.
+        if let Some(edit) = self
+            .remote_edits
+            .iter()
+            .find(|edit| edit.session_id == session_id && edit.remote == remote)
+        {
+            let local = edit.local.clone();
+            if Self::launch_editor(editor, &local).is_ok() {
+                self.status = format!("editing {} — saves ask to sync back", remote.display());
+            } else {
+                self.status = "could not launch the editor".into();
+            }
+            cx.notify();
+            return;
+        }
+        let pending = PendingEditorOpen {
+            session_id,
+            remote: remote.clone(),
+            editor,
+        };
+        if !self
+            .pending_editor_open
+            .iter()
+            .any(|waiting| {
+                waiting.session_id == pending.session_id
+                    && waiting.remote == pending.remote
+                    && waiting.editor == pending.editor
+            })
+        {
+            self.pending_editor_open.push(pending);
+        }
+        // A previous staging (drag-out or an earlier edit) is reused.
         let key = (session_id, remote.clone());
-        if !self.pending_vscode_open.contains(&key) {
-            self.pending_vscode_open.push(key);
+        let staged = self.temp_download_cache.lock().get(&key).cloned();
+        match (staged, session) {
+            (Some(local), _) => {
+                self.begin_remote_edit(session_id, remote, local, target, editor, cx)
+            }
+            (None, Some(session)) => {
+                log::info!("edit: staging {}", remote.display());
+                session.download_to_temp(session_id, remote.clone(), self.temp_download_cache.clone());
+                self.status = format!("staging {}…", remote.display());
+            }
+            (None, None) => self.status = "not connected".into(),
         }
-        log::info!("vscode: staging {}", remote.display());
-        if let Some(session) = session {
-            session.download_to_temp(session_id, remote.clone(), self.temp_download_cache.clone());
-        }
-        self.status = format!("staging {} for VS Code…", remote.display());
         cx.notify();
     }
 
-    /// Launch VS Code on a local file (best effort; error if it's missing).
-    fn launch_vscode(local: &std::path::Path) -> anyhow::Result<()> {
-        #[cfg(target_os = "macos")]
-        let result = std::process::Command::new("open")
-            .args(["-a", "Visual Studio Code"])
-            .arg(local)
-            .spawn();
-        #[cfg(not(target_os = "macos"))]
-        let result = std::process::Command::new("code").arg(local).spawn();
-        result.map(|_| ()).map_err(|err| err.into())
+    /// Register a staged temp file as a watched remote edit and open it.
+    fn begin_remote_edit(
+        &mut self,
+        session_id: u64,
+        remote: PathBuf,
+        local: PathBuf,
+        target: String,
+        editor: EditorChoice,
+        cx: &mut Context<Self>,
+    ) {
+        let (mtime, size) = std::fs::metadata(&local)
+            .map(|metadata| {
+                (
+                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    metadata.len(),
+                )
+            })
+            .unwrap_or((std::time::UNIX_EPOCH, 0));
+        self.remote_edits.push(RemoteEdit {
+            session_id,
+            remote: remote.clone(),
+            local: local.clone(),
+            target,
+            mtime,
+            size,
+        });
+        match Self::launch_editor(editor, &local) {
+            Ok(()) => {
+                self.status = format!("editing {} — saves ask to sync back", remote.display());
+            }
+            Err(err) => {
+                self.status = format!("editor: {err:#}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Launch a local editor on a staged file.
+    fn launch_editor(choice: EditorChoice, local: &std::path::Path) -> anyhow::Result<()> {
+        match choice {
+            EditorChoice::VsCode => {
+                #[cfg(target_os = "macos")]
+                let result = std::process::Command::new("open")
+                    .args(["-a", "Visual Studio Code"])
+                    .arg(local)
+                    .spawn();
+                #[cfg(not(target_os = "macos"))]
+                let result = std::process::Command::new("code").arg(local).spawn();
+                result.map(|_| ()).map_err(|err| err.into())
+            }
+            EditorChoice::Default => {
+                // $AETHERIUM_EDITOR wins ("code --wait", "subl", …); otherwise
+                // the OS default handler for the file type.
+                let spec = std::env::var("AETHERIUM_EDITOR").ok();
+                #[cfg(target_os = "macos")]
+                let fallback = "open";
+                #[cfg(target_os = "linux")]
+                let fallback = "xdg-open";
+                #[cfg(windows)]
+                let fallback = "explorer";
+                let spec = spec.unwrap_or_else(|| fallback.to_string());
+                let mut parts = spec.split_whitespace();
+                let program = parts.next().unwrap_or(fallback);
+                let mut command = std::process::Command::new(program);
+                command.args(parts).arg(local);
+                command.spawn().map(|_| ()).map_err(|err| err.into())
+            }
+        }
+    }
+
+    /// Poll watched edits; a modified temp copy asks to sync back (one
+    /// question at a time, like MobaXterm).
+    fn edit_scan(&mut self, cx: &mut Context<Self>) {
+        if self.last_edit_scan.elapsed() < Duration::from_millis(700) {
+            return;
+        }
+        self.last_edit_scan = std::time::Instant::now();
+        if self.edit_sync_ask.is_some() {
+            return;
+        }
+        for index in 0..self.remote_edits.len() {
+            let edit = &self.remote_edits[index];
+            let Ok(metadata) = std::fs::metadata(&edit.local) else {
+                continue;
+            };
+            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if mtime != edit.mtime || metadata.len() != edit.size {
+                self.edit_sync_ask = Some(EditSyncAsk {
+                    session_id: edit.session_id,
+                    remote: edit.remote.clone(),
+                    local: edit.local.clone(),
+                    target: edit.target.clone(),
+                });
+                cx.notify();
+                return;
+            }
+        }
+    }
+
+    /// Answer the sync dialog: `true` uploads back, `false` just resets the
+    /// watch baseline.
+    fn answer_edit_sync(&mut self, upload: bool, cx: &mut Context<Self>) {
+        let Some(ask) = self.edit_sync_ask.take() else {
+            return;
+        };
+        // Reset the baseline either way (to the file's current state).
+        if let Some(edit) = self
+            .remote_edits
+            .iter_mut()
+            .find(|edit| edit.session_id == ask.session_id && edit.remote == ask.remote)
+        {
+            if let Ok(metadata) = std::fs::metadata(&ask.local) {
+                edit.mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                edit.size = metadata.len();
+            }
+        }
+        if upload {
+            // Upload into the remote file's parent directory, keeping the
+            // file name (the shared transfer UI shows progress).
+            let remote_dir = ask
+                .remote
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            if let Some(tab) = self.tabs.iter().find(|tab| {
+                !tab.is_log()
+                    && tab.session_id == ask.session_id
+                    && tab.state == ConnState::Connected
+            }) {
+                if let Some(session) = tab.session.as_ref() {
+                    session.send(SessionCommand::Upload {
+                        session_id: ask.session_id,
+                        local: ask.local.clone(),
+                        remote_dir: remote_dir.clone(),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    });
+                    self.status = format!("uploading {}…", ask.remote.display());
+                }
+            } else {
+                self.status = "session for that file is gone — sync skipped".into();
+            }
+        }
+        cx.notify();
     }
 
     /// Disconnect the active shell tab (the tab itself stays open).
@@ -5632,14 +5859,16 @@ fn render_tree_rows(
                 .when(highlighted, |row| row.bg(theme::drop_target()))
                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.focus_file_tree(window, cx);
-                    // Double-click a file to open it in a log-follow tab
-                    // (SnakeTail-style); single click just selects/expands.
+                    // Double-click a file to edit it locally (MobaXterm
+                    // style: staged to a temp file, opened in the local
+                    // editor, saves ask to sync back). Single click just
+                    // selects/expands; tail -f lives in the right-click menu.
                     let double = matches!(
                         event,
                         gpui::ClickEvent::Mouse(click) if click.down.click_count >= 2
                     );
                     if !is_dir && double {
-                        this.open_log_tab(path.clone(), cx);
+                        this.start_remote_edit(path.clone(), EditorChoice::Default, cx);
                     } else {
                         this.toggle_tree_node(path.clone(), cx);
                     }
@@ -6167,6 +6396,11 @@ impl Render for RootView {
             // The tail -f closure captures `path` by move; the other items
             // get their own clone.
             let vscode_path = path.clone();
+            let edit_path = path.clone();
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
             let delete_path = path.clone();
             let rename_path = path.clone();
             root = root
@@ -6240,6 +6474,21 @@ impl Render for RootView {
                         )
                         .child(
                             div()
+                                .id("context-menu-edit")
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::text())
+                                .hover(|item| item.bg(theme::selection()))
+                                .child(format!("Edit {file_name}"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_remote_edit(edit_path.clone(), EditorChoice::Default, cx);
+                                })),
+                        )
+                        .child(
+                            div()
                                 .id("context-menu-vscode")
                                 .px_2()
                                 .py_1()
@@ -6250,7 +6499,7 @@ impl Render for RootView {
                                 .hover(|item| item.bg(theme::selection()))
                                 .child("Open in VS Code")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_in_vscode(vscode_path.clone(), cx);
+                                    this.start_remote_edit(vscode_path.clone(), EditorChoice::VsCode, cx);
                                 })),
                         )
                         .child(
@@ -6400,6 +6649,112 @@ impl Render for RootView {
                                                 this.delete_remote_confirmed(remote.clone(), cx);
                                             }))
                                     }),
+                            ),
+                    ),
+            );
+        }
+
+        // "Sync back to the device?" for a locally edited remote file
+        // (MobaXterm style). Clicking outside, Escape or "Ignore" keeps the
+        // local changes unsynced; "Upload" pushes the temp copy back over the
+        // shared transfer path.
+        if let Some(ask) = self.edit_sync_ask.clone() {
+            let name = ask
+                .remote
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ask.remote.display().to_string());
+            root = root.child(
+                div()
+                    .id("edit-sync-dialog")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::black().opacity(0.4))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.answer_edit_sync(false, cx);
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                        this.answer_edit_sync(false, cx);
+                    }))
+                    .child(
+                        div()
+                            .id("edit-sync-panel")
+                            .w(px(360.))
+                            .bg(theme::panel())
+                            .border_1()
+                            .border_color(theme::border())
+                            .rounded_md()
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .shadow_md()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }))
+                            .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::text())
+                                    .child(format!("“{name}” changed on disk.")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_dim())
+                                    .child(format!(
+                                        "Upload the changes back to {}?",
+                                        ask.target
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("edit-sync-ignore")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_color(theme::text())
+                                            .hover(|button| button.bg(theme::hover()))
+                                            .child("Ignore")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.answer_edit_sync(false, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("edit-sync-upload")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .bg(theme::accent())
+                                            .text_color(theme::bg())
+                                            .hover(|button| button.opacity(0.9))
+                                            .child("Upload")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.answer_edit_sync(true, cx);
+                                            })),
+                                    ),
                             ),
                     ),
             );
