@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_TYMED, E_NOTIMPL,
-    E_OUTOFMEMORY, LPARAM, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_MEDIUMFULL,
-    WPARAM,
+    E_OUTOFMEMORY, LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK,
+    STG_E_MEDIUMFULL, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
@@ -33,8 +33,9 @@ use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_LBUTTON};
 use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetCursorPos, PostMessageW, WINDOW_EX_STYLE, WM_LBUTTONUP,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    PostMessageW, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_LBUTTONUP,
+    WM_QUIT, WNDCLASSW, WS_POPUP,
 };
 use windows::core::{HRESULT, Interface, Ref, implement};
 
@@ -285,16 +286,60 @@ impl IDropSource_Impl for FileDrag_Impl {
     }
 }
 
+/// Kick-off message posted to the drag window: the LPARAM points at the
+/// heap-allocated [`DragStartContext`].
+const WM_START_DRAG: u32 = WM_APP;
+
+/// What the wndproc needs to run the drag: the COM pair and the app window
+/// handle for the synthetic button-up afterwards.
+struct DragStartContext {
+    data: IDataObject,
+    source: IDropSource,
+    app_hwnd: isize,
+}
+
+/// The drag must run INSIDE normal message dispatch. A bare thread that
+/// calls `DoDragDrop` at its top level starves the drag loop: the drop
+/// never reaches a target and neither drop nor cancel ever comes back
+/// (observed on Windows 11). Inside a wndproc reached through
+/// GetMessage/DispatchMessage, the modal drag loop behaves — the same
+/// shape as running it on a toolkit's main thread (GTK/Qt recipes).
+unsafe extern "system" fn drag_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let _ = wparam;
+    if msg == WM_START_DRAG {
+        let ctx = unsafe { &*(lparam.0 as *const DragStartContext) };
+        let mut effect = DROPEFFECT(0);
+        let result =
+            unsafe { DoDragDrop(&ctx.data, &ctx.source, DROPEFFECT_COPY, &mut effect) };
+        log::info!(
+            "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
+            effect
+        );
+        release_ghost_drag(ctx.app_hwnd);
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
 /// Run an OLE file drag for the given staged path, on a helper thread with
-/// its own capture window. `DoDragDrop` requires the mouse capture to
-/// belong to the calling thread (otherwise DRAGDROP_E_INVALIDHWND), but
-/// running it on the UI thread pumps messages through gpui's event
+/// its own capture window and message loop. `DoDragDrop` requires the mouse
+/// capture to belong to the calling thread (otherwise DRAGDROP_E_INVALIDHWND),
+/// but running it on the UI thread pumps messages through gpui's event
 /// dispatch while its interior state is borrowed and panics with
 /// "RefCell already borrowed". A hidden 0×0 popup owned by THIS thread is
 /// captured here to satisfy the thread check: a message-only window turned
-/// out NOT to hold real capture (the drag then died with
-/// DRAGDROP_E_INVALIDHWND the moment it left the app window). Afterwards a
-/// synthetic button-up releases gpui's internal drag state.
+/// out NOT to hold real capture. The drag itself runs inside the thread's
+/// GetMessage/DispatchMessage loop (see [`drag_wndproc`]) — a top-level
+/// DoDragDrop on an undispatched thread starves. Afterwards a synthetic
+/// button-up releases gpui's internal drag state.
 // [impl->req~windows-drag-out~1]
 pub fn begin_file_drag(
     hwnd: isize,
@@ -303,12 +348,22 @@ pub fn begin_file_drag(
     std::thread::spawn(move || {
         log::info!("drag-out: OLE drag thread started (app hwnd {hwnd:#x})");
         unsafe {
+            let class = windows::core::w!("aetherium-ole-drag");
+            // Registering the same class name twice is fine; the second
+            // registration fails with ERROR_CLASS_ALREADY_EXISTS and the
+            // existing one (same wndproc) is used. A null instance means
+            // the current process for both registration and creation.
+            let _atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(drag_wndproc),
+                lpszClassName: class,
+                ..Default::default()
+            });
             // Hidden zero-size popup on THIS thread, for SetCapture. It
             // must be a real (invisible) top-level window: message-only
             // windows do not take genuine mouse capture.
             let local = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
-                windows::core::w!("Static"),
+                class,
                 windows::core::w!("aetherium-drag"),
                 WS_POPUP,
                 -100,
@@ -341,17 +396,30 @@ pub fn begin_file_drag(
                 let _ = DestroyWindow(local);
                 return;
             };
-            let mut effect = DROPEFFECT(0);
-            let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
-            log::info!(
-                "drag-out: DoDragDrop returned {result:?}, final effect {:?}",
-                effect
+            let ctx = Box::into_raw(Box::new(DragStartContext {
+                data,
+                source,
+                app_hwnd: hwnd,
+            }));
+            // Start the drag from inside the message loop.
+            let _ = PostMessageW(
+                Some(local),
+                WM_START_DRAG,
+                WPARAM(0),
+                LPARAM(ctx as isize),
             );
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            // No hwnd filter: WM_QUIT is a thread message and would be
+            // invisible to a filtered GetMessage.
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            drop(Box::from_raw(ctx));
             CoUninitialize();
             let _ = ReleaseCapture();
             let _ = DestroyWindow(local);
         }
-        release_ghost_drag(hwnd);
     });
 }
 
