@@ -271,6 +271,7 @@ struct ClientHandler {
     port: u16,
 }
 
+// [impl->req~known-hosts-verification~1]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -419,6 +420,7 @@ async fn session_loop(
     result
 }
 
+// [impl->req~sftp-operations~1]
 async fn command_loop(
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     event_tx: &std_mpsc::Sender<Event>,
@@ -440,6 +442,7 @@ async fn command_loop(
                     Some(Command::ResizePty { cols, rows }) => {
                         shell.window_change(cols, rows, 0, 0).await.context("window-change")?;
                     }
+// [impl->req~log-rotation~1]
                     Some(Command::TailFile { tail_id, terminal, path }) => {
                         // `-F` follows the file *by name*, so the view keeps
                         // working across log rotation (rename + recreate).
@@ -508,6 +511,7 @@ async fn command_loop(
                         // reader task, which then drops the channel.
                         tails.remove(&tail_id);
                     }
+// [impl->req~api-drives-ui-sessions~1]
                     Some(Command::ApiExec { req_id, command }) => {
                         // A dedicated exec channel, like tail uses; the reply
                         // carries the collected stdout/stderr.
@@ -892,6 +896,7 @@ fn shell_quote(path: &str) -> String {
 
 /// Translate lone `\n` to `\r\n` (PTY-style ONLCR). Borrowed when no
 /// translation is needed.
+// [impl->req~piped-newline-handling~1]
 fn lf_to_crlf(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if !data.contains(&b'\n') {
         return std::borrow::Cow::Borrowed(data);
@@ -1423,6 +1428,7 @@ fn unique_download_path(dir: &std::path::Path, name: &str) -> PathBuf {
 
 /// Authenticate according to the profile's auth method; fail unless the
 /// server reports full success.
+// [impl->feat~silent-key-auth~1]
 async fn authenticate(handle: &mut Handle<ClientHandler>, profile: &Profile) -> Result<()> {
     let result = match &profile.auth {
         AuthMethod::Password { password } => {
@@ -1513,6 +1519,7 @@ fn detect_default_ssh_key() -> Option<PathBuf> {
 /// password-configured profile. Failures here are not fatal — they just mean
 /// the caller should fall back to the stored password — so only a definite
 /// `AuthResult::Success` is reported back.
+// [impl->req~default-key-fallback~1]
 async fn try_silent_auth(handle: &mut Handle<ClientHandler>, username: &str) -> Option<AuthResult> {
     // Unix: SSH_AUTH_SOCK tells us an agent is supposed to exist. Windows:
     // connecting to a missing agent fails fast, so just try it.
@@ -1541,6 +1548,7 @@ async fn try_silent_auth(handle: &mut Handle<ClientHandler>, username: &str) -> 
 /// Connect to the platform's ssh agent, boxing the stream so the rest of
 /// the agent code is platform-independent.
 #[cfg(unix)]
+// [impl->req~agent-auth~1]
 async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<AgentBox>> {
     use russh::keys::agent::client::AgentClient;
     Ok(AgentClient::connect_env().await?.dynamic())
@@ -1549,6 +1557,7 @@ async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<Agent
 /// Windows: try the OpenSSH service's agent pipe first (this is what
 /// `ssh.exe` talks to), then fall back to PuTTY's Pageant.
 #[cfg(windows)]
+// [impl->req~agent-auth~1]
 async fn connect_agent() -> Result<russh::keys::agent::client::AgentClient<AgentBox>> {
     use russh::keys::agent::client::AgentClient;
     let openssh_pipe = r"\\.\pipe\openssh-ssh-agent";

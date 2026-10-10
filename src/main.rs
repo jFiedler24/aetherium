@@ -6,6 +6,8 @@
 
 // GUI-subsystem binary on Windows: no console window next to the UI. stderr
 // is unavailable there, so the logger mirrors to a file (see below).
+// [impl->feat~windows-parity~1]
+// [impl->req~windows-gui-subsystem~1]
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod api;

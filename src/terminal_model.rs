@@ -212,6 +212,7 @@ impl TerminalModel {
     /// instant even on high-latency links; the server's identical echo is
     /// deduplicated on arrival in `feed`. Primary screen only — full-screen
     /// applications manage their own display and usually don't echo input.
+// [impl->req~local-echo~1]
     pub fn echo_input(&self, bytes: &[u8]) {
         if !Self::is_echoable_input(bytes) {
             return;
@@ -929,6 +930,7 @@ mod tests {
     }
 
     #[test]
+    // [utest->req~piped-newline-handling~1]
     fn log_grids_start_lines_at_column_zero() {
         // Piped remote output is \\n-terminated (no PTY translating to
         // \\r\\n) and alacritty routes raw LF to `linefeed` without LNM, so

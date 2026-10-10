@@ -109,6 +109,7 @@ const LILEX_BOLD_ITALIC: &[u8] = include_bytes!("fonts/Lilex-BoldItalic.ttf");
 
 /// Register the bundled Lilex family with the text system. Must run before
 /// any code resolves `theme::FONT_MONO`.
+// [impl->req~bundled-monospace-font~1]
 pub fn load_bundled_fonts(cx: &mut App) {
     let fonts: Vec<Cow<'static, [u8]>> = vec![
         Cow::Borrowed(LILEX_REGULAR),

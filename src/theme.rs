@@ -365,6 +365,7 @@ pub fn set_active(name: &str) -> bool {
 
 /// Parse the registry and restore the saved theme (defaulting to One Dark).
 /// Call once at startup, before any rendering.
+// [impl->req~bundled-zed-themes~1]
 pub fn init() {
     let saved = std::fs::read_to_string(crate::crypto::config_dir().join("theme.toml"))
         .ok()

@@ -1299,6 +1299,7 @@ impl RootView {
 
     // --- actions -----------------------------------------------------------
 
+// [impl->feat~connection-profiles~1]
     fn connect_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.store.profiles.is_empty() {
             // Nothing to connect to yet — offer the profile form instead of
@@ -1379,6 +1380,7 @@ impl RootView {
 
     /// Open a new read-only tab that follows a remote file via `tail -f`,
     /// running on the active (parent) tab's connection.
+// [impl->feat~log-follow-view~1]
     fn open_log_tab(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let connected = self
             .active_tab()
@@ -1495,6 +1497,7 @@ impl RootView {
     }
 
     /// Handle one request forwarded by the HTTP layer. Runs on the UI thread.
+// [impl->feat~rest-api~1]
     fn handle_api_request(&mut self, request: ApiRequest, cx: &mut Context<Self>) {
         match request {
             ApiRequest::Status { reply } => {
@@ -1973,6 +1976,7 @@ impl RootView {
     }
 
     /// Upload OS-dropped files/directories into `remote_dir` via SFTP.
+// [impl->feat~os-file-drop-in~1]
     fn upload_dropped_paths(
         &mut self,
         paths: &[PathBuf],
@@ -2188,6 +2192,7 @@ impl RootView {
 
     /// Switch the active theme (from the header's theme menu). Persists the
     /// choice; the whole UI re-reads colors on the next paint.
+// [impl->feat~theme-system~1]
     fn apply_theme(&mut self, name: String, cx: &mut Context<Self>) {
         if theme::set_active(&name) {
             self.theme_menu = false;
@@ -2387,6 +2392,7 @@ impl RootView {
     /// Stage a remote file locally and open the temp copy in a local
     /// editor (MobaXterm-style remote editing). The temp copy is watched;
     /// every save pops a "sync back to the device?" dialog.
+// [impl->feat~remote-edit-writeback~1]
     fn start_remote_edit(&mut self, remote: PathBuf, editor: EditorChoice, cx: &mut Context<Self>) {
         self.context_menu = None;
         let connected = self
@@ -3881,6 +3887,7 @@ fn colors_equal(a: Hsla, b: Hsla) -> bool {
 }
 
 impl RootView {
+// [impl->feat~terminal-emulation~1]
     fn render_terminal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(tab) = self.tabs.get(self.active) else {
             return div()
@@ -4515,6 +4522,7 @@ fn form_row(label: &str, field: &Entity<TextField>) -> gpui::AnyElement {
 }
 
 impl RootView {
+// [impl->feat~icon-ui~1]
     fn render_header(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let summary = self
             .selected
@@ -4649,6 +4657,7 @@ fn log_toolbar_button(
 
 /// SnakeTail-style toolbar for the active log tab: follow/pause, search
     /// with match navigation, a filter, and bookmarks. Empty for other tabs.
+// [impl->feat~snaketail-tools~1]
     fn render_log_toolbar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return div().into_any_element();
@@ -5634,6 +5643,7 @@ fn log_toolbar_button(
             .into_any_element()
     }
 
+// [impl->feat~transfer-progress~1]
     fn render_statusbar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Show the active tab's lifecycle, transfer, and status; with no
         // tabs the global (UI-level) status stands alone.
@@ -5808,6 +5818,7 @@ fn format_duration(seconds: u64) -> String {
 }
 
 /// Recursively flatten the visible part of the tree into indented rows.
+// [impl->feat~file-tree~1]
 fn render_tree_rows(
     nodes: &[TreeNode],
     depth: usize,
@@ -5951,6 +5962,7 @@ fn render_tree_rows(
                         }
                     },
                 )
+// [impl->feat~os-file-drag-out~1]
                 // When the drag leaves the window, offer the local temp path
                 // to the OS as a native file drag. Only works if the
                 // background download has already finished.

@@ -69,6 +69,7 @@ pub struct LogHighlighter {
     rules: Vec<HighlightRule>,
 }
 
+// [impl->req~log-highlighting~1]
 impl LogHighlighter {
     /// Load from the config dir, falling back to the embedded default.
     pub fn load() -> Self {
@@ -152,6 +153,7 @@ fn parse_color(text: &str) -> Option<Hsla> {
 }
 
 #[cfg(test)]
+// [utest->req~log-highlighting~1]
 mod tests {
     use super::*;
 

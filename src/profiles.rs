@@ -137,6 +137,7 @@ struct ProfileFile {
 }
 
 /// The collection of profiles plus the paths they persist to.
+// [impl->req~profile-storage~1]
 pub struct ProfileStore {
     pub profiles: Vec<Profile>,
     path: PathBuf,

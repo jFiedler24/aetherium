@@ -1,0 +1,25 @@
+# Requirements tracing with Open Very Fast Trace.
+# `cargo ovft --check` fails the job when a requirement loses coverage.
+name: Requirements
+
+on: [push, pull_request]
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-ovft
+        run: cargo install cargo-ovft
+
+      - name: Check requirements traceability
+        run: cargo ovft --check --output requirements_report.html
+
+      - name: Upload traceability report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: requirements-report
+          path: requirements_report.html

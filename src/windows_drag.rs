@@ -200,6 +200,7 @@ impl IDropSource_Impl for FileDrag_Impl {
 /// gpui's own (internal) drag tracking is unaffected. `hwnd` is the app
 /// window used to synthesize the button-up that the OLE loop consumes, so
 /// gpui doesn't think the button stays pressed.
+// [impl->req~windows-drag-out~1]
 pub fn begin_file_drag(
     hwnd: isize,
     wait_path: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,

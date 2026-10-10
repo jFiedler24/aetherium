@@ -1,0 +1,36 @@
+# Open Very Fast Trace configuration for aetherium.
+# Docs: https://github.com/jFiedler24/open-very-fast-trace
+# Run `cargo ovft` for a report or `cargo ovft --check` for a CI gate;
+# the build script also refreshes the report on every build.
+
+# Directories scanned for [impl->req~…~1] tags.
+source_dirs = ["src"]
+
+# Markdown specification items (`## req~name~1` + Needs/Covers).
+spec_dirs = ["docs/requirements"]
+
+source_patterns = ["*.rs"]
+
+exclude_patterns = [
+    "target/**",
+    ".git/**",
+    "aetherium.app/**",
+    "dist/**",
+]
+
+# creq = customer requirement (input, owned by the customer; only ever
+# covered, never reworded here). The rest follow the OFT convention.
+artifact_types = [
+    "creq",
+    "feat",
+    "req",
+    "arch",
+    "dsn",
+    "impl",
+    "utest",
+    "itest",
+    "stest",
+]
+
+verbose = false
+output_dir = "target"

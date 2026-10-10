@@ -77,6 +77,7 @@ fn load_token() -> (String, std::path::PathBuf) {
 }
 
 /// Start the listener thread. Returns `None` when no port could be bound.
+// [impl->req~api-transport~1]
 pub fn start(ui_tx: std_mpsc::Sender<ApiRequest>) -> Option<ApiInfo> {
     let (token, token_path) = load_token();
     let env_port = std::env::var("AETHERIUM_API_PORT")
@@ -249,6 +250,7 @@ fn err(message: impl Into<String>) -> Value {
     json!({"ok": false, "error": message.into()})
 }
 
+// [impl->req~api-token-auth~1]
 fn handle_connection(
     mut stream: std::net::TcpStream,
     ui_tx: std_mpsc::Sender<ApiRequest>,
