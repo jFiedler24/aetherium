@@ -64,6 +64,12 @@ pub enum Command {
     /// Permanently delete a remote entry. Directories are deleted
     /// recursively (children first); there is no trash over SFTP.
     Delete { session_id: u64, path: PathBuf },
+    /// Read the mode bits of a remote path (for the chmod dialog).
+    StatMode { session_id: u64, path: PathBuf },
+    /// Apply permission bits (`perms` is masked to 0o777; the backend
+    /// merges them with each entry's existing file-type bits).
+    /// `recursive` walks directories depth-first.
+    Chmod { session_id: u64, path: PathBuf, perms: u32, recursive: bool },
     /// Create an empty remote file.
     CreateFile { session_id: u64, path: PathBuf },
     /// Create a remote directory.
@@ -115,6 +121,19 @@ pub enum Event {
     EntryMoved { from: PathBuf, to: PathBuf },
     /// A remote entry was deleted; the UI refreshes the parent directory.
     EntryDeleted { path: PathBuf },
+    /// The mode bits of a path (for the chmod dialog); `mode` is the raw
+    /// st_mode when the server reported it.
+    StatModeDone {
+        session_id: u64,
+        path: PathBuf,
+        mode: Option<u32>,
+    },
+    /// A chmod finished; the UI refreshes the parent directory.
+    ChmodDone {
+        session_id: u64,
+        path: PathBuf,
+        result: Result<(), String>,
+    },
     /// A remote entry was created; the UI refreshes the parent directory.
     EntryCreated { parent: PathBuf },
     /// A remote file was downloaded to a local temp path for drag-out.
@@ -257,6 +276,22 @@ impl SessionHandle {
 
     pub fn delete(&self, session_id: u64, path: PathBuf) {
         self.send(Command::Delete { session_id, path });
+    }
+
+    /// Read the mode bits of a remote path (chmod dialog).
+    pub fn stat_mode(&self, session_id: u64, path: PathBuf) {
+        self.send(Command::StatMode { session_id, path });
+    }
+
+    /// Apply permission bits (0o777-masked) to a remote path, optionally
+    /// recursively. The backend preserves each entry's file-type bits.
+    pub fn chmod(&self, session_id: u64, path: PathBuf, perms: u32, recursive: bool) {
+        self.send(Command::Chmod {
+            session_id,
+            path,
+            perms,
+            recursive,
+        });
     }
 
     pub fn create_file(&self, session_id: u64, path: PathBuf) {
@@ -791,6 +826,28 @@ async fn command_loop(
                                     )));
                                 }
                             }
+                        });
+                    }
+                    Some(Command::StatMode { session_id, path }) => {
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let mode = sftp
+                                .metadata(path.to_string_lossy().into_owned())
+                                .await
+                                .ok()
+                                .and_then(|attrs| attrs.permissions);
+                            let _ = event_tx.send(Event::StatModeDone { session_id, path, mode });
+                        });
+                    }
+                    Some(Command::Chmod { session_id, path, perms, recursive }) => {
+                        let sftp = sftp.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = chmod_path(&sftp, &path, perms & 0o777, recursive)
+                                .await
+                                .map_err(|err| format!("{err:#}"));
+                            let _ = event_tx.send(Event::ChmodDone { session_id, path, result });
                         });
                     }
                     Some(Command::Disconnect) => return Ok(()),
@@ -1338,6 +1395,61 @@ async fn delete_remote(
         sftp.remove_file(remote.to_string_lossy().into_owned())
             .await
             .with_context(|| format!("removing {}", remote.display()))?;
+    }
+    Ok(())
+}
+
+/// Apply permission bits to one path, preserving its file-type bits.
+/// `perms` is masked to 0o777 by the caller; the current mode is read back
+/// first so the setuid/sticky/type bits survive.
+// [impl->req~chmod-operations~1]
+async fn chmod_one(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &std::path::Path,
+    perms: u32,
+) -> Result<()> {
+    let current = sftp
+        .metadata(remote.to_string_lossy().into_owned())
+        .await
+        .with_context(|| format!("stating remote {}", remote.display()))?;
+    let mode = (current.permissions.unwrap_or(0) & !0o777) | (perms & 0o777);
+    sftp.set_metadata(
+        remote.to_string_lossy().into_owned(),
+        russh_sftp::protocol::FileAttributes {
+            permissions: Some(mode),
+            ..Default::default()
+        },
+    )
+    .await
+    .with_context(|| format!("chmod {} → {:o}", remote.display(), perms & 0o777))?;
+    Ok(())
+}
+
+/// Apply permission bits to a path, descending into subdirectories when
+/// `recursive` is set. A failing child aborts the walk (chmod semantics are
+/// usually sensitive to partial application).
+async fn chmod_path(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &std::path::Path,
+    perms: u32,
+    recursive: bool,
+) -> Result<()> {
+    let metadata = sftp
+        .metadata(remote.to_string_lossy().into_owned())
+        .await
+        .with_context(|| format!("stating remote {}", remote.display()))?;
+    chmod_one(sftp, remote, perms).await?;
+    if recursive && metadata.is_dir() {
+        let entries = sftp
+            .read_dir(remote.to_string_lossy().into_owned())
+            .await
+            .with_context(|| format!("listing remote {}", remote.display()))?;
+        for entry in entries {
+            if entry.file_name() == "." || entry.file_name() == ".." {
+                continue;
+            }
+            Box::pin(chmod_path(sftp, std::path::Path::new(&entry.path()), perms, true)).await?;
+        }
     }
     Ok(())
 }

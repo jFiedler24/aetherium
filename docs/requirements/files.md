@@ -86,3 +86,24 @@ the transfer cancel, and remove the partial archive on failure.
 **Covers:** feat~folder-zip-download~1
 
 **Needs:** impl, utest
+
+## feat~chmod-ui~1
+
+Right-clicking any tree entry shall offer "Permissions…": a dialog
+showing the current mode and a user/group/other × read/write/exec grid,
+with an octal readout and a recursive option for directories.
+
+**Covers:** creq~chmod-from-filetree~1
+
+**Needs:** req, impl
+
+## req~chmod-operations~1
+
+Applying permissions shall read each entry's current mode and replace
+only the 0o777 bits (file-type bits preserved), walking subdirectories
+depth-first when recursive is requested; the dialog's checkbox grid maps
+to and from the nine permission bits exactly.
+
+**Covers:** feat~chmod-ui~1
+
+**Needs:** impl, utest

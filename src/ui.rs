@@ -560,6 +560,44 @@ struct CollectJob {
     deadline: std::time::Instant,
 }
 
+/// The chmod dialog: which path, the raw mode read back from the server,
+/// and the nine permission checkboxes (user/group/other × r/w/x).
+struct ChmodDialog {
+    path: PathBuf,
+    is_dir: bool,
+    /// Raw st_mode from the server; `None` while the stat is in flight.
+    loaded: Option<u32>,
+    /// Checkbox order: user r/w/x, group r/w/x, other r/w/x.
+    bits: [bool; 9],
+    recursive: bool,
+}
+
+/// Checkbox grid → permission bits (bit 8 = user-read … bit 0 = other-exec).
+// [impl->req~chmod-operations~1]
+fn perms_from_bits(bits: [bool; 9]) -> u32 {
+    let mut perms = 0u32;
+    for (ix, set) in bits.iter().enumerate() {
+        if *set {
+            perms |= 1 << (8 - ix);
+        }
+    }
+    perms
+}
+
+/// Permission bits → checkbox grid (inverse of [`perms_from_bits`]).
+fn bits_from_perms(perms: u32) -> [bool; 9] {
+    let mut bits = [false; 9];
+    for (ix, slot) in bits.iter_mut().enumerate() {
+        *slot = perms & (1 << (8 - ix)) != 0;
+    }
+    bits
+}
+
+/// `0o755`-style rendering of the nine permission bits.
+fn format_perms(perms: u32) -> String {
+    format!("0o{:03o}", perms & 0o777)
+}
+
 impl ApiWait {
     fn deadline(&self) -> std::time::Instant {
         match self {
@@ -743,6 +781,8 @@ pub struct RootView {
     shell_coloring: bool,
     /// The shortcuts & features overlay (header help button / Escape).
     help_open: bool,
+    /// The chmod dialog for a tree entry, if open.
+    chmod_dialog: Option<ChmodDialog>,
     /// Commands submitted in any session, persisted across launches and
     /// recallable with Shift+↑ / Shift+↓ (roadmap 3.4).
     history: HistoryStore,
@@ -850,6 +890,7 @@ impl RootView {
             shell_highlighter: Arc::new(LogHighlighter::load_shell()),
             shell_coloring: ui_settings.shell_coloring,
             help_open: false,
+            chmod_dialog: None,
             history: HistoryStore::load(),
             focus_handle: cx.focus_handle(),
         };
@@ -1233,6 +1274,56 @@ impl RootView {
                     LogLevel::Info,
                     format!("{tab_label}: created something in {}", parent.display()),
                 );
+            }
+            SessionEvent::StatModeDone { session_id: _, path, mode } => {
+                // Answer the chmod dialog's initial stat; ignore stray
+                // replies when the dialog is already gone.
+                if let Some(dialog) = &mut self.chmod_dialog {
+                    if dialog.path == path {
+                        match mode {
+                            Some(mode) => {
+                                dialog.loaded = Some(mode);
+                                dialog.bits = bits_from_perms(mode & 0o777);
+                            }
+                            None => {
+                                self.status =
+                                    format!("chmod: could not read mode of {}", path.display());
+                                self.chmod_dialog = None;
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+            SessionEvent::ChmodDone { session_id: _, path, result } => {
+                if self
+                    .chmod_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.path == path)
+                {
+                    self.chmod_dialog = None;
+                }
+                let tab = &mut self.tabs[index];
+                match &result {
+                    Ok(()) => {
+                        tab.status = format!("chmod applied to {}", path.display());
+                        if let Some(parent) = path.parent().map(PathBuf::from) {
+                            reload_dir(tab, &parent);
+                        }
+                    }
+                    Err(err) => {
+                        tab.status = format!("chmod {} failed: {err}", path.display());
+                    }
+                }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(
+                    match &result {
+                        Ok(()) => LogLevel::Info,
+                        Err(_) => LogLevel::Error,
+                    },
+                    format!("{tab_label}: chmod {}: {result:?}", path.display()),
+                );
+                cx.notify();
             }
             SessionEvent::Error(message) => {
                 let tab = &mut self.tabs[index];
@@ -2332,6 +2423,67 @@ impl RootView {
             if let Some(tab) = self.active_tab_mut() {
                 tab.transfer_cancel = Some(cancel);
             }
+        }
+        cx.notify();
+    }
+
+    /// Open the chmod dialog for the selected tree entry: reads the current
+    /// mode from the server, then edits the nine permission bits.
+    // [impl->feat~chmod-ui~1]
+    fn open_chmod_dialog(&mut self, is_dir: bool, cx: &mut Context<Self>) {
+        let connected = self
+            .active_tab()
+            .is_some_and(|tab| tab.state == ConnState::Connected);
+        if !connected {
+            self.status = "not connected".into();
+            cx.notify();
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(path) = tab.tree_selection.clone() else {
+            self.status = "select an entry in the tree first".into();
+            cx.notify();
+            return;
+        };
+        let session_id = tab.session_id;
+        if let Some(session) = tab.session.as_ref() {
+            session.stat_mode(session_id, path.clone());
+        }
+        self.chmod_dialog = Some(ChmodDialog {
+            path,
+            is_dir,
+            loaded: None,
+            bits: [false; 9],
+            recursive: false,
+        });
+        cx.notify();
+    }
+
+    /// Send the chmod with the dialog's bits; the dialog closes when the
+    /// backend confirms (`ChmodDone`).
+    fn apply_chmod(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.chmod_dialog.take() else {
+            return;
+        };
+        let perms = perms_from_bits(dialog.bits);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if let Some(session) = tab.session.as_ref() {
+            session.chmod(
+                tab.session_id,
+                dialog.path.clone(),
+                perms,
+                dialog.recursive,
+            );
+            self.status = format!(
+                "chmod {} {}{}",
+                format_perms(perms),
+                dialog.path.display(),
+                if dialog.recursive { " (recursive)" } else { "" }
+            );
         }
         cx.notify();
     }
@@ -4855,7 +5007,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ),
             (
                 "right-click",
-                "menu: tail -f, Download, Edit, VS Code, Rename, Delete — folders: Download as ZIP",
+                "menu: tail -f, Download, Edit, VS Code, Permissions…, Rename, Delete — folders: Download as ZIP",
             ),
             ("drag & drop", "move remote entries; drop OS files to upload"),
             (".. row", "navigate to the parent directory"),
@@ -6910,6 +7062,11 @@ impl Render for RootView {
                     cx.notify();
                     return;
                 }
+                if this.chmod_dialog.is_some() && event.keystroke.key.as_str() == "escape" {
+                    this.chmod_dialog = None;
+                    cx.notify();
+                    return;
+                }
                 if this.theme_menu && event.keystroke.key.as_str() == "escape" {
                     this.theme_menu = false;
                     cx.notify();
@@ -7073,27 +7230,44 @@ impl Render for RootView {
                 .flex_col()
                 .shadow_md();
             if is_dir {
-                menu = menu.child(
-                    div()
-                        .id("context-menu-zip")
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(theme::text())
-                        .hover(|item| item.bg(theme::selection()))
-                        .child(format!(
-                            "Download {} as ZIP",
-                            path.file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string())
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.context_menu = None;
-                            this.download_zip_selected(cx);
-                        })),
-                );
+                menu = menu
+                    .child(
+                        div()
+                            .id("context-menu-zip")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child(format!(
+                                "Download {} as ZIP",
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string())
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.download_zip_selected(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-chmod-dir")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child("Permissions…")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.open_chmod_dialog(true, cx);
+                            })),
+                    );
             } else {
                 // The tail -f closure captures `path` by move; the other
                 // items get their own clone.
@@ -7186,6 +7360,22 @@ impl Render for RootView {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.context_menu = None;
                                 this.start_rename(rename_path.clone(), window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu-chmod")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text())
+                            .hover(|item| item.bg(theme::selection()))
+                            .child("Permissions…")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.open_chmod_dialog(false, cx);
                             })),
                     )
                     .child(
@@ -7340,6 +7530,262 @@ impl Render for RootView {
                         .child(
                             // Swallow presses inside the panel so they don't
                             // hit the dismiss layer (same race as the menus).
+                            panel
+                                .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                }))
+                                .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                })),
+                        ),
+                );
+        }
+
+        // Chmod dialog: nine permission bits in a user/group/other × r/w/x
+        // grid, live octal readout, optional recursive apply for folders.
+        if let Some(dialog) = &self.chmod_dialog {
+            let path = dialog.path.clone();
+            let is_dir = dialog.is_dir;
+            let loaded = dialog.loaded;
+            let bits = dialog.bits;
+            let recursive = dialog.recursive;
+            let perms = perms_from_bits(bits);
+            let mut panel = div()
+                .id("chmod-panel")
+                .w(px(320.))
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::border())
+                .rounded_lg()
+                .shadow_md()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(theme::accent())
+                                .child("Permissions"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_dim())
+                                .child("Esc to cancel"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_dim())
+                        .truncate()
+                        .child(path.display().to_string()),
+                );
+            match loaded {
+                None => {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_dim())
+                            .child("reading current permissions…"),
+                    );
+                }
+                Some(mode) => {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_dim())
+                            .child(format!("current mode: {}", format_perms(mode & 0o777))),
+                    );
+                    // Header row: column labels.
+                    let mut header = div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(div().w(px(56.)).flex_none().child(""));
+                    for label in ["read", "write", "exec"] {
+                        header = header.child(
+                            div()
+                                .w(px(56.))
+                                .flex_none()
+                                .text_center()
+                                .text_xs()
+                                .text_color(theme::text_dim())
+                                .child(label),
+                        );
+                    }
+                    panel = panel.child(header);
+                    const ROWS: [&str; 3] = ["user", "group", "other"];
+                    for row in 0..3 {
+                        let mut line = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w(px(56.))
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(theme::text())
+                                    .child(ROWS[row]),
+                            );
+                        for col in 0..3 {
+                            let ix = row * 3 + col;
+                            let set = bits[ix];
+                            line = line.child(
+                                div()
+                                    .id(("chmod-bit", ix))
+                                    .w(px(56.))
+                                    .h(px(24.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .bg(if set {
+                                        theme::selection()
+                                    } else {
+                                        theme::button()
+                                    })
+                                    .text_color(if set {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .hover(|cell| cell.bg(theme::hover()))
+                                    .child(if set { "✓" } else { "·" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(dialog) = &mut this.chmod_dialog {
+                                            dialog.bits[ix] = !dialog.bits[ix];
+                                        }
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        panel = panel.child(line);
+                    }
+                    panel = panel
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::text_dim())
+                                        .child("new permissions"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(theme::FONT_MONO)
+                                        .text_sm()
+                                        .text_color(theme::accent())
+                                        .child(format_perms(perms)),
+                                ),
+                        )
+                        .when(is_dir, |panel| {
+                            panel.child(
+                                div()
+                                    .id("chmod-recursive")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(if recursive {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .child(if recursive { "☑" } else { "☐" })
+                                    .child("apply recursively")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(dialog) = &mut this.chmod_dialog {
+                                            dialog.recursive = !dialog.recursive;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        });
+                }
+            }
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("chmod-cancel")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_color(theme::text())
+                            .hover(|button| button.bg(theme::hover()))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chmod_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("chmod-apply")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .bg(theme::accent())
+                            .text_color(theme::bg())
+                            .hover(|button| button.opacity(0.9))
+                            .child("Apply")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.apply_chmod(cx);
+                            })),
+                    ),
+            );
+            root = root
+                .child(
+                    div()
+                        .id("chmod-overlay")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.chmod_dialog = None;
+                            cx.notify();
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                            this.chmod_dialog = None;
+                            cx.notify();
+                        }))
+                        .child(
                             panel
                                 .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
                                     cx.stop_propagation();
@@ -7617,5 +8063,28 @@ mod tests {
                 assert!(!keys.is_empty() && !description.is_empty());
             }
         }
+    }
+
+    // [utest->req~chmod-operations~1]
+    #[test]
+    fn chmod_bits_round_trip() {
+        // Every possible 9-bit permission value survives bits → perms → bits.
+        for perms in 0..=0o777u32 {
+            let bits = bits_from_perms(perms);
+            assert_eq!(perms_from_bits(bits), perms, "{perms:03o}");
+        }
+        // Spot-check the classic modes against their bit layout.
+        let bits = bits_from_perms(0o755);
+        assert_eq!(bits[0], true); // user read
+        assert_eq!(bits[1], true); // user write
+        assert_eq!(bits[2], true); // user exec
+        assert_eq!(bits[3], true); // group read
+        assert_eq!(bits[4], false); // group write
+        assert_eq!(bits[5], true); // group exec
+        assert_eq!(bits[6], true); // other read
+        assert_eq!(bits[7], false);
+        assert_eq!(bits[8], true);
+        assert_eq!(format_perms(0o755), "0o755");
+        assert_eq!(format_perms(0), "0o000");
     }
 }

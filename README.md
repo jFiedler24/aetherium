@@ -43,6 +43,9 @@ list](docs/images/log-follower.png)
   streams the whole structure (hierarchy and empty dirs preserved) into a
   single archive in `~/Downloads`, with the usual transfer progress bar
   (byte totals, speed, ETA, cancel).
+- **Chmod dialog** — right-click any entry → "Permissions…" shows the current
+  mode and a user/group/other × read/write/exec grid with a live octal
+  readout; folders can apply recursively. File-type bits are preserved.
 - **Help overlay** — the header's ? button lists every shortcut (terminal,
   file tree, log tabs) and what the header buttons do. Esc closes it.
 - **Log follower** — right-click any remote file in the tree → **tail -f** opens a

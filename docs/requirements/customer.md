@@ -108,3 +108,10 @@ A REST action shall collect the most common Linux logs from a target plus
 a configurable set of files, so an AI can pull diagnostics in one call.
 
 **Tags:** integration, ai
+
+## creq~chmod-from-filetree~1
+
+I want a chmod UI on right click in the file tree — see and edit an
+entry's permissions without opening a terminal.
+
+**Tags:** files

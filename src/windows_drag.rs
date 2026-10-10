@@ -33,8 +33,8 @@ use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_LBUTTON};
 use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetCursorPos, HWND_MESSAGE, PostMessageW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_LBUTTONUP,
+    CreateWindowExW, DestroyWindow, GetCursorPos, PostMessageW, WINDOW_EX_STYLE, WM_LBUTTONUP,
+    WS_POPUP,
 };
 use windows::core::{HRESULT, Interface, Ref, implement};
 
@@ -290,10 +290,11 @@ impl IDropSource_Impl for FileDrag_Impl {
 /// belong to the calling thread (otherwise DRAGDROP_E_INVALIDHWND), but
 /// running it on the UI thread pumps messages through gpui's event
 /// dispatch while its interior state is borrowed and panics with
-/// "RefCell already borrowed". A message-only window created on this
-/// thread and captured here satisfies the thread check without touching
-/// the UI thread at all. Afterwards a synthetic button-up releases gpui's
-/// internal drag state.
+/// "RefCell already borrowed". A hidden 0×0 popup owned by THIS thread is
+/// captured here to satisfy the thread check: a message-only window turned
+/// out NOT to hold real capture (the drag then died with
+/// DRAGDROP_E_INVALIDHWND the moment it left the app window). Afterwards a
+/// synthetic button-up releases gpui's internal drag state.
 // [impl->req~windows-drag-out~1]
 pub fn begin_file_drag(
     hwnd: isize,
@@ -302,17 +303,19 @@ pub fn begin_file_drag(
     std::thread::spawn(move || {
         log::info!("drag-out: OLE drag thread started (app hwnd {hwnd:#x})");
         unsafe {
-            // Message-only window owned by THIS thread, for SetCapture.
+            // Hidden zero-size popup on THIS thread, for SetCapture. It
+            // must be a real (invisible) top-level window: message-only
+            // windows do not take genuine mouse capture.
             let local = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 windows::core::w!("Static"),
                 windows::core::w!("aetherium-drag"),
-                WINDOW_STYLE(0),
+                WS_POPUP,
+                -100,
+                -100,
                 0,
                 0,
-                0,
-                0,
-                Some(HWND_MESSAGE),
+                None,
                 None,
                 None,
                 None,
