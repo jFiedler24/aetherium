@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 120" width="100%" height="120">
+  <defs>
+    <linearGradient id="logoGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="60%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <filter id="markGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#0a0c13" rx="14"/>
+
+  <!-- Icon Mark (Compact) -->
+  <g transform="translate(42, 22)">
+    <rect width="76" height="76" rx="18" fill="#131726" stroke="#252d47" stroke-width="1.5"/>
+    <path d="M 25 24 L 45 38 L 25 52" fill="none" stroke="#38bdf8" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" filter="url(#markGlow)"/>
+    <line x1="49" y1="52" x2="61" y2="52" stroke="#818cf8" stroke-width="6.5" stroke-linecap="round" filter="url(#markGlow)"/>
+    <circle cx="38" cy="14" r="3" fill="#38bdf8"/>
+  </g>
+
+  <!-- Typography -->
+  <text x="144" y="65" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Segoe UI', sans-serif" font-weight="700" font-size="40" letter-spacing="-0.03em" fill="url(#logoGrad)">
+    aetherium
+  </text>
+
+  <!-- Subtitle Tag -->
+  <text x="146" y="88" font-family="'JetBrains Mono', 'Fira Code', Menlo, monospace" font-size="13" font-weight="500" fill="#64748b" letter-spacing="0.08em">
+    FAST NATIVE RUST SSH TERMINAL
+  </text>
+
+  <!-- Subtle Version / Status Indicator -->
+  <g transform="translate(636, 36)">
+    <rect width="52" height="22" rx="6" fill="#161b2b" stroke="#2a3350" stroke-width="1"/>
+    <text x="26" y="15" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="600" fill="#38bdf8">v0.1</text>
+  </g>
+</svg>

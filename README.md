@@ -1,4 +1,4 @@
-# aetherium
+![aetherium](branding/aetherium-banner-logo.svg)
 
 A SSH/SFTP client built with **gpui** — the GPU-accelerated UI
 framework extracted from the [Zed editor](https://zed.dev). Same rendering stack,
@@ -71,19 +71,19 @@ list](docs/images/log-follower.png)
   tree root. Moves run as SFTP renames; both affected directories refresh
   afterwards.
 - **Auth methods** — password, key file (with optional passphrase), ssh-agent.
-- Zed's default dark theme and Zed Sans/Mono typography, ~60fps terminal
-  repaints only when dirty.
+- **Branded theme** — the Aetherium dark theme pairs midnight surfaces with
+  cyan/violet accents inspired by the app icon; Zed, Ayu, and Gruvbox themes
+  remain available in the switcher.
 
 ## Theme & fonts
 
-The UI colors are transcribed 1:1 from Zed's built-in default dark theme and
-its `terminal_ansi_*` palette (Zed is MIT-licensed; the values live in
-`src/main.rs` / `src/ui.rs` next to the code that uses them).
+Theme colors, including the terminal ANSI palette, are loaded from JSON files
+in `src/themes/`.
 
-Fonts are referenced by name — **Zed Sans** (UI) and **Zed Mono** (terminal) —
-and fall back to system fonts when not installed. Zed's fonts are licensed
-under the SIL Open Font License 1.1, which permits this use. They ship inside
-Zed itself, so for the exact Zed look copy the font files from a Zed
+The terminal bundles **Lilex**; optional **Zed Sans** UI fonts fall back to
+system fonts when not installed. Zed's fonts are licensed under the SIL Open
+Font License 1.1, which permits this use. They ship inside Zed itself, so for
+the exact Zed look copy the font files from a Zed
 installation (e.g. `Zed.app/Contents/Resources` on macOS) or install them
 system-wide. aetherium also loads every `.ttf`/`.otf`/`.ttc` found in
 `~/.config/aetherium/fonts/` on startup, so dropping the files there works too.
@@ -128,8 +128,8 @@ unchanged on macOS and Windows).
 open aetherium.app
 ```
 
-Packages a proper `.app` bundle with the aetherium Dock icon (built from
-`aetherium_icons_dark_v2/main_executable.svg`) and ad-hoc code signs it.
+Packages a proper `.app` bundle with the branded aetherium Dock icon (built from
+`branding/aetherium-app-icon.svg`) and ad-hoc code signs it.
 
 ### Windows
 

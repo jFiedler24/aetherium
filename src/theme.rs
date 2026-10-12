@@ -1,11 +1,10 @@
 //! Runtime-switchable themes.
 //!
-//! The bundled JSON files in `src/themes/` are Zed's own standard theme
-//! families (One, Ayu, Gruvbox — the set shipped with Zed today, along with
-//! their licenses, see `src/themes/LICENSES`), in Zed's theme schema. They
-//! are parsed into a flat [`ThemeData`] with one field per color the app
-//! actually uses (window chrome, terminal foreground/background, and the
-//! terminal's 16-color ANSI palette, which themes carry per theme).
+//! The bundled JSON files in `src/themes/` use Zed's theme schema. They
+//! include Zed's standard One, Ayu, and Gruvbox families and the app's own
+//! Aetherium brand theme. They are parsed into a flat [`ThemeData`] with one
+//! field per color the app actually uses (window chrome, terminal
+//! foreground/background, and the terminal's 16-color ANSI palette).
 //!
 //! The active theme lives in a process-global so the existing `theme::…()`
 //! call sites keep working unchanged; the header's theme button opens the
@@ -32,12 +31,13 @@ pub const FONT_UI: &str = "Zed Sans";
 pub const FONT_MONO: &str = "Lilex";
 
 const THEME_FILES: &[&str] = &[
+    include_str!("themes/aetherium.json"),
     include_str!("themes/one.json"),
     include_str!("themes/ayu.json"),
     include_str!("themes/gruvbox.json"),
 ];
 
-const DEFAULT_THEME: &str = "One Dark";
+const DEFAULT_THEME: &str = "Aetherium";
 
 // ── Zed theme JSON (the subset we consume) ─────────────────────────────
 

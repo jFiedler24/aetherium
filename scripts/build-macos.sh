@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 PROFILE=release
 [[ "${1:-}" == "--debug" ]] && PROFILE=debug
 
-ICON_SRC="aetherium_icons_dark_v2/main_executable.svg"
+ICON_SRC="branding/aetherium-app-icon.svg"
 APP="aetherium.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 

@@ -1,8 +1,7 @@
 //! aetherium — a MobaXterm-style SSH/SFTP client built on gpui (Zed's UI
 //! framework). Entry point: opens the main window with [`ui::RootView`].
 //!
-//! The SVG icon set in `aetherium_icons_dark_v2/` is embedded via
-//! [`assets::EmbeddedAssets`].
+//! SVG icons are embedded via [`assets::EmbeddedAssets`].
 
 // GUI-subsystem binary on Windows: no console window next to the UI. stderr
 // is unavailable there, so the logger mirrors to a file (see below).

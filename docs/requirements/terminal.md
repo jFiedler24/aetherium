@@ -33,8 +33,8 @@ high-latency links.
 ## feat~theme-system~1
 
 The whole UI — including terminal colors — shall be theme-driven, with
-Zed's standard theme families bundled, persisted selection, and a
-header switcher grouped dark/light.
+Zed's standard theme families and an Aetherium brand theme bundled,
+persisted selection, and a header switcher grouped dark/light.
 
 **Covers:** creq~slick-modern-ui~1
 
@@ -42,8 +42,8 @@ header switcher grouped dark/light.
 
 ## req~bundled-zed-themes~1
 
-Themes shall be parsed from the original Zed theme JSON (One, Ayu,
-Gruvbox families) rather than hardcoded palettes.
+Zed themes shall be parsed from the original Zed theme JSON (One, Ayu,
+Gruvbox families); the bundled Aetherium theme shall use the same schema.
 
 **Covers:** feat~theme-system~1
 

@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use anyhow::Result;
 use gpui::{App, AssetSource, SharedString};
 
-const MAIN_EXECUTABLE: &str = include_str!("../aetherium_icons_dark_v2/main_executable.svg");
+const MAIN_EXECUTABLE: &str = include_str!("../branding/aetherium-app-icon.svg");
 const CLI_TERMINAL: &str = include_str!("../aetherium_icons_dark_v2/cli_terminal.svg");
 const BACKGROUND_PROCESS: &str = include_str!("../aetherium_icons_dark_v2/background_process.svg");
 const CONFIGURATION: &str = include_str!("../aetherium_icons_dark_v2/configuration.svg");

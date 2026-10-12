@@ -5031,7 +5031,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
         rows: &[
             ("highlighter button", "toggle heuristic shell syntax coloring"),
             ("eye button", "toggle local echo (typing lag on slow links)"),
-            ("theme dropdown", "switch between the bundled Zed themes"),
+            ("theme dropdown", "switch between the bundled themes"),
             (
                 "REST API",
                 "http://127.0.0.1:48920 — bearer token in the config dir (api_token); GET / lists endpoints",
