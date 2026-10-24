@@ -90,6 +90,11 @@ pub enum Command {
     ApiUpload { req_id: u64, local: PathBuf, remote: String },
     /// Download a remote file to a temp path for the REST API.
     ApiDownload { req_id: u64, remote: String },
+    /// Remove every known_hosts entry for the host; used when the recorded
+    /// key changed and the user chose to trust the new one. The following
+    /// connect re-learns the current key trust-on-first-use.
+    /// [impl->req~accept-changed-host-key~1]
+    ForgetKnownHost { host: String, port: u16 },
     Disconnect,
 }
 
@@ -142,6 +147,21 @@ pub enum Event {
     /// disturb the shared transfer progress UI.
     TempDownloadReady { session_id: u64, remote: PathBuf, local: PathBuf },
     Error(String),
+    /// Host-key verification failed because the key differs from the one
+    /// recorded in known_hosts. The UI shows `message` and offers to trust
+    /// the new key (`fingerprint`) by forgetting the stale entry and
+    /// reconnecting.
+    /// [impl->req~accept-changed-host-key~1]
+    HostKeyChanged {
+        host: String,
+        port: u16,
+        message: String,
+        fingerprint: String,
+    },
+    /// Reply to `Command::ForgetKnownHost`: on success the UI reconnects
+    /// and the new key is learned trust-on-first-use.
+    /// [impl->req~accept-changed-host-key~1]
+    KnownHostForgotten { result: Result<(), String> },
     Disconnected,
     /// The `tail -f` channel with the given tab id ended (file closed or the
     /// session went away).
@@ -256,6 +276,14 @@ impl SessionHandle {
         self.send(Command::Download { session_id, remote, cancel });
     }
 
+    /// Forget the recorded host key so the next connect re-learns it (the
+    /// user accepted a changed host key). `Event::KnownHostForgotten`
+    /// reports the outcome.
+    /// [impl->req~accept-changed-host-key~1]
+    pub fn forget_known_host(&self, host: String, port: u16) {
+        self.send(Command::ForgetKnownHost { host, port });
+    }
+
     /// Download a remote directory tree into a single .zip in ~/Downloads.
     pub fn download_zip(&self, session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool>) {
         self.send(Command::DownloadZip { session_id, remote, cancel });
@@ -308,12 +336,30 @@ impl SessionHandle {
     }
 }
 
+/// Why host-key verification rejected the server, recorded for the UI.
+/// russh maps a `false` from `check_server_key` to the generic
+/// `Error::UnknownKey` ("Unknown server key"), so the actual cause is
+/// stashed here; `changed_key` carries the new key's OpenSSH fingerprint
+/// when the recorded one differs, which enables the accept-changed-key
+/// flow (forget the stale entry, reconnect, re-learn).
+/// [impl->req~connect-error-visibility~1]
+#[derive(Debug)]
+struct HostKeyFailure {
+    message: String,
+    /// Fingerprint of the key the server actually presented, when it
+    /// differs from the recorded one (`None` for other rejections).
+    changed_key: Option<String>,
+}
+
 /// russh client handler. Verifies the server's host key against
 /// `~/.ssh/known_hosts`; unknown or mismatched keys are rejected rather than
 /// silently accepted, closing the "accept anything" hole from v1.
 struct ClientHandler {
     host: String,
     port: u16,
+    /// Where `check_server_key` records the precise rejection reason for
+    /// `run` to turn into a useful connect error.
+    failure: Arc<Mutex<Option<HostKeyFailure>>>,
 }
 
 // [impl->req~known-hosts-verification~1]
@@ -324,11 +370,18 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        let record_failure = |failure: HostKeyFailure| {
+            log::warn!("host key check: {}", failure.message);
+            *self.failure.lock() = Some(failure);
+        };
         let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
-            eprintln!(
-                "aetherium: rejecting certificate-based host key for {}:{} (unsupported)",
-                self.host, self.port
-            );
+            record_failure(HostKeyFailure {
+                message: format!(
+                    "host key verification failed for {}:{}: the server uses a certificate-based host key, which aetherium does not support yet",
+                    self.host, self.port
+                ),
+                changed_key: None,
+            });
             return Ok(false);
         };
         match russh::keys::check_known_hosts(&self.host, self.port, key) {
@@ -338,7 +391,7 @@ impl client::Handler for ClientHandler {
                 // learn it now. A *changed* key (KeyChanged below) is still
                 // rejected, which is what protects against MITM.
                 if let Err(err) = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, key) {
-                    eprintln!(
+                    log::warn!(
                         "aetherium: could not record host key for {}:{}: {err}",
                         self.host, self.port
                     );
@@ -346,10 +399,23 @@ impl client::Handler for ClientHandler {
                 Ok(true)
             }
             Err(err) => {
-                eprintln!(
-                    "aetherium: host key verification failed for {}:{}: {err}",
-                    self.host, self.port
-                );
+                // [impl->req~connect-error-visibility~1]
+                let mut failure = HostKeyFailure {
+                    message: format!(
+                        "host key verification failed for {}:{}: {err}",
+                        self.host, self.port
+                    ),
+                    changed_key: None,
+                };
+                if matches!(err, russh::keys::Error::KeyChanged { .. }) {
+                    // [impl->req~accept-changed-host-key~1]
+                    failure.changed_key =
+                        Some(key.fingerprint(russh::keys::HashAlg::Sha256).to_string());
+                    failure.message.push_str(
+                        " — the host's key differs from the recorded one; if the change is expected (host reinstalled or replaced), remove its stale entry from known_hosts and reconnect",
+                    );
+                }
+                record_failure(failure);
                 Ok(false)
             }
         }
@@ -367,17 +433,74 @@ async fn run(
         let profile = loop {
             match cmd_rx.recv().await {
                 Some(Command::Connect(profile)) => break profile,
+                // [impl->req~accept-changed-host-key~1]
+                Some(Command::ForgetKnownHost { host, port }) => {
+                    let result = forget_known_host(&host, port).map_err(|err| format!("{err:#}"));
+                    let _ = event_tx.send(Event::KnownHostForgotten { result });
+                }
                 Some(_) => continue, // ignore input while disconnected
                 None => return,      // UI is gone
             }
         };
 
-        if let Err(err) = session_loop(profile, &mut cmd_rx, &event_tx, &terminal).await {
-            let _ = event_tx.send(Event::Error(format!("{err:#}")));
+        // Shared with the connect's `ClientHandler`: when verification
+        // rejects the server, the precise reason (and the new key's
+        // fingerprint for a changed key) lands here.
+        let host_key_failure = Arc::new(Mutex::new(None));
+        let host = profile.host.clone();
+        let port = profile.port;
+        if let Err(err) =
+            session_loop(profile, &mut cmd_rx, &event_tx, &terminal, host_key_failure.clone())
+                .await
+        {
+            // [impl->req~connect-error-visibility~1]
+            let _ = event_tx.send(match host_key_failure.lock().take() {
+                // [impl->req~accept-changed-host-key~1]
+                Some(HostKeyFailure { message, changed_key: Some(fingerprint) }) => {
+                    Event::HostKeyChanged { host, port, message, fingerprint }
+                }
+                Some(HostKeyFailure { message, .. }) => Event::Error(message),
+                None => Event::Error(format!("{err:#}")),
+            });
         }
         terminal.clear_pty_writer();
         let _ = event_tx.send(Event::Disconnected);
     }
+}
+
+/// Remove every known_hosts entry naming `host` — the `ssh-keygen -R`
+/// equivalent. The following connect re-learns the server's current key
+/// trust-on-first-use. A missing file is fine (nothing to forget).
+/// [impl->req~accept-changed-host-key~1]
+fn forget_known_host(host: &str, port: u16) -> Result<()> {
+    let Some(home) = dirs::home_dir() else {
+        return Err(anyhow!("could not locate the home directory"));
+    };
+    let path = home.join(".ssh").join("known_hosts");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    let wanted = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let names = line.split_whitespace().next().unwrap_or("");
+            !names.split(',').any(|name| name == wanted)
+        })
+        .collect();
+    let mut rewritten = kept.join("\n");
+    if !kept.is_empty() {
+        rewritten.push('\n');
+    }
+    std::fs::write(&path, rewritten)
+        .with_context(|| format!("rewriting {}", path.display()))?;
+    Ok(())
 }
 
 /// Connect, authenticate, open shell + SFTP channels, and serve commands
@@ -387,6 +510,7 @@ async fn session_loop(
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     event_tx: &std_mpsc::Sender<Event>,
     terminal: &TerminalModel,
+    host_key_failure: Arc<Mutex<Option<HostKeyFailure>>>,
 ) -> Result<()> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(60)),
@@ -395,16 +519,29 @@ async fn session_loop(
         ..Default::default()
     });
 
-    let mut handle = client::connect(
+    // [impl->req~connect-error-visibility~1]
+    let mut handle = match client::connect(
         config,
         (profile.host.as_str(), profile.port),
         ClientHandler {
             host: profile.host.clone(),
             port: profile.port,
+            failure: host_key_failure.clone(),
         },
     )
     .await
-    .with_context(|| format!("connecting to {}:{}", profile.host, profile.port))?;
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            // A rejection in `check_server_key` surfaces here as russh's
+            // generic "Unknown server key"; `run` reads the precise reason
+            // the verifier recorded from the shared slot and reports that
+            // instead, so the UI shows e.g. "The server key changed at
+            // line N" rather than nothing at all.
+            return Err(err)
+                .with_context(|| format!("connecting to {}:{}", profile.host, profile.port));
+        }
+    };
 
     authenticate(&mut handle, &profile).await?;
 
@@ -855,6 +992,9 @@ async fn command_loop(
                         // Already connected; a new Connect is handled after
                         // the UI disconnects first.
                     }
+                    // Meaningful only while idle (between sessions); a live
+                    // session already passed verification.
+                    Some(Command::ForgetKnownHost { .. }) => {}
                     None => return Ok(()),
                 }
             }

@@ -52,10 +52,13 @@ fn main() {
 
     let terminal = TerminalModel::new(80, 24);
     let session = SessionHandle::spawn(terminal.clone());
-    session.connect(profile);
+    session.connect(profile.clone());
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut connected = false;
+    // Set once the accept flow reconnects, so the loop survives the failed
+    // attempt's Disconnected event and watches the reconnect through.
+    let mut reconnecting = false;
     while std::time::Instant::now() < deadline {
         if let Some(event) = session.try_recv_event() {
             match event {
@@ -74,9 +77,25 @@ fn main() {
                 Event::Error(message) => {
                     println!("ERROR {message}");
                 }
+                // The recorded key changed: exercise the accept flow —
+                // forget the stale entry, then reconnect (re-learns TOFU).
+                Event::HostKeyChanged { message, fingerprint, .. } => {
+                    println!("HOSTKEY-CHANGED {message}");
+                    println!("FINGERPRINT {fingerprint}");
+                    session.send(Command::ForgetKnownHost { host: host.clone(), port });
+                }
+                Event::KnownHostForgotten { result } => {
+                    println!("FORGOTTEN {result:?}");
+                    if result.is_ok() {
+                        reconnecting = true;
+                        session.connect(profile.clone());
+                    }
+                }
                 Event::Disconnected => {
                     println!("DISCONNECTED");
-                    break;
+                    if connected || reconnecting {
+                        break;
+                    }
                 }
                 _ => {}
             }

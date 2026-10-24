@@ -46,6 +46,21 @@ enum ConnState {
     Disconnected,
     Connecting,
     Connected,
+    /// The connect attempt failed; `tab.status` holds the error text and
+    /// must not be overwritten with a generic "disconnected".
+    Failed,
+}
+
+/// Host-key change prompt (modal): the recorded known_hosts key differs
+/// from the one the server presented. Accepting removes the stale entry
+/// and reconnects; the new key is then learned trust-on-first-use.
+/// [impl->req~accept-changed-host-key~1]
+#[derive(Clone)]
+struct HostKeyPrompt {
+    host: String,
+    port: u16,
+    /// OpenSSH fingerprint (SHA256) of the key the server presented.
+    fingerprint: String,
 }
 
 /// One node of the lazily-loaded remote file tree.
@@ -713,6 +728,11 @@ pub struct RootView {
     /// Deleting is permanent over SFTP (no trash), so both the Delete key
     /// and the context menu ask first.
     confirm_delete: Option<PathBuf>,
+    /// Host-key change prompt: offers to forget the stale known_hosts
+    /// entry and reconnect (one click instead of `ssh-keygen -R` plus a
+    /// manual reconnect).
+    /// [impl->req~accept-changed-host-key~1]
+    host_key_prompt: Option<HostKeyPrompt>,
     /// The theme switcher dropdown is open (anchored under the header).
     theme_menu: bool,
     /// Inline rename/create editor in the file tree, if one is open.
@@ -863,6 +883,7 @@ impl RootView {
             next_tab_id: 0,
             context_menu: None,
             confirm_delete: None,
+            host_key_prompt: None,
             theme_menu: false,
             tree_editor: None,
             tree_drag_target: None,
@@ -1325,22 +1346,53 @@ impl RootView {
                 );
                 cx.notify();
             }
+            // [impl->req~connect-error-visibility~1]
             SessionEvent::Error(message) => {
                 let tab = &mut self.tabs[index];
                 tab.status = message.clone();
                 if tab.state == ConnState::Connecting {
-                    tab.state = ConnState::Disconnected;
+                    // `Disconnected` arrives right behind this event; the
+                    // Failed state tells it to keep the error text instead
+                    // of replacing it with a generic "disconnected".
+                    tab.state = ConnState::Failed;
                 }
                 let tab_label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Error, format!("{tab_label}: {message}"));
                 log::warn!("session: {tab_label}: {message}");
             }
+            // Same visible handling as `Error`, plus the accept-changed-key
+            // prompt.
+            // [impl->req~accept-changed-host-key~1]
+            SessionEvent::HostKeyChanged {
+                host,
+                port,
+                message,
+                fingerprint,
+            } => {
+                let tab = &mut self.tabs[index];
+                tab.status = message.clone();
+                if tab.state == ConnState::Connecting {
+                    tab.state = ConnState::Failed;
+                }
+                let tab_label = Self::tab_log_label(&self.tabs[index]);
+                self.log(LogLevel::Error, format!("{tab_label}: {message}"));
+                log::warn!("session: {tab_label}: {message}");
+                self.host_key_prompt = Some(HostKeyPrompt {
+                    host,
+                    port,
+                    fingerprint,
+                });
+            }
             SessionEvent::Disconnected => {
                 let tab_id = self.tabs[index].id;
                 let session_id = self.tabs[index].session_id;
                 let tab = &mut self.tabs[index];
-                tab.state = ConnState::Disconnected;
-                tab.status = "disconnected".to_string();
+                // A failed connect keeps its error message on display; only
+                // a live session turning offline gets the generic label.
+                if tab.state != ConnState::Failed {
+                    tab.state = ConnState::Disconnected;
+                    tab.status = "disconnected".to_string();
+                }
                 tab.tree.clear();
                 tab.root_path = None;
                 tab.tree_selection = None;
@@ -1357,6 +1409,7 @@ impl RootView {
                 self.purge_staged_for(session_id);
                 // The confirmation dialog (if up) outlived its session.
                 self.confirm_delete = None;
+                self.host_key_prompt = None;
                 self.tree_editor = None;
                 // The tail channels die with the connection; mark the log
                 // tabs that rode on it.
@@ -1371,6 +1424,35 @@ impl RootView {
                 let tab_label = Self::tab_log_label(&self.tabs[index]);
                 self.log(LogLevel::Warn, format!("{tab_label}: disconnected"));
                 log::info!("session: {tab_label} disconnected");
+            }
+            // Reply to the host-key dialog's accept: the stale entry is
+            // gone, so reconnecting re-learns the current key (TOFU).
+            // [impl->req~accept-changed-host-key~1]
+            SessionEvent::KnownHostForgotten { result } => {
+                self.host_key_prompt = None;
+                match result {
+                    Ok(()) => {
+                        self.log(
+                            LogLevel::Info,
+                            "known_hosts: stale entry removed, reconnecting".to_string(),
+                        );
+                        if index != self.active {
+                            self.activate_tab(index, cx);
+                        }
+                        self.reconnect_tab(cx);
+                    }
+                    Err(message) => {
+                        if let Some(tab) = self.active_tab_mut() {
+                            tab.status = format!("could not remove stale host key: {message}");
+                        }
+                        let tab_label = Self::tab_log_label(&self.tabs[index]);
+                        self.log(
+                            LogLevel::Error,
+                            format!("{tab_label}: could not remove stale host key: {message}"),
+                        );
+                        log::warn!("session: {tab_label}: forget_known_host failed: {message}");
+                    }
+                }
             }
             SessionEvent::TempDownloadReady {
                 session_id,
@@ -1686,7 +1768,10 @@ impl RootView {
                     .as_ref()
                     .is_some_and(|p| p.name == target || p.summary() == target)
         }) {
-            if self.tabs[index].state == ConnState::Disconnected {
+            if matches!(
+                self.tabs[index].state,
+                ConnState::Disconnected | ConnState::Failed
+            ) {
                 self.active = index;
                 self.reconnect_tab(cx);
             }
@@ -1744,6 +1829,7 @@ impl RootView {
                                 ConnState::Connected => "connected",
                                 ConnState::Connecting => "connecting",
                                 ConnState::Disconnected => "disconnected",
+                                ConnState::Failed => "failed",
                             },
                             "status": tab.status,
                         })
@@ -2534,6 +2620,43 @@ impl RootView {
         cx.notify();
     }
 
+    /// Host-key dialog's confirm button: ask the backend to drop the stale
+    /// known_hosts entry; the `KnownHostForgotten` reply triggers the
+    /// reconnect (and the new key is learned trust-on-first-use).
+    /// [impl->req~accept-changed-host-key~1]
+    fn accept_changed_host_key(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.host_key_prompt.take() else {
+            return;
+        };
+        let (session, tab_label) = match self.active_tab() {
+            Some(tab) => (tab.session.clone(), Self::tab_log_label(tab)),
+            None => return,
+        };
+        let Some(session) = session else {
+            self.status = "not connected".into();
+            cx.notify();
+            return;
+        };
+        session.forget_known_host(prompt.host.clone(), prompt.port);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.status = format!("removing stale host key for {} …", prompt.host);
+        }
+        self.log(
+            LogLevel::Info,
+            format!("{tab_label}: removing stale known_hosts entry for {}", prompt.host),
+        );
+        cx.notify();
+    }
+
+    /// Host-key dialog's cancel / outside click: dismiss the dialog and
+    /// keep the failure text on display; the user can still deal with
+    /// known_hosts by hand and reconnect.
+    /// [impl->req~accept-changed-host-key~1]
+    fn dismiss_host_key_prompt(&mut self, cx: &mut Context<Self>) {
+        self.host_key_prompt = None;
+        cx.notify();
+    }
+
     fn on_delete_entry(
         &mut self,
         _: &DeleteEntry,
@@ -2601,7 +2724,9 @@ impl RootView {
         let Some(tab) = self.active_tab() else {
             return;
         };
-        if tab.is_log() || tab.state != ConnState::Disconnected {
+        if tab.is_log()
+            || !matches!(tab.state, ConnState::Disconnected | ConnState::Failed)
+        {
             return;
         }
         let Some(profile) = tab.profile.clone() else {
@@ -6446,6 +6571,8 @@ fn log_toolbar_button(
             ConnState::Disconnected => (assets::ICON_DISCONNECTED, "disconnected", theme::text_dim()),
             ConnState::Connecting => (assets::ICON_SIGNAL_MEDIUM, "connecting…", theme::warning()),
             ConnState::Connected => (assets::ICON_SIGNAL_HIGH, "connected", theme::success()),
+            // [impl->req~connect-error-visibility~1]
+            ConnState::Failed => (assets::ICON_DISCONNECTED, "connection failed", theme::danger()),
         };
         // Active transfer progress, shown between the state and the status
         // message: a graphical bar when the total is known, plus the
@@ -6474,7 +6601,9 @@ fn log_toolbar_button(
         // Dropped shell tab with a known profile: offer a one-click way
         // back (phone sessions disconnect constantly).
         let can_reconnect = self.active_tab().is_some_and(|tab| {
-            !tab.is_log() && tab.profile.is_some() && tab.state == ConnState::Disconnected
+            !tab.is_log()
+                && tab.profile.is_some()
+                && matches!(tab.state, ConnState::Disconnected | ConnState::Failed)
         });
         div()
             .h(px(STATUSBAR_HEIGHT))
@@ -7906,6 +8035,119 @@ impl Render for RootView {
                                                 this.delete_remote_confirmed(remote.clone(), cx);
                                             }))
                                     }),
+                            ),
+                    ),
+            );
+        }
+
+        // Host-key change dialog, painted above everything like the delete
+        // dialog. Accept removes the stale known_hosts entry and reconnects
+        // (the new key is then learned trust-on-first-use); Cancel or an
+        // outside click dismisses and keeps the failure text on display.
+        // [impl->req~accept-changed-host-key~1]
+        if let Some(prompt) = self.host_key_prompt.clone() {
+            root = root.child(
+                div()
+                    .id("host-key-dialog")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::black().opacity(0.4))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.dismiss_host_key_prompt(cx);
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                        this.dismiss_host_key_prompt(cx);
+                    }))
+                    .child(
+                        div()
+                            .id("host-key-dialog-panel")
+                            .w(px(400.))
+                            .bg(theme::panel())
+                            .border_1()
+                            .border_color(theme::border())
+                            .rounded_md()
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .shadow_md()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }))
+                            .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::text())
+                                    .child(format!(
+                                        "Host key changed for {}:{}",
+                                        prompt.host, prompt.port
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_dim())
+                                    .child(
+                                        "The key differs from the one recorded in known_hosts. Accept only if you expect this — a host reinstall or replacement — otherwise someone may be intercepting the connection.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_dim())
+                                    .child(format!(
+                                        "New key fingerprint: {}",
+                                        prompt.fingerprint
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("host-key-dialog-cancel")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .text_color(theme::text())
+                                            .hover(|button| button.bg(theme::hover()))
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.dismiss_host_key_prompt(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("host-key-dialog-accept")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .bg(theme::danger())
+                                            .text_color(gpui::white())
+                                            .hover(|button| button.opacity(0.9))
+                                            .child("Accept new key & reconnect")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.accept_changed_host_key(cx);
+                                            })),
+                                    ),
                             ),
                     ),
             );

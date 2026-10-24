@@ -32,6 +32,30 @@ keys are rejected.
 
 **Needs:** impl
 
+## req~connect-error-visibility~1
+
+When a connection attempt fails — including host-key verification
+failure, DNS/connection errors, and authentication failure — the error
+text shall be shown in the UI (status bar and in-app log), not only in
+a stderr or log-file diagnostic. A failed tab keeps its error message
+instead of reverting to a generic "disconnected", and stays
+reconnectable.
+
+**Covers:** feat~connection-profiles~1
+
+**Needs:** impl
+
+## req~accept-changed-host-key~1
+
+When verification fails because the recorded host key changed, the app
+shall show the new key's fingerprint and offer a one-click way to remove
+the stale known_hosts entry and reconnect — the `ssh-keygen -R` plus
+trust-on-first-use equivalent.
+
+**Covers:** feat~connection-profiles~1
+
+**Needs:** impl
+
 ## feat~silent-key-auth~1
 
 Connecting shall first try key-based authentication without prompting
