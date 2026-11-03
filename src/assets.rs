@@ -44,6 +44,7 @@ const LOCK: &str = include_str!("../zed_icons/lock.svg");
 const LOCK_OFF: &str = include_str!("../zed_icons/lock_off.svg");
 const HIGHLIGHTER: &str = include_str!("../zed_icons/highlighter.svg");
 const CIRCLE_HELP: &str = include_str!("../zed_icons/circle_help.svg");
+const COPY: &str = include_str!("../zed_icons/copy.svg");
 
 /// App icon, shown next to the brand name in the header.
 pub const ICON_MAIN_EXECUTABLE: &str = "aetherium/icons/main_executable.svg";
@@ -103,6 +104,8 @@ pub const ICON_LOCK_OFF: &str = "aetherium/icons/lock_off.svg";
 pub const ICON_HIGHLIGHTER: &str = "aetherium/icons/highlighter.svg";
 /// Header: opens the shortcuts & features help overlay.
 pub const ICON_CIRCLE_HELP: &str = "aetherium/icons/circle_help.svg";
+/// Header: copy the whole terminal (scrollback included) to the clipboard.
+pub const ICON_COPY: &str = "aetherium/icons/copy.svg";
 
 const BUILD_TOOL_PATH: &str = "aetherium/icons/build_tool.svg";
 const UPDATE_MANAGER_PATH: &str = "aetherium/icons/update_manager.svg";
@@ -204,6 +207,7 @@ impl AssetSource for EmbeddedAssets {
             ICON_LOCK_OFF => Some(LOCK_OFF.as_bytes()),
             ICON_HIGHLIGHTER => Some(HIGHLIGHTER.as_bytes()),
             ICON_CIRCLE_HELP => Some(CIRCLE_HELP.as_bytes()),
+            ICON_COPY => Some(COPY.as_bytes()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

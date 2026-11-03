@@ -803,11 +803,6 @@ pub struct RootView {
     /// when the drag ends inside the app, when the session disconnects or its
     /// tab closes, and every staged file is purged on the next app launch.
     temp_download_cache: TempDownloadCache,
-    /// Last known window position of an in-progress terminal selection
-    /// drag (left button held). The repaint loop scrolls the grid while the
-    /// cursor sits outside the viewport so the selection can reach rows that
-    /// are not visible yet; cleared on mouse-up.
-    terminal_drag_point: Arc<Mutex<Option<Point<Pixels>>>>,
     /// Instant local echo of printable keystrokes (the server's identical
     /// echo is deduplicated on arrival) — the fix for typing lag on
     /// high-latency links. Toggleable from the header.
@@ -929,7 +924,6 @@ impl RootView {
             logs_scroll_pending: false,
             terminal_wake_tx,
             temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            terminal_drag_point: Arc::new(Mutex::new(None)),
             local_echo: true,
             terminal_font_size: ui_settings.terminal_font_size,
             shell_highlighter: Arc::new(LogHighlighter::load_shell()),
@@ -963,70 +957,6 @@ impl RootView {
 
     fn tab_index_by_id(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == id)
-    }
-
-    /// While a left-button drag extends a terminal selection and the cursor
-    /// sits outside the viewport, scroll the grid toward the cursor so the
-    /// selection can reach rows that are not visible yet, re-extending it
-    /// every tick (classic terminal autoscroll). Scrolling away from the
-    /// bottom pauses a log tab's follow, like the wheel handler.
-    fn terminal_autoscroll_tick(&mut self, cx: &mut Context<Self>) {
-        let Some(point) = self.terminal_drag_point.lock().as_ref().copied() else {
-            return;
-        };
-        let active = self.active;
-        let Some(tab) = self.tabs.get_mut(active) else {
-            return;
-        };
-        if !tab.terminal.has_selection() {
-            *self.terminal_drag_point.lock() = None;
-            return;
-        }
-        // Like the wheel handler: in filter mode the visible rows are a
-        // synthetic window scrolled via `filter_offset`, so the grid must
-        // not scroll (and a stale grid selection must not autoscroll it).
-        if tab
-            .log_view
-            .as_ref()
-            .is_some_and(|view| view.filtering())
-        {
-            return;
-        }
-        let Some(geometry) = tab.geometry.lock().as_ref().copied() else {
-            return;
-        };
-        let bounds = geometry.bounds;
-        let line_height = f32::from(geometry.line_height).max(1.0);
-        let above = f32::from(bounds.top() - point.y);
-        let below = f32::from(point.y - bounds.bottom());
-        // Whole lines per tick, growing with the distance outside; capped so
-        // the grid stays followable.
-        let lines = if above > 0.0 {
-            (above / line_height).round() as i32
-        } else if below > 0.0 {
-            -((below / line_height).round() as i32)
-        } else {
-            return;
-        };
-        let lines = lines.clamp(-10, 10);
-        tab.terminal.term.lock().scroll_display(Scroll::Delta(lines));
-        // The cursor did not move, but the grid did: re-extend the selection
-        // against the new display offset. Above the top edge the point maps
-        // to row 0, so each tick folds one more revealed row in.
-        let (line, col, side) = terminal_grid_point(&tab.terminal, geometry, point);
-        tab.terminal.selection_update(line, col, side);
-        if let Some(view) = tab.log_view.as_mut() {
-            let at_bottom = tab
-                .terminal
-                .term
-                .lock()
-                .renderable_content()
-                .display_offset
-                == 0;
-            view.follow = at_bottom;
-        }
-        tab.terminal.mark_dirty();
-        cx.notify();
     }
 
     /// Repaint as soon as any terminal wakes us, with a 16ms timer as a
@@ -1083,9 +1013,6 @@ impl RootView {
                         }
                         cx.notify();
                     }
-                    // Selection-drag autoscroll: scrolls and notifies on its
-                    // own, only when a drag is outside the viewport.
-                    this.terminal_autoscroll_tick(cx);
                 });
                 if result.is_err() {
                     break;
@@ -3476,6 +3403,22 @@ impl RootView {
         window.focus(&focus_handle, cx);
     }
 
+    /// Copy the whole terminal — scrollback and visible screen — to the
+    /// clipboard. The mouse-free way to capture output that has scrolled
+    /// out of view (header button / Ctrl/⌘+Shift+A); works in log tabs too.
+    fn copy_all_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let text = tab.terminal.all_text();
+        let len = text.len() as u64;
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(tab) = self.active_tab_mut() {
+            tab.status = format!("copied all ({})", format_size(len));
+        }
+        cx.notify();
+    }
+
     fn on_terminal_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -3566,6 +3509,13 @@ impl RootView {
                 }
             }
             cx.notify();
+            return;
+        }
+
+        // Copy everything, scrollback included: Ctrl/⌘+Shift+A. Never goes
+        // to the PTY; like plain copy it works in read-only log tabs.
+        if keystroke.key == "a" && mods.shift && !mods.alt && (mods.platform || mods.control) {
+            self.copy_all_terminal(cx);
             return;
         }
 
@@ -4713,7 +4663,6 @@ impl RootView {
         let geometry = tab.geometry.clone();
         let focus_handle = tab.focus_handle.clone();
         let canvas_focus = focus_handle.clone();
-        let drag_point = self.terminal_drag_point.clone();
         // Log tabs use their own rule set; shell tabs get the heuristic shell
         // coloring while the toggle is on (uncolored cells only).
         let highlighter = if tab.is_log() {
@@ -4805,9 +4754,6 @@ impl RootView {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 // A real press ends any OLE drag's stand-down period.
                 this.ole_drag_active = false;
-                // A fresh press also invalidates any drag state that never
-                // saw its mouse-up (e.g. a focus loss mid-drag).
-                *this.terminal_drag_point.lock() = None;
                 if let Some(tab) = this.active_tab_mut() {
                     window.focus(&tab.focus_handle, cx);
                     let filtering = tab
@@ -4839,9 +4785,6 @@ impl RootView {
                 cx.notify();
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                // The drag (and with it the autoscroll) is over wherever the
-                // button is released — also outside the window.
-                *this.terminal_drag_point.lock() = None;
                 if let Some(tab) = this.active_tab() {
                     tab.terminal.selection_end();
                 }
@@ -4878,7 +4821,6 @@ impl RootView {
                             let terminal = terminal.clone();
                             let geometry = geometry.clone();
                             let canvas_focus = canvas_focus.clone();
-                            let drag_point = drag_point.clone();
                             move |event: &MouseMoveEvent, phase, window, _cx| {
                                 if phase != DispatchPhase::Bubble
                                     || event.pressed_button != Some(MouseButton::Left)
@@ -4890,11 +4832,6 @@ impl RootView {
                                 let Some(geo) = geometry.lock().as_ref().copied() else {
                                     return;
                                 };
-                                // Remember the drag position: while it sits
-                                // outside the viewport the repaint loop keeps
-                                // scrolling the grid so the selection can
-                                // grow into rows that were invisible.
-                                *drag_point.lock() = Some(event.position);
                                 let (line, col, side) =
                                     terminal_grid_point(&terminal, geo, event.position);
                                 terminal.selection_update(line, col, side);
@@ -5309,14 +5246,14 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ("scroll", "scroll the scrollback"),
             ("drag / double-click", "select text / select a word"),
             (
-                "drag past the top/bottom edge",
-                "keep selecting while the view scrolls into the hidden scrollback",
-            ),
-            (
                 "Ctrl/⌘ C with selection · Ctrl+Insert",
                 "copy the selection (Ctrl+Shift+C works too)",
             ),
             ("Ctrl/⌘ V · Shift+Insert", "paste (Ctrl+Shift+V works too)"),
+            (
+                "Ctrl/⌘ Shift A · copy button",
+                "copy the whole terminal, scrollback included",
+            ),
             ("Shift+↑ / Shift+↓", "recall cross-session command history"),
         ],
     },
@@ -5634,6 +5571,15 @@ impl RootView {
                         this.reset_terminal_font(cx);
                     })),
             )
+            .child(header_icon_button(
+                "copy-all",
+                assets::ICON_COPY,
+                "Copy the whole terminal, scrollback included (Ctrl/⌘ Shift A)",
+                cx,
+                |this, _window, cx| {
+                    this.copy_all_terminal(cx);
+                },
+            ))
             .child(
                 div()
                     .id("theme")

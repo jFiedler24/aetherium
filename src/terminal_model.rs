@@ -201,6 +201,36 @@ impl TerminalModel {
         Some((text, cols))
     }
 
+    /// All grid text: scrollback (oldest first) plus the visible screen, one
+    /// row per line, trailing whitespace trimmed per row — the same
+    /// trimming alacritty applies to copied selections. Unlike a selection
+    /// this includes rows that are scrolled out of view.
+    pub fn all_text(&self) -> String {
+        let term = self.term.lock();
+        let screen = term.screen_lines() as i32;
+        let history = term.grid().total_lines() as i32 - screen;
+        let mut out = String::new();
+        for line0 in -history..screen {
+            let row = &term.grid()[Line(line0)];
+            let mut text = String::new();
+            for col in 0..term.columns() {
+                let cell = &row[Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(cell.c);
+            }
+            let trimmed = text.trim_end().len();
+            text.truncate(trimmed);
+            out.push_str(&text);
+            out.push('\n');
+        }
+        out
+    }
+
     /// Whether the server is expected to echo these keystrokes back verbatim:
     /// printable ASCII only. Escape sequences and control keys are consumed
     /// by the remote application, which often doesn't echo them at all.
@@ -951,6 +981,28 @@ mod tests {
     }
 
     #[test]
+    fn all_text_covers_scrollback_and_screen() {
+        use alacritty_terminal::grid::Scroll;
+
+        let model = TerminalModel::new(80, 10);
+        for i in 0..30 {
+            model.feed(format!("line{i:02}\r\n").as_bytes());
+        }
+        // Scroll up so the oldest lines are not visible; copy-all must
+        // still include them, oldest first, one row per line.
+        model.term.lock().scroll_display(Scroll::Delta(10));
+        let text = model.all_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.first().is_some_and(|l| l.starts_with("line00")), "got {:?}", lines.first());
+        assert!(
+            lines.iter().any(|l| l.starts_with("line29")),
+            "newest line missing from {text:?}"
+        );
+        // Rows are ragged-trimmed: no trailing whitespace on a row.
+        assert!(lines.iter().all(|l| l.trim_end() == *l));
+    }
+
+    #[test]
     fn line_anchor_is_stable_across_feeds() {
         // A row's identity = line index + lines_fed at capture time; it must
         // resolve to the same text after more lines arrive.
@@ -1003,14 +1055,13 @@ mod tests {
         (text, cols)
     }
 
-    /// Replays the terminal autoscroll tick (selection drag held outside the
-    /// viewport) against a live-fed log grid: every step the real tick does,
-    /// including the paint-path queries. A regression here crashes the whole
-    /// app in release builds (observed on Windows while marking text in a
-    /// log-follow tab with the drag held past the edge), so it must survive
-    /// thousands of ticks in both directions with the feeder running.
+    /// Scrollback plus visible screen stay consistent while a feeder thread
+    /// writes concurrently: scroll the view both ways, drag a selection
+    /// across the moving grid, and keep querying ranges and selected text.
+    /// The copy-all feature walks the same rows, so a regression here would
+    /// corrupt copies (or panic) on any platform.
     #[test]
-    fn selection_autoscroll_stress_on_live_log_grid() {
+    fn selection_stays_stable_across_scrolling_on_a_live_grid() {
         use alacritty_terminal::grid::Scroll;
 
         let model = TerminalModel::new(80, 24);
