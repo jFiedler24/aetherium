@@ -755,7 +755,7 @@ async fn command_loop(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             let result = sftp
-                                .read_dir(path.to_string_lossy().into_owned())
+                                .read_dir(posix(&path))
                                 .await
                                 .map(|read_dir| {
                                     read_dir
@@ -803,7 +803,7 @@ async fn command_loop(
                         let sftp = sftp.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            match sftp.read_dir(path.to_string_lossy().into_owned()).await {
+                            match sftp.read_dir(posix(&path)).await {
                                 Ok(read_dir) => {
                                     let entries = read_dir
                                         .map(|entry| {
@@ -880,8 +880,8 @@ async fn command_loop(
                         tokio::spawn(async move {
                             match sftp
                                 .rename(
-                                    from.to_string_lossy().into_owned(),
-                                    to.to_string_lossy().into_owned(),
+                                    posix(&from),
+                                    posix(&to),
                                 )
                                 .await
                             {
@@ -924,7 +924,7 @@ async fn command_loop(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             let result = match sftp
-                                .create(path.to_string_lossy().into_owned())
+                                .create(posix(&path))
                                 .await
                             {
                                 Ok(file) => file.close().await.map_err(|err| anyhow::anyhow!(err)),
@@ -950,7 +950,7 @@ async fn command_loop(
                         let sftp = sftp.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            match sftp.create_dir(path.to_string_lossy().into_owned()).await {
+                            match sftp.create_dir(posix(&path)).await {
                                 Ok(()) => {
                                     let _ = event_tx.send(Event::EntryCreated {
                                         parent: path.parent().map(PathBuf::from).unwrap_or_default(),
@@ -970,7 +970,7 @@ async fn command_loop(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             let mode = sftp
-                                .metadata(path.to_string_lossy().into_owned())
+                                .metadata(posix(&path))
                                 .await
                                 .ok()
                                 .and_then(|attrs| attrs.permissions);
@@ -1101,7 +1101,15 @@ impl TransferProgress<'_> {
 
 /// Join a child name onto a remote (always `/`-separated) directory path.
 fn remote_join(dir: &std::path::Path, name: &str) -> String {
-    format!("{}/{}", dir.to_string_lossy().trim_end_matches('/'), name)
+    format!("{}/{}", posix(dir).trim_end_matches('/'), name)
+}
+
+/// Render a remote path for the SFTP wire. Remote paths are POSIX, but
+/// `PathBuf`s built client-side join with the *local* separator — on
+/// Windows that is `\`, which the server reads as a literal character in
+/// the entry's name (a rename then lands as `folder\file`).
+fn posix(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// Quote a path for execution by a POSIX shell.
@@ -1279,7 +1287,7 @@ async fn download(
 
     let label = format!("download {}", remote.display());
     // Directories have no meaningful total; progress then counts bytes only.
-    let total = match sftp.metadata(remote.to_string_lossy().into_owned()).await {
+    let total = match sftp.metadata(posix(remote)).await {
         Ok(metadata) if !metadata.is_dir() => metadata.len(),
         Ok(_) => 0,
         Err(err) => {
@@ -1320,7 +1328,7 @@ async fn download_to_temp(
     remote: &std::path::Path,
     cache: &TempDownloadCache,
 ) {
-    let metadata = match sftp.metadata(remote.to_string_lossy().into_owned()).await {
+    let metadata = match sftp.metadata(posix(remote)).await {
         Ok(metadata) => metadata,
         Err(err) => {
             let _ = event_tx.send(Event::Error(format!(
@@ -1369,7 +1377,7 @@ async fn download_to_temp(
         let mut local_file = std::fs::File::create(&local)
             .with_context(|| format!("creating {}", local.display()))?;
         let mut remote_file = sftp
-            .open(remote.to_string_lossy().into_owned())
+            .open(posix(remote))
             .await
             .with_context(|| format!("opening remote {}", remote.display()))?;
         let mut buffer = vec![0u8; TRANSFER_CHUNK];
@@ -1514,12 +1522,12 @@ async fn delete_remote(
     remote: &std::path::Path,
 ) -> Result<()> {
     let metadata = sftp
-        .metadata(remote.to_string_lossy().into_owned())
+        .metadata(posix(remote))
         .await
         .with_context(|| format!("stating remote {}", remote.display()))?;
     if metadata.is_dir() {
         let entries = sftp
-            .read_dir(remote.to_string_lossy().into_owned())
+            .read_dir(posix(remote))
             .await
             .with_context(|| format!("listing remote {}", remote.display()))?;
         for entry in entries {
@@ -1528,11 +1536,11 @@ async fn delete_remote(
             }
             Box::pin(delete_remote(sftp, std::path::Path::new(&entry.path()))).await?;
         }
-        sftp.remove_dir(remote.to_string_lossy().into_owned())
+        sftp.remove_dir(posix(remote))
             .await
             .with_context(|| format!("removing directory {}", remote.display()))?;
     } else {
-        sftp.remove_file(remote.to_string_lossy().into_owned())
+        sftp.remove_file(posix(remote))
             .await
             .with_context(|| format!("removing {}", remote.display()))?;
     }
@@ -1549,12 +1557,12 @@ async fn chmod_one(
     perms: u32,
 ) -> Result<()> {
     let current = sftp
-        .metadata(remote.to_string_lossy().into_owned())
+        .metadata(posix(remote))
         .await
         .with_context(|| format!("stating remote {}", remote.display()))?;
     let mode = (current.permissions.unwrap_or(0) & !0o777) | (perms & 0o777);
     sftp.set_metadata(
-        remote.to_string_lossy().into_owned(),
+        posix(remote),
         russh_sftp::protocol::FileAttributes {
             permissions: Some(mode),
             ..Default::default()
@@ -1575,13 +1583,13 @@ async fn chmod_path(
     recursive: bool,
 ) -> Result<()> {
     let metadata = sftp
-        .metadata(remote.to_string_lossy().into_owned())
+        .metadata(posix(remote))
         .await
         .with_context(|| format!("stating remote {}", remote.display()))?;
     chmod_one(sftp, remote, perms).await?;
     if recursive && metadata.is_dir() {
         let entries = sftp
-            .read_dir(remote.to_string_lossy().into_owned())
+            .read_dir(posix(remote))
             .await
             .with_context(|| format!("listing remote {}", remote.display()))?;
         for entry in entries {
@@ -1612,7 +1620,7 @@ async fn download_path(
         .map(|name| name.to_string_lossy().into_owned())
         .with_context(|| format!("{} has no file name", remote.display()))?;
     let metadata = sftp
-        .metadata(remote.to_string_lossy().into_owned())
+        .metadata(posix(remote))
         .await
         .with_context(|| format!("stating remote {}", remote.display()))?;
 
@@ -1621,7 +1629,7 @@ async fn download_path(
         std::fs::create_dir_all(&target)
             .with_context(|| format!("creating {}", target.display()))?;
         let entries = sftp
-            .read_dir(remote.to_string_lossy().into_owned())
+            .read_dir(posix(remote))
             .await
             .with_context(|| format!("listing remote {}", remote.display()))?;
         for entry in entries {
@@ -1645,7 +1653,7 @@ async fn download_path(
     let mut local_file = std::fs::File::create(&target)
         .with_context(|| format!("creating {}", target.display()))?;
     let mut remote_file = sftp
-        .open(remote.to_string_lossy().into_owned())
+        .open(posix(remote))
         .await
         .with_context(|| format!("opening remote {}", remote.display()))?;
 
@@ -1725,7 +1733,7 @@ async fn collect_remote_tree_into(
     members: &mut Vec<RemoteMember>,
 ) -> Result<()> {
     let entries = sftp
-        .read_dir(remote.to_string_lossy().into_owned())
+        .read_dir(posix(remote))
         .await
         .with_context(|| format!("listing remote {}", remote.display()))?;
     for entry in entries {
@@ -2162,5 +2170,39 @@ async fn authenticate_with_agent(
         Err(anyhow!("ssh-agent authentication failed for all identities"))
     } else {
         Err(anyhow!("ssh-agent holds no usable public-key identities"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PathBuf::join` uses the *local* separator, so a path assembled on
+    /// Windows arrives as `dir\name`; the SFTP wire format must re-render it
+    /// POSIX-style or the server creates an entry literally named `dir\name`.
+    #[test]
+    fn posix_renders_windows_joined_paths_for_the_wire() {
+        // The string a Windows client join produces for the same path.
+        let windows_joined = std::path::Path::new("/home/user/docs\\report.txt");
+        assert_eq!(posix(windows_joined), "/home/user/docs/report.txt");
+    }
+
+    #[test]
+    fn posix_keeps_unix_paths_unchanged() {
+        assert_eq!(
+            posix(std::path::Path::new("/home/user/docs")),
+            "/home/user/docs"
+        );
+    }
+
+    #[test]
+    fn remote_join_appends_with_posix_separator() {
+        let dir = std::path::Path::new("/var/log");
+        assert_eq!(remote_join(dir, "app.log"), "/var/log/app.log");
+        // Trailing slashes on the directory must not double up.
+        assert_eq!(
+            remote_join(std::path::Path::new("/var/log/"), "app.log"),
+            "/var/log/app.log"
+        );
     }
 }

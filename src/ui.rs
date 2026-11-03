@@ -118,6 +118,19 @@ fn find_node<'a>(nodes: &'a mut [TreeNode], path: &std::path::Path) -> Option<&'
     at_mut(nodes, &indices)
 }
 
+/// Flatten the visible tree rows (expanded directories' children included)
+/// into display order — the same order `render_tree_rows` emits them in.
+fn visible_tree_paths(nodes: &[TreeNode], out: &mut Vec<PathBuf>) {
+    for node in nodes {
+        out.push(node.entry.path.clone());
+        if node.expanded {
+            if let Some(children) = node.children.as_deref() {
+                visible_tree_paths(children, out);
+            }
+        }
+    }
+}
+
 /// Re-list a directory in a tab's tree, showing the loading state.
 fn reload_dir(tab: &mut SessionTab, path: &std::path::Path) {
     if let Some(node) = find_node(&mut tab.tree, path) {
@@ -770,6 +783,10 @@ pub struct RootView {
     /// The tool's own log (connection issues, transfer errors, …).
     logs: Vec<LogEntry>,
     log_scroll: ScrollHandle,
+    /// Scroll position of the active tab's file tree. Without a tracked
+    /// handle gpui wires no wheel handler onto the `overflow_scroll`
+    /// container, so a tree taller than its panel could never scroll.
+    tree_scroll: ScrollHandle,
     /// Set when new log entries arrived (or the tab was opened); the log
     /// list scrolls to the bottom on the next render.
     logs_scroll_pending: bool,
@@ -786,6 +803,11 @@ pub struct RootView {
     /// when the drag ends inside the app, when the session disconnects or its
     /// tab closes, and every staged file is purged on the next app launch.
     temp_download_cache: TempDownloadCache,
+    /// Last known window position of an in-progress terminal selection
+    /// drag (left button held). The repaint loop scrolls the grid while the
+    /// cursor sits outside the viewport so the selection can reach rows that
+    /// are not visible yet; cleared on mouse-up.
+    terminal_drag_point: Arc<Mutex<Option<Point<Pixels>>>>,
     /// Instant local echo of printable keystrokes (the server's identical
     /// echo is deduplicated on arrival) — the fix for typing lag on
     /// high-latency links. Toggleable from the header.
@@ -903,9 +925,11 @@ impl RootView {
             show_file_details: false,
             logs: Vec::new(),
             log_scroll: ScrollHandle::default(),
+            tree_scroll: ScrollHandle::default(),
             logs_scroll_pending: false,
             terminal_wake_tx,
             temp_download_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            terminal_drag_point: Arc::new(Mutex::new(None)),
             local_echo: true,
             terminal_font_size: ui_settings.terminal_font_size,
             shell_highlighter: Arc::new(LogHighlighter::load_shell()),
@@ -939,6 +963,60 @@ impl RootView {
 
     fn tab_index_by_id(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// While a left-button drag extends a terminal selection and the cursor
+    /// sits outside the viewport, scroll the grid toward the cursor so the
+    /// selection can reach rows that are not visible yet, re-extending it
+    /// every tick (classic terminal autoscroll). Scrolling away from the
+    /// bottom pauses a log tab's follow, like the wheel handler.
+    fn terminal_autoscroll_tick(&mut self, cx: &mut Context<Self>) {
+        let Some(point) = self.terminal_drag_point.lock().as_ref().copied() else {
+            return;
+        };
+        let active = self.active;
+        let Some(tab) = self.tabs.get_mut(active) else {
+            return;
+        };
+        if !tab.terminal.has_selection() {
+            *self.terminal_drag_point.lock() = None;
+            return;
+        }
+        let Some(geometry) = tab.geometry.lock().as_ref().copied() else {
+            return;
+        };
+        let bounds = geometry.bounds;
+        let line_height = f32::from(geometry.line_height).max(1.0);
+        let above = f32::from(bounds.top() - point.y);
+        let below = f32::from(point.y - bounds.bottom());
+        // Whole lines per tick, growing with the distance outside; capped so
+        // the grid stays followable.
+        let lines = if above > 0.0 {
+            (above / line_height).round() as i32
+        } else if below > 0.0 {
+            -((below / line_height).round() as i32)
+        } else {
+            return;
+        };
+        let lines = lines.clamp(-10, 10);
+        tab.terminal.term.lock().scroll_display(Scroll::Delta(lines));
+        // The cursor did not move, but the grid did: re-extend the selection
+        // against the new display offset. Above the top edge the point maps
+        // to row 0, so each tick folds one more revealed row in.
+        let (line, col, side) = terminal_grid_point(&tab.terminal, geometry, point);
+        tab.terminal.selection_update(line, col, side);
+        if let Some(view) = tab.log_view.as_mut() {
+            let at_bottom = tab
+                .terminal
+                .term
+                .lock()
+                .renderable_content()
+                .display_offset
+                == 0;
+            view.follow = at_bottom;
+        }
+        tab.terminal.mark_dirty();
+        cx.notify();
     }
 
     /// Repaint as soon as any terminal wakes us, with a 16ms timer as a
@@ -995,6 +1073,9 @@ impl RootView {
                         }
                         cx.notify();
                     }
+                    // Selection-drag autoscroll: scrolls and notifies on its
+                    // own, only when a drag is outside the viewport.
+                    this.terminal_autoscroll_tick(cx);
                 });
                 if result.is_err() {
                     break;
@@ -2895,7 +2976,9 @@ impl RootView {
             return;
         };
         let session_id = tab.session_id;
-        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        // Remote paths are always POSIX; a backslash would be a literal
+        // character in the entry's name on the server, never a separator.
+        if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
             if let Some(tab) = self.active_tab_mut() {
                 tab.status = "invalid name".into();
             }
@@ -2952,6 +3035,58 @@ impl RootView {
             return;
         };
         self.start_rename(remote, window, cx);
+    }
+
+    /// Move the tree selection by `delta` rows over the flattened visible
+    /// rows and scroll the row into view — keyboard-only tree navigation for
+    /// when no mouse (and thus no wheel) is available.
+    fn on_tree_nav(&mut self, delta: i64, cx: &mut Context<Self>) {
+        if self.tree_editor.is_some() || self.confirm_delete.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let mut paths = Vec::new();
+        visible_tree_paths(&tab.tree, &mut paths);
+        if paths.is_empty() {
+            return;
+        }
+        // The ".." row, when present, is scroll-child 0; tree rows follow it.
+        let up_row = tab.root_path.as_ref().is_some_and(|root| {
+            root.parent().is_some_and(|parent| parent != root.as_path())
+        }) as usize;
+        let current = tab.tree_selection.clone();
+        let next = current
+            .as_ref()
+            .and_then(|sel| paths.iter().position(|path| path == sel))
+            .map(|ix| (ix as i64 + delta).clamp(0, paths.len() as i64 - 1) as usize)
+            .unwrap_or(0);
+        let selection = paths[next].clone();
+        if let Some(tab) = self.active_tab_mut() {
+            tab.tree_selection = Some(selection);
+        }
+        self.tree_scroll.scroll_to_item(next + up_row);
+        cx.notify();
+    }
+
+    /// PageUp/PageDown: scroll the tree by one viewport without moving the
+    /// selection.
+    fn on_tree_page(&mut self, direction: i64, cx: &mut Context<Self>) {
+        if self.tree_editor.is_some() {
+            return;
+        }
+        let viewport = self.tree_scroll.bounds().size.height;
+        if viewport <= px(0.) {
+            return;
+        }
+        let mut offset = self.tree_scroll.offset();
+        // Offsets are negative (distance scrolled down); paging down scrolls
+        // further negative, paging back toward zero.
+        offset.y =
+            (offset.y - viewport * direction as f32).clamp(-self.tree_scroll.max_offset().y, px(0.));
+        self.tree_scroll.set_offset(offset);
+        cx.notify();
     }
 
     /// Stage a remote file locally and open the temp copy in a local
@@ -3084,8 +3219,18 @@ impl RootView {
                 let fallback = "open";
                 #[cfg(target_os = "linux")]
                 let fallback = "xdg-open";
+                // Never fall back to `explorer <file>`: it parses `/` as a
+                // switch marker and only unreliably forwards files to their
+                // registered association, so double-clicks sporadically
+                // opened Explorer windows instead of the file's tool.
+                // ShellExecuteW's "open" verb is the supported API for
+                // "open with the default application".
                 #[cfg(windows)]
-                let fallback = "explorer";
+                if spec.is_none() {
+                    return Self::open_with_windows_default(local);
+                }
+                #[cfg(windows)]
+                let fallback = "";
                 let spec = spec.unwrap_or_else(|| fallback.to_string());
                 let mut parts = spec.split_whitespace();
                 let program = parts.next().unwrap_or(fallback);
@@ -3093,6 +3238,31 @@ impl RootView {
                 command.args(parts).arg(local);
                 command.spawn().map(|_| ()).map_err(|err| err.into())
             }
+        }
+    }
+
+    /// Open a staged file with its associated application via ShellExecuteW
+    /// (`open` verb) — the Windows API whose whole job is "the tool that
+    /// opens this file".
+    #[cfg(windows)]
+    fn open_with_windows_default(local: &std::path::Path) -> anyhow::Result<()> {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::HSTRING;
+
+        let file = HSTRING::from(local);
+        let verb = HSTRING::from("open");
+        let result = unsafe { ShellExecuteW(None, &verb, &file, None, None, SW_SHOWNORMAL) };
+        // A return value greater than 32 is a handle (success); anything at
+        // or below 32 is an error code.
+        if result.0 as isize > 32 {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "opening {} with its associated application failed (ShellExecute error {})",
+                local.display(),
+                result.0 as isize
+            ))
         }
     }
 
@@ -4533,6 +4703,7 @@ impl RootView {
         let geometry = tab.geometry.clone();
         let focus_handle = tab.focus_handle.clone();
         let canvas_focus = focus_handle.clone();
+        let drag_point = self.terminal_drag_point.clone();
         // Log tabs use their own rule set; shell tabs get the heuristic shell
         // coloring while the toggle is on (uncolored cells only).
         let highlighter = if tab.is_log() {
@@ -4624,6 +4795,9 @@ impl RootView {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 // A real press ends any OLE drag's stand-down period.
                 this.ole_drag_active = false;
+                // A fresh press also invalidates any drag state that never
+                // saw its mouse-up (e.g. a focus loss mid-drag).
+                *this.terminal_drag_point.lock() = None;
                 if let Some(tab) = this.active_tab_mut() {
                     window.focus(&tab.focus_handle, cx);
                     let filtering = tab
@@ -4655,6 +4829,9 @@ impl RootView {
                 cx.notify();
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                // The drag (and with it the autoscroll) is over wherever the
+                // button is released — also outside the window.
+                *this.terminal_drag_point.lock() = None;
                 if let Some(tab) = this.active_tab() {
                     tab.terminal.selection_end();
                 }
@@ -4691,6 +4868,7 @@ impl RootView {
                             let terminal = terminal.clone();
                             let geometry = geometry.clone();
                             let canvas_focus = canvas_focus.clone();
+                            let drag_point = drag_point.clone();
                             move |event: &MouseMoveEvent, phase, window, _cx| {
                                 if phase != DispatchPhase::Bubble
                                     || event.pressed_button != Some(MouseButton::Left)
@@ -4702,6 +4880,11 @@ impl RootView {
                                 let Some(geo) = geometry.lock().as_ref().copied() else {
                                     return;
                                 };
+                                // Remember the drag position: while it sits
+                                // outside the viewport the repaint loop keeps
+                                // scrolling the grid so the selection can
+                                // grow into rows that were invisible.
+                                *drag_point.lock() = Some(event.position);
                                 let (line, col, side) =
                                     terminal_grid_point(&terminal, geo, event.position);
                                 terminal.selection_update(line, col, side);
@@ -5116,6 +5299,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ("scroll", "scroll the scrollback"),
             ("drag / double-click", "select text / select a word"),
             (
+                "drag past the top/bottom edge",
+                "keep selecting while the view scrolls into the hidden scrollback",
+            ),
+            (
                 "Ctrl/⌘ C with selection · Ctrl+Insert",
                 "copy the selection (Ctrl+Shift+C works too)",
             ),
@@ -5136,6 +5323,9 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ),
             ("drag & drop", "move remote entries; drop OS files to upload"),
             (".. row", "navigate to the parent directory"),
+            ("↑ / ↓", "move the selection through the visible rows"),
+            ("PgUp / PgDn", "scroll the tree by a page"),
+            ("scroll wheel", "scroll the tree (useful in huge folders)"),
             ("Delete key", "delete the selected entry (asks first)"),
         ],
     },
@@ -5188,6 +5378,40 @@ fn header_icon_button(
         .tooltip(tip(tooltip))
         .child(svg().path(icon).w(px(14.)).h(px(14.)).text_color(theme::text()))
         .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+        .into_any_element()
+}
+
+/// Text-labeled button stepping the terminal font size by `delta` points.
+fn font_size_button(
+    id: &'static str,
+    label: &'static str,
+    tooltip: &'static str,
+    cx: &mut Context<RootView>,
+    delta: f32,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.))
+        .h(px(26.))
+        .rounded_sm()
+        .bg(theme::button())
+        .hover(|style| style.bg(theme::button_hover()))
+        .active(|style| style.opacity(0.8))
+        .cursor_pointer()
+        .tooltip(tip(tooltip))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(theme::text())
+                .child(label),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.zoom_terminal(delta, cx);
+        }))
         .into_any_element()
 }
 
@@ -5360,6 +5584,46 @@ impl RootView {
                     cx.notify();
                 },
             ))
+            // Text-size buttons: the wheel-free counterpart of Ctrl/⌘ +/-.
+            .child(font_size_button(
+                "font-smaller",
+                "A−",
+                "Smaller terminal text (Ctrl/⌘ −)",
+                cx,
+                -1.0,
+            ))
+            .child(font_size_button(
+                "font-larger",
+                "A+",
+                "Larger terminal text (Ctrl/⌘ +)",
+                cx,
+                1.0,
+            ))
+            .child(
+                div()
+                    .id("font-reset")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(28.))
+                    .h(px(26.))
+                    .rounded_sm()
+                    .bg(theme::button())
+                    .hover(|style| style.bg(theme::button_hover()))
+                    .active(|style| style.opacity(0.8))
+                    .cursor_pointer()
+                    .tooltip(tip("Reset terminal text size (Ctrl/⌘ 0)"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("A"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reset_terminal_font(cx);
+                    })),
+            )
             .child(
                 div()
                     .id("theme")
@@ -6342,6 +6606,9 @@ fn log_toolbar_button(
         let mut rows = Vec::new();
         // Built before the immutable borrows below (it needs &mut self).
         let up_row = self.tree_up_row(cx);
+        // Tracked so gpui attaches its wheel handler and the keyboard
+        // navigation can scroll rows into view.
+        let tree_scroll = self.tree_scroll.clone();
         let empty: Vec<TreeNode> = Vec::new();
         let (tree, tree_selection, connected, tree_focus) = match self.active_tab() {
             Some(tab) => (
@@ -6389,6 +6656,7 @@ fn log_toolbar_button(
             .flex_1()
             .min_h(px(0.))
             .id("file-tree")
+            .track_scroll(&tree_scroll)
             .overflow_scroll()
             .flex()
             .flex_col()
@@ -6403,6 +6671,18 @@ fn log_toolbar_button(
                     .on_action(cx.listener(Self::on_cancel_delete))
                     .on_action(cx.listener(Self::on_confirm_delete))
                     .on_action(cx.listener(Self::on_rename_entry))
+                    .on_action(cx.listener(|this, _: &TreeUp, _, cx| {
+                        this.on_tree_nav(-1, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TreeDown, _, cx| {
+                        this.on_tree_nav(1, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TreePageUp, _, cx| {
+                        this.on_tree_page(-1, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TreePageDown, _, cx| {
+                        this.on_tree_page(1, cx);
+                    }))
             })
             // Dropping OS files onto the tree background uploads them into
             // the remote home directory; dropping onto a directory row
@@ -8266,8 +8546,19 @@ impl Render for RootView {
 // Actions bound in `main.rs` under the "FileTree" key context. DeleteEntry
 // asks to delete the selected entry; while the confirmation is up, Enter
 // confirms and Escape cancels. RenameEntry opens the inline rename editor.
+// TreeUp/TreeDown move the selection (scrolling it into view) and
+// TreePageUp/TreePageDown scroll by a viewport for mouse-free use.
 // Handlers live on the file-tree container.
-gpui::actions!(file_tree, [DeleteEntry, CancelDelete, ConfirmDelete, RenameEntry]);
+gpui::actions!(file_tree, [
+    DeleteEntry,
+    CancelDelete,
+    ConfirmDelete,
+    RenameEntry,
+    TreeUp,
+    TreeDown,
+    TreePageUp,
+    TreePageDown
+]);
 
 #[cfg(test)]
 // [utest->req~uncolored-cell-coloring~1]
@@ -8335,5 +8626,41 @@ mod tests {
         assert_eq!(bits[8], true);
         assert_eq!(format_perms(0o755), "0o755");
         assert_eq!(format_perms(0), "0o000");
+    }
+
+    // Flattening must follow display order — a node, then its children's
+    // subtree while expanded — so keyboard navigation indexes the same rows
+    // the renderer emits (and thus the scroll handle's child bounds).
+    #[test]
+    fn visible_tree_paths_follows_display_order() {
+        let file = |name: &str, path: &str| TreeNode {
+            entry: crate::session::FileEntry {
+                name: name.into(),
+                path: PathBuf::from(path),
+                is_dir: false,
+                size: 0,
+                modified: None,
+            },
+            expanded: false,
+            loading: false,
+            children: None,
+        };
+        let mut dir = file("dir", "/home/user/dir");
+        dir.entry.is_dir = true;
+        dir.expanded = true;
+        dir.children = Some(vec![file("child.txt", "/home/user/dir/child.txt")]);
+        let collapsed = file("collapsed.txt", "/home/user/collapsed.txt");
+        let tree = vec![dir, collapsed];
+
+        let mut paths = Vec::new();
+        visible_tree_paths(&tree, &mut paths);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/home/user/dir"),
+                PathBuf::from("/home/user/dir/child.txt"),
+                PathBuf::from("/home/user/collapsed.txt"),
+            ]
+        );
     }
 }

@@ -30,7 +30,10 @@ use gpui::{
     App, Bounds, KeyBinding, WindowBounds, WindowOptions, point, prelude::*, px, size,
 };
 
-use crate::ui::{CancelDelete, ConfirmDelete, DeleteEntry, RenameEntry, RootView};
+use crate::ui::{
+    CancelDelete, ConfirmDelete, DeleteEntry, RenameEntry, RootView, TreeDown, TreePageDown,
+    TreePageUp, TreeUp,
+};
 
 /// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
 /// errors) are visible when running the binary directly. On Windows the
@@ -111,13 +114,19 @@ fn main() {
         ]);
         // File-tree shortcuts: Delete/Backspace ask to delete the selected
         // entry; while the confirmation dialog is up, Enter confirms and
-        // Escape cancels. F2 renames inline.
+        // Escape cancels. F2 renames inline. The arrow keys walk the visible
+        // rows (scrolling them into view) and PageUp/PageDown scroll by a
+        // viewport, so the tree is fully usable without a mouse wheel.
         cx.bind_keys([
             KeyBinding::new("delete", DeleteEntry, Some("FileTree")),
             KeyBinding::new("backspace", DeleteEntry, Some("FileTree")),
             KeyBinding::new("enter", ConfirmDelete, Some("FileTree")),
             KeyBinding::new("escape", CancelDelete, Some("FileTree")),
             KeyBinding::new("f2", RenameEntry, Some("FileTree")),
+            KeyBinding::new("up", TreeUp, Some("FileTree")),
+            KeyBinding::new("down", TreeDown, Some("FileTree")),
+            KeyBinding::new("pageup", TreePageUp, Some("FileTree")),
+            KeyBinding::new("pagedown", TreePageDown, Some("FileTree")),
         ]);
 
         let bounds = Bounds {
