@@ -1002,4 +1002,62 @@ mod tests {
         cols.truncate(text.chars().count());
         (text, cols)
     }
+
+    /// Replays the terminal autoscroll tick (selection drag held outside the
+    /// viewport) against a live-fed log grid: every step the real tick does,
+    /// including the paint-path queries. A regression here crashes the whole
+    /// app in release builds (observed on Windows while marking text in a
+    /// log-follow tab with the drag held past the edge), so it must survive
+    /// thousands of ticks in both directions with the feeder running.
+    #[test]
+    fn selection_autoscroll_stress_on_live_log_grid() {
+        use alacritty_terminal::grid::Scroll;
+
+        let model = TerminalModel::new(80, 24);
+        let feeder = {
+            let model = model.clone();
+            std::thread::spawn(move || {
+                for i in 0..3000 {
+                    model.feed(format!("log line {i} with some payload text\r\n").as_bytes());
+                }
+            })
+        };
+
+        // Mouse-down in the middle of the grid starts the selection.
+        model.selection_start(10, 5, Direction::Left);
+
+        // Drag held above the top edge: scroll up, extend to the top row.
+        for _ in 0..4000 {
+            let display_offset = model.term.lock().renderable_content().display_offset as i32;
+            model.term.lock().scroll_display(Scroll::Delta(1));
+            // Above the viewport the grid point clamps to row 0, so the
+            // endpoint is `-display_offset` — marching up every tick.
+            model.selection_update(-display_offset, 0, Direction::Left);
+            let term = model.term.lock();
+            let _ = term
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.to_range(&*term));
+            drop(term);
+            if model.lines_fed() % 97 == 0 {
+                let _ = model.selected_text();
+            }
+        }
+
+        // Drag held below the bottom edge: scroll down, extend to the last row.
+        for _ in 0..2000 {
+            let rows = model.screen_lines() as i32;
+            model.term.lock().scroll_display(Scroll::Delta(-1));
+            model.selection_update(rows - 1, 0, Direction::Right);
+            let term = model.term.lock();
+            let _ = term
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.to_range(&*term));
+        }
+
+        feeder.join().expect("feeder");
+        model.selection_end();
+        let _ = model.selected_text();
+    }
 }

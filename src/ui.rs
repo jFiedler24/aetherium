@@ -982,6 +982,16 @@ impl RootView {
             *self.terminal_drag_point.lock() = None;
             return;
         }
+        // Like the wheel handler: in filter mode the visible rows are a
+        // synthetic window scrolled via `filter_offset`, so the grid must
+        // not scroll (and a stale grid selection must not autoscroll it).
+        if tab
+            .log_view
+            .as_ref()
+            .is_some_and(|view| view.filtering())
+        {
+            return;
+        }
         let Some(geometry) = tab.geometry.lock().as_ref().copied() else {
             return;
         };
