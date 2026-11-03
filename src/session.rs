@@ -200,6 +200,9 @@ pub struct FileEntry {
     pub size: u64,
     /// Modification time as seconds since the Unix epoch.
     pub modified: Option<u64>,
+    /// Raw permission bits (0o777-masked plus file-type knowledge), when the
+    /// server reported them; drives the tree's permissions column.
+    pub mode: Option<u32>,
 }
 
 /// Handle owned by the UI; talks to the background tokio runtime. Cheap to
@@ -773,6 +776,7 @@ async fn command_loop(
                                                         t.duration_since(std::time::UNIX_EPOCH).ok()
                                                     })
                                                     .map(|d| d.as_secs()),
+                                                mode: metadata.permissions,
                                             }
                                         })
                                         .collect::<Vec<FileEntry>>()
@@ -818,6 +822,7 @@ async fn command_loop(
                                                     .ok()
                                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                                     .map(|d| d.as_secs()),
+                                                mode: metadata.permissions,
                                             }
                                         })
                                         .collect();

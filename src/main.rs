@@ -31,8 +31,8 @@ use gpui::{
 };
 
 use crate::ui::{
-    CancelDelete, ConfirmDelete, DeleteEntry, RenameEntry, RootView, TreeDown, TreePageDown,
-    TreePageUp, TreeUp,
+    CancelDelete, ConfirmDelete, DeleteEntry, RenameEntry, RootView, TreeDown, TreeLeft,
+    TreePageDown, TreePageUp, TreeRight, TreeUp,
 };
 
 /// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
@@ -115,8 +115,10 @@ fn main() {
         // File-tree shortcuts: Delete/Backspace ask to delete the selected
         // entry; while the confirmation dialog is up, Enter confirms and
         // Escape cancels. F2 renames inline. The arrow keys walk the visible
-        // rows (scrolling them into view) and PageUp/PageDown scroll by a
-        // viewport, so the tree is fully usable without a mouse wheel.
+        // rows (scrolling them into view), Right expands a directory (or
+        // steps into it) and Left collapses it (or moves to the parent row);
+        // PageUp/PageDown scroll by a viewport, so the tree is fully usable
+        // without a mouse wheel.
         cx.bind_keys([
             KeyBinding::new("delete", DeleteEntry, Some("FileTree")),
             KeyBinding::new("backspace", DeleteEntry, Some("FileTree")),
@@ -127,6 +129,8 @@ fn main() {
             KeyBinding::new("down", TreeDown, Some("FileTree")),
             KeyBinding::new("pageup", TreePageUp, Some("FileTree")),
             KeyBinding::new("pagedown", TreePageDown, Some("FileTree")),
+            KeyBinding::new("left", TreeLeft, Some("FileTree")),
+            KeyBinding::new("right", TreeRight, Some("FileTree")),
         ]);
 
         let bounds = Bounds {

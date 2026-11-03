@@ -84,6 +84,16 @@ impl TreeNode {
     }
 }
 
+/// What the file tree's optional details column shows, toggled from the
+/// tree header: nothing, file sizes, or permission bits. Size and
+/// permissions are alternatives — enabling one clears the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeDetails {
+    None,
+    Size,
+    Permissions,
+}
+
 /// Find a directory node by path (depth-first). Implemented in two phases —
 /// locate the index path on an immutable walk, then descend mutably — to
 /// stay within what the borrow checker accepts for tree walks.
@@ -778,8 +788,8 @@ pub struct RootView {
     sidebar_tab: SidebarTab,
     /// Current width of the sidebar, dragged via the splitter.
     sidebar_width: Pixels,
-    /// Whether file rows show a details column (size).
-    show_file_details: bool,
+    /// Which column the file rows show in their details slot, if any.
+    tree_details: TreeDetails,
     /// The tool's own log (connection issues, transfer errors, …).
     logs: Vec<LogEntry>,
     log_scroll: ScrollHandle,
@@ -917,7 +927,7 @@ impl RootView {
             last_edit_scan: std::time::Instant::now(),
             sidebar_tab: SidebarTab::Sessions,
             sidebar_width: px(260.),
-            show_file_details: false,
+            tree_details: TreeDetails::None,
             logs: Vec::new(),
             log_scroll: ScrollHandle::default(),
             tree_scroll: ScrollHandle::default(),
@@ -1119,6 +1129,7 @@ impl RootView {
                         is_dir: true,
                         size: 0,
                         modified: None,
+                        mode: None,
                     },
                     expanded: true,
                     loading: true,
@@ -1179,6 +1190,7 @@ impl RootView {
                         is_dir: true,
                         size: 0,
                         modified: None,
+                        mode: None,
                     };
                     if let Some(old_root) = tab.tree.first().cloned() {
                         if let Some(slot) = entries
@@ -2989,10 +3001,6 @@ impl RootView {
         if paths.is_empty() {
             return;
         }
-        // The ".." row, when present, is scroll-child 0; tree rows follow it.
-        let up_row = tab.root_path.as_ref().is_some_and(|root| {
-            root.parent().is_some_and(|parent| parent != root.as_path())
-        }) as usize;
         let current = tab.tree_selection.clone();
         let next = current
             .as_ref()
@@ -3000,11 +3008,100 @@ impl RootView {
             .map(|ix| (ix as i64 + delta).clamp(0, paths.len() as i64 - 1) as usize)
             .unwrap_or(0);
         let selection = paths[next].clone();
+        self.tree_select(selection, cx);
+    }
+
+    /// Select `path` in the active tab's tree and scroll the row into view
+    /// (shared by the keyboard navigation handlers).
+    fn tree_select(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let (tree, root_path) = match self.active_tab() {
+            Some(tab) => (&tab.tree, tab.root_path.clone()),
+            None => return,
+        };
+        // The ".." row, when present, is scroll-child 0; tree rows follow it.
+        let up_row = root_path.as_ref().is_some_and(|root| {
+            root.parent().is_some_and(|parent| parent != root.as_path())
+        }) as usize;
+        let mut paths = Vec::new();
+        visible_tree_paths(tree, &mut paths);
+        let ix = paths.iter().position(|p| p == &path);
         if let Some(tab) = self.active_tab_mut() {
-            tab.tree_selection = Some(selection);
+            tab.tree_selection = Some(path);
         }
-        self.tree_scroll.scroll_to_item(next + up_row);
+        if let Some(ix) = ix {
+            self.tree_scroll.scroll_to_item(ix + up_row);
+        }
         cx.notify();
+    }
+
+    /// Right arrow: expand the selected directory (loading its children like
+    /// a click does), or step into the first child when it is already
+    /// expanded.
+    fn on_tree_expand(&mut self, cx: &mut Context<Self>) {
+        if self.tree_editor.is_some() || self.confirm_delete.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(selected) = tab.tree_selection.clone() else {
+            return;
+        };
+        let node_state = find_node(&mut self.tabs[self.active].tree, &selected)
+            .map(|node| (node.entry.is_dir, node.expanded));
+        match node_state {
+            Some((true, false)) => self.toggle_tree_node(selected, cx),
+            Some((true, true)) => {
+                // The row right after a pre-order node is its first child
+                // exactly when it has visible children.
+                let mut paths = Vec::new();
+                if let Some(tab) = self.active_tab() {
+                    visible_tree_paths(&tab.tree, &mut paths);
+                }
+                let first_child = paths
+                    .iter()
+                    .position(|path| path == &selected)
+                    .and_then(|ix| paths.get(ix + 1))
+                    .filter(|child| child.starts_with(&selected))
+                    .cloned();
+                if let Some(child) = first_child {
+                    self.tree_select(child, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Left arrow: collapse the selected directory, or move the selection to
+    /// the parent row of a file or an already-collapsed directory.
+    fn on_tree_collapse(&mut self, cx: &mut Context<Self>) {
+        if self.tree_editor.is_some() || self.confirm_delete.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(selected) = tab.tree_selection.clone() else {
+            return;
+        };
+        let node_state = find_node(&mut self.tabs[self.active].tree, &selected)
+            .map(|node| (node.entry.is_dir, node.expanded));
+        match node_state {
+            Some((true, true)) => self.toggle_tree_node(selected, cx),
+            _ => {
+                let mut paths = Vec::new();
+                if let Some(tab) = self.active_tab() {
+                    visible_tree_paths(&tab.tree, &mut paths);
+                }
+                let parent = selected
+                    .parent()
+                    .map(PathBuf::from)
+                    .filter(|parent| paths.iter().any(|path| path == parent));
+                if let Some(parent) = parent {
+                    self.tree_select(parent, cx);
+                }
+            }
+        }
     }
 
     /// PageUp/PageDown: scroll the tree by one viewport without moving the
@@ -5271,6 +5368,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ("drag & drop", "move remote entries; drop OS files to upload"),
             (".. row", "navigate to the parent directory"),
             ("↑ / ↓", "move the selection through the visible rows"),
+            ("→ / ←", "expand / collapse directories (→ also steps into expanded ones)"),
             ("PgUp / PgDn", "scroll the tree by a page"),
             ("scroll wheel", "scroll the tree (useful in huge folders)"),
             ("Delete key", "delete the selected entry (asks first)"),
@@ -6195,7 +6293,7 @@ fn log_toolbar_button(
                     .as_ref()
                     .map(|profile| profile.summary())
                     .unwrap_or_default();
-                let show_details = self.show_file_details;
+                let tree_details = self.tree_details;
                 section = section
                     .child(
                         div()
@@ -6238,17 +6336,18 @@ fn log_toolbar_button(
                                     this.download_selected(cx);
                                 },
                             ))
-                            // Toggle the file-details column (sizes).
+                            // Toggle the file-details column: sizes, or
+                            // permission bits as the alternative view.
                             .child(
                                 div()
                                     .id("tab-details")
                                     .child("≡")
-                                    .bg(if show_details {
+                                    .bg(if tree_details == TreeDetails::Size {
                                         theme::selection()
                                     } else {
                                         theme::button()
                                     })
-                                    .text_color(if show_details {
+                                    .text_color(if tree_details == TreeDetails::Size {
                                         theme::text()
                                     } else {
                                         theme::text_dim()
@@ -6260,8 +6359,48 @@ fn log_toolbar_button(
                                     .px_2()
                                     .py_1()
                                     .rounded_sm()
+                                    .tooltip(tip("Show file sizes"))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_file_details = !this.show_file_details;
+                                        this.tree_details = if this.tree_details
+                                            == TreeDetails::Size
+                                        {
+                                            TreeDetails::None
+                                        } else {
+                                            TreeDetails::Size
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("tab-details-perms")
+                                    .child("rwx")
+                                    .bg(if tree_details == TreeDetails::Permissions {
+                                        theme::selection()
+                                    } else {
+                                        theme::button()
+                                    })
+                                    .text_color(if tree_details == TreeDetails::Permissions {
+                                        theme::text()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .hover(|style| style.bg(theme::button_hover()))
+                                    .active(|style| style.opacity(0.8))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .tooltip(tip("Show permissions instead of sizes"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tree_details = if this.tree_details
+                                            == TreeDetails::Permissions
+                                        {
+                                            TreeDetails::None
+                                        } else {
+                                            TreeDetails::Permissions
+                                        };
                                         cx.notify();
                                     })),
                             )
@@ -6599,7 +6738,7 @@ fn log_toolbar_button(
                 0,
                 tree_selection.as_ref(),
                 drag_highlight.as_ref(),
-                self.show_file_details,
+                self.tree_details,
                 tab.and_then(|t| t.session.as_ref()),
                 tab.map(|t| t.session_id).unwrap_or(0),
                 self.temp_download_cache.clone(),
@@ -6638,6 +6777,12 @@ fn log_toolbar_button(
                     }))
                     .on_action(cx.listener(|this, _: &TreePageDown, _, cx| {
                         this.on_tree_page(1, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TreeRight, _, cx| {
+                        this.on_tree_expand(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TreeLeft, _, cx| {
+                        this.on_tree_collapse(cx);
                     }))
             })
             // Dropping OS files onto the tree background uploads them into
@@ -6954,6 +7099,34 @@ fn format_size(size: u64) -> String {
     }
 }
 
+/// `ls -l`-style mode string (`drwxr-xr-x`); the type char is `d` for
+/// directories, `-` otherwise (symlinks arrive as their target type here).
+fn format_mode(mode: u32, is_dir: bool) -> String {
+    let mut out = String::with_capacity(10);
+    out.push(if is_dir { 'd' } else { '-' });
+    // Per group (user, group, other): r, w, then x — with setuid/setgid/sticky
+    // rendering as s/s/t when the x bit is also set, S/S/T when it is not.
+    let groups = [
+        (0o4000u32, 's', 'S', 0o100u32),
+        (0o2000, 's', 'S', 0o010),
+        (0o1000, 't', 'T', 0o001),
+    ];
+    for (g, (special, special_on, special_off, exec)) in groups.iter().enumerate() {
+        let shift = 3 * g as u32;
+        out.push(if mode & (0o400u32 >> shift) != 0 { 'r' } else { '-' });
+        out.push(if mode & (0o200u32 >> shift) != 0 { 'w' } else { '-' });
+        let exec_set = mode & exec != 0;
+        let special_set = mode & special != 0;
+        out.push(match (special_set, exec_set) {
+            (true, true) => *special_on,
+            (true, false) => *special_off,
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
+    }
+    out
+}
+
 /// Human-friendly duration in seconds (e.g. `2m 15s`).
 fn format_duration(seconds: u64) -> String {
     if seconds < 60 {
@@ -6972,7 +7145,7 @@ fn render_tree_rows(
     depth: usize,
     selected: Option<&PathBuf>,
     drag_highlight: Option<&PathBuf>,
-    show_details: bool,
+    details: TreeDetails,
     session: Option<&SessionHandle>,
     session_id: u64,
     temp_download_cache: TempDownloadCache,
@@ -7318,13 +7491,25 @@ fn render_tree_rows(
                             .child("…"),
                     )
                 })
-                .when(show_details && !is_dir, |row| {
+                .when(details == TreeDetails::Size && !is_dir, |row| {
                     row.child(
                         div()
                             .flex_none()
                             .text_xs()
                             .text_color(theme::text_dim())
                             .child(format_size(node.entry.size)),
+                    )
+                })
+                .when(details == TreeDetails::Permissions, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::text_dim())
+                            .child(match node.entry.mode {
+                                Some(mode) => format_mode(mode, is_dir),
+                                None => "----------".into(),
+                            }),
                     )
                 })
                 .into_any_element(),
@@ -7342,7 +7527,7 @@ fn render_tree_rows(
                     depth + 1,
                     selected,
                     drag_highlight,
-                    show_details,
+                    details,
                     session,
                     session_id,
                     temp_download_cache,
@@ -8502,8 +8687,10 @@ impl Render for RootView {
 // Actions bound in `main.rs` under the "FileTree" key context. DeleteEntry
 // asks to delete the selected entry; while the confirmation is up, Enter
 // confirms and Escape cancels. RenameEntry opens the inline rename editor.
-// TreeUp/TreeDown move the selection (scrolling it into view) and
-// TreePageUp/TreePageDown scroll by a viewport for mouse-free use.
+// TreeUp/TreeDown move the selection (scrolling it into view),
+// TreePageUp/TreePageDown scroll by a viewport, TreeRight expands the
+// selected directory (or steps into it), and TreeLeft collapses it (or
+// moves the selection to the parent row).
 // Handlers live on the file-tree container.
 gpui::actions!(file_tree, [
     DeleteEntry,
@@ -8513,7 +8700,9 @@ gpui::actions!(file_tree, [
     TreeUp,
     TreeDown,
     TreePageUp,
-    TreePageDown
+    TreePageDown,
+    TreeLeft,
+    TreeRight
 ]);
 
 #[cfg(test)]
@@ -8584,6 +8773,20 @@ mod tests {
         assert_eq!(format_perms(0), "0o000");
     }
 
+    // The tree's permissions column renders like `ls -l`, including
+    // setuid/setgid/sticky variants.
+    #[test]
+    fn format_mode_renders_ls_style_strings() {
+        assert_eq!(format_mode(0o755, true), "drwxr-xr-x");
+        assert_eq!(format_mode(0o644, false), "-rw-r--r--");
+        assert_eq!(format_mode(0o700, false), "-rwx------");
+        assert_eq!(format_mode(0o4755, false), "-rwsr-xr-x");
+        assert_eq!(format_mode(0o4644, false), "-rwSr--r--");
+        assert_eq!(format_mode(0o1777, true), "drwxrwxrwt");
+        assert_eq!(format_mode(0o1644, false), "-rw-r--r-T");
+        assert_eq!(format_mode(0, false), "----------");
+    }
+
     // Flattening must follow display order — a node, then its children's
     // subtree while expanded — so keyboard navigation indexes the same rows
     // the renderer emits (and thus the scroll handle's child bounds).
@@ -8596,6 +8799,7 @@ mod tests {
                 is_dir: false,
                 size: 0,
                 modified: None,
+                mode: None,
             },
             expanded: false,
             loading: false,
