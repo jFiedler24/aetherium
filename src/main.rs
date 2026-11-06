@@ -24,6 +24,8 @@ mod text_field;
 mod theme;
 mod ui;
 #[cfg(windows)]
+mod windows_dispatch;
+#[cfg(windows)]
 mod windows_drag;
 
 use gpui::{

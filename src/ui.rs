@@ -768,6 +768,11 @@ pub struct RootView {
     /// file-tree drop/hover handling must stand down (set when the OLE drag
     /// starts, cleared on the next real mouse-down).
     ole_drag_active: bool,
+    /// Windows-only: gpui's window handle, cached on first render. Used to
+    /// defer message-pumping Win32 calls (ShellExecuteW file opens) out of
+    /// gpui dispatches — see `windows_dispatch`.
+    #[cfg(windows)]
+    app_hwnd: isize,
     /// Incoming REST API requests (drained by the event loop).
     api_rx: std::sync::mpsc::Receiver<ApiRequest>,
     /// REST API calls awaiting their backend replies.
@@ -916,6 +921,8 @@ impl RootView {
             tree_drag_target: None,
             tree_dragging: None,
             ole_drag_active: false,
+            #[cfg(windows)]
+            app_hwnd: 0,
             api_rx,
             api_pending: std::collections::HashMap::new(),
             api_collect: None,
@@ -3154,7 +3161,7 @@ impl RootView {
             .find(|edit| edit.session_id == session_id && edit.remote == remote)
         {
             let local = edit.local.clone();
-            if Self::launch_editor(editor, &local).is_ok() {
+            if self.launch_editor(editor, &local).is_ok() {
                 self.status = format!("editing {} — saves ask to sync back", remote.display());
             } else {
                 self.status = "could not launch the editor".into();
@@ -3221,7 +3228,7 @@ impl RootView {
             mtime,
             size,
         });
-        match Self::launch_editor(editor, &local) {
+        match self.launch_editor(editor, &local) {
             Ok(()) => {
                 self.status = format!("editing {} — saves ask to sync back", remote.display());
             }
@@ -3233,7 +3240,7 @@ impl RootView {
     }
 
     /// Launch a local editor on a staged file.
-    fn launch_editor(choice: EditorChoice, local: &std::path::Path) -> anyhow::Result<()> {
+    fn launch_editor(&self, choice: EditorChoice, local: &std::path::Path) -> anyhow::Result<()> {
         match choice {
             EditorChoice::VsCode => {
                 #[cfg(target_os = "macos")]
@@ -3261,7 +3268,7 @@ impl RootView {
                 // "open with the default application".
                 #[cfg(windows)]
                 if spec.is_none() {
-                    return Self::open_with_windows_default(local);
+                    return self.open_with_windows_default(local);
                 }
                 #[cfg(windows)]
                 let fallback = "";
@@ -3278,26 +3285,40 @@ impl RootView {
     /// Open a staged file with its associated application via ShellExecuteW
     /// (`open` verb) — the Windows API whose whole job is "the tool that
     /// opens this file".
+    ///
+    /// The call is deferred to a `SetTimer` TIMERPROC (see
+    /// `windows_dispatch`): ShellExecuteW pumps window messages while the
+    /// shell resolves the association, and running it inside a gpui
+    /// callback (this is reached from the staging-complete event, under an
+    /// AppCell borrow) reenters gpui's window procedure and panicked with
+    /// "RefCell already borrowed" — followed by "panic in a function that
+    /// cannot unwind" when the unwind hit the window-procedure boundary.
+    /// Between dispatches no borrow is held, so the nested pump is safe.
+    /// The outcome is logged instead of returned to the caller.
     #[cfg(windows)]
-    fn open_with_windows_default(local: &std::path::Path) -> anyhow::Result<()> {
+    fn open_with_windows_default(&self, local: &std::path::Path) -> anyhow::Result<()> {
         use windows::Win32::UI::Shell::ShellExecuteW;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
         use windows::core::HSTRING;
 
         let file = HSTRING::from(local);
         let verb = HSTRING::from("open");
-        let result = unsafe { ShellExecuteW(None, &verb, &file, None, None, SW_SHOWNORMAL) };
-        // A return value greater than 32 is a handle (success); anything at
-        // or below 32 is an error code.
-        if result.0 as isize > 32 {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "opening {} with its associated application failed (ShellExecute error {})",
-                local.display(),
-                result.0 as isize
-            ))
-        }
+        let path = local.to_path_buf();
+        crate::windows_dispatch::run_between_dispatches(self.app_hwnd, Arc::new(move || {
+            let result = unsafe { ShellExecuteW(None, &verb, &file, None, None, SW_SHOWNORMAL) };
+            // A return value greater than 32 is a handle (success); anything
+            // at or below 32 is an error code.
+            if result.0 as isize <= 32 {
+                log::error!(
+                    "opening {} with its associated application failed (ShellExecute error {})",
+                    path.display(),
+                    result.0 as isize
+                );
+            } else {
+                log::info!("edit: opened {} with its associated application", path.display());
+            }
+        }));
+        Ok(())
     }
 
     /// Poll watched edits; a modified temp copy asks to sync back (one
@@ -7585,6 +7606,18 @@ impl Focusable for RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Windows-only: remember gpui's window handle once, for deferring
+        // message-pumping Win32 calls (ShellExecuteW opens) out of gpui
+        // dispatches via `windows_dispatch`.
+        #[cfg(windows)]
+        if self.app_hwnd == 0 {
+            use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+            if let Ok(RawWindowHandle::Win32(handle)) =
+                window.window_handle().map(|handle| handle.as_raw())
+            {
+                self.app_hwnd = handle.hwnd.get() as isize;
+            }
+        }
         // A drag that ends outside the tree (no drop) leaves no event behind;
         // heal stale drag-hover state once gpui reports the drag is over.
         if self.tree_drag_target.is_some() && !cx.has_active_drag() {
