@@ -32,6 +32,15 @@ use crate::terminal_model::TerminalModel;
 pub type TempDownloadCache =
     Arc<Mutex<std::collections::HashMap<(u64, PathBuf), PathBuf>>>;
 
+/// Staging is isolated per process so launching another instance cannot delete
+/// files that an editor in this instance still has open.
+// [impl->req~remote-edit-staging-lifetime~1]
+pub fn temp_staging_dir() -> PathBuf {
+    std::env::temp_dir()
+        .join("aetherium")
+        .join(format!("pid-{}", std::process::id()))
+}
+
 /// UI → backend commands.
 pub enum Command {
     Connect(Profile),
@@ -49,8 +58,8 @@ pub enum Command {
     /// `cancel` to abort the transfer (checked between chunks); the
     /// partial archive is removed.
     DownloadZip { session_id: u64, remote: PathBuf, cancel: Arc<AtomicBool> },
-    /// Download a remote file to a temp directory for drag-out. The UI is
-    /// notified via `Event::TempDownloadReady` when the file is available
+    /// Download a remote file to a temp directory for drag-out or local editing.
+    /// The UI is notified via `Event::TempDownloadReady` when it is available
     /// locally; `cache` additionally receives the staged path directly on
     /// the backend thread (see [`TempDownloadCache`]).
     DownloadToTemp {
@@ -146,6 +155,9 @@ pub enum Event {
     /// `TransferStarted`/`TransferProgress`/`TransferDone`, so it can't
     /// disturb the shared transfer progress UI.
     TempDownloadReady { session_id: u64, remote: PathBuf, local: PathBuf },
+    /// Staging failed; the UI clears a matching pending editor request so a
+    /// later open retries instead of remaining stuck behind the old request.
+    TempDownloadFailed { session_id: u64, remote: PathBuf, message: String },
     Error(String),
     /// Host-key verification failed because the key differs from the one
     /// recorded in known_hosts. The UI shows `message` and offers to trust
@@ -292,7 +304,7 @@ impl SessionHandle {
         self.send(Command::DownloadZip { session_id, remote, cancel });
     }
 
-    /// Download a remote file to a temp directory for drag-out.
+    /// Download a remote file to a temp directory for drag-out or local editing.
     pub fn download_to_temp(&self, session_id: u64, remote: PathBuf, cache: TempDownloadCache) {
         self.send(Command::DownloadToTemp {
             session_id,
@@ -1324,8 +1336,8 @@ async fn download(
     }
 }
 
-/// Download a remote file to the OS temp directory so it can be dragged out
-/// of the app. Only files are supported (directories are too slow to stage).
+/// Download a remote file to the process-local OS temp area for drag-out or
+/// local editing. Only files are supported (directories are too slow to stage).
 async fn download_to_temp(
     sftp: &russh_sftp::client::SftpSession,
     event_tx: &std_mpsc::Sender<Event>,
@@ -1333,19 +1345,27 @@ async fn download_to_temp(
     remote: &std::path::Path,
     cache: &TempDownloadCache,
 ) {
+    let fail = |message: String| {
+        let _ = event_tx.send(Event::TempDownloadFailed {
+            session_id,
+            remote: remote.to_path_buf(),
+            message,
+        });
+    };
     let metadata = match sftp.metadata(posix(remote)).await {
         Ok(metadata) => metadata,
         Err(err) => {
-            let _ = event_tx.send(Event::Error(format!(
+            fail(format!(
                 "temp download: stating {}: {err}",
                 remote.display()
-            )));
+            ));
             return;
         }
     };
     if metadata.is_dir() {
-        let _ = event_tx.send(Event::Error(
-            "temp download: directories are not supported".into(),
+        fail(format!(
+            "temp download: {} is a directory",
+            remote.display()
         ));
         return;
     }
@@ -1354,21 +1374,21 @@ async fn download_to_temp(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_string());
-    let temp_dir = std::env::temp_dir().join("aetherium");
+    let temp_dir = temp_staging_dir();
     if let Err(err) = std::fs::create_dir_all(&temp_dir) {
-        let _ = event_tx.send(Event::Error(format!(
+        fail(format!(
             "temp download: creating {}: {err}",
             temp_dir.display()
-        )));
+        ));
         return;
     }
     // Unique subdirectory per file to avoid collisions.
     let local_dir = temp_dir.join(Uuid::new_v4().to_string());
     if let Err(err) = std::fs::create_dir_all(&local_dir) {
-        let _ = event_tx.send(Event::Error(format!(
+        fail(format!(
             "temp download: creating {}: {err}",
             local_dir.display()
-        )));
+        ));
         return;
     }
     let local = local_dir.join(&name);
@@ -1377,7 +1397,7 @@ async fn download_to_temp(
 
     // Deliberately silent: staging must not touch the shared transfer
     // progress UI (a drag is not a user-requested transfer). Failures still
-    // surface through Event::Error.
+    // surface through Event::TempDownloadFailed.
     let result = async {
         let mut local_file = std::fs::File::create(&local)
             .with_context(|| format!("creating {}", local.display()))?;
@@ -1411,18 +1431,13 @@ async fn download_to_temp(
         Ok(()) => {
             // Publish the staged path before notifying the UI event loop:
             // the drag-out resolver blocks on this map on the UI thread, and
-            // the event loop can't run (and insert it) until it returns.
-            if let Some(old) = cache
+            // the event loop can't run (and insert it) until it returns. An
+            // older copy may belong to a running editor, so replacing the
+            // cache entry must not delete that copy.
+            // [impl->req~remote-edit-staging-lifetime~1]
+            cache
                 .lock()
-                .insert((session_id, remote.to_path_buf()), local.clone())
-            {
-                // Superseded staging of the same file: drop the old copy.
-                if old != local {
-                    if let Some(dir) = old.parent() {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
-                }
-            }
+                .insert((session_id, remote.to_path_buf()), local.clone());
             log::info!("drag-out: staged {} → {}", remote.display(), local.display());
             let _ = event_tx.send(Event::TempDownloadReady {
                 session_id,
@@ -1433,10 +1448,7 @@ async fn download_to_temp(
         Err(err) => {
             // Drop the partially staged file; nothing will ever reference it.
             let _ = std::fs::remove_dir_all(&local_dir);
-            let _ = event_tx.send(Event::Error(format!(
-                "temp download {}: {err:#}",
-                remote.display()
-            )));
+            fail(format!("temp download {}: {err:#}", remote.display()));
         }
     }
 }

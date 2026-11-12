@@ -94,6 +94,64 @@ enum TreeDetails {
     Permissions,
 }
 
+/// Merge a fresh listing with the nodes it replaces. Matching directories keep
+/// their expansion state and already-loaded descendants; the fresh entry still
+/// supplies the displayed name, size, timestamps, and permissions.
+// [impl->req~tree-live-refresh~1]
+fn merge_tree_entries(entries: Vec<FileEntry>, previous: Option<Vec<TreeNode>>) -> Vec<TreeNode> {
+    let mut previous = previous
+        .unwrap_or_default()
+        .into_iter()
+        .map(|node| (node.entry.path.clone(), node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut entries: Vec<TreeNode> = entries.into_iter().map(TreeNode::from_entry).collect();
+    for node in &mut entries {
+        if let Some(old) = previous.remove(&node.entry.path) {
+            if node.entry.is_dir && old.entry.is_dir {
+                node.expanded = old.expanded;
+                node.loading = old.loading;
+                node.children = old.children;
+            }
+        }
+    }
+    // Directories first, then alphabetical.
+    entries.sort_by(|a, b| {
+        b.entry
+            .is_dir
+            .cmp(&a.entry.is_dir)
+            .then_with(|| a.entry.name.to_lowercase().cmp(&b.entry.name.to_lowercase()))
+    });
+    entries
+}
+
+/// Consume a pending re-root only for the response that actually belongs to it.
+// [impl->req~tree-parent-navigation~1]
+fn take_pending_tree_root(pending: &mut Option<PathBuf>, path: &std::path::Path) -> bool {
+    if pending.as_deref() == Some(path) {
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Loaded, expanded directories in the visible part of a tree that are not
+/// already waiting for another listing.
+// [impl->req~tree-live-refresh~1]
+fn expanded_tree_dirs(nodes: &[TreeNode], out: &mut Vec<PathBuf>) {
+    for node in nodes {
+        if !node.entry.is_dir || !node.expanded {
+            continue;
+        }
+        if node.children.is_some() && !node.loading {
+            out.push(node.entry.path.clone());
+        }
+        if let Some(children) = node.children.as_deref() {
+            expanded_tree_dirs(children, out);
+        }
+    }
+}
+
 /// Find a directory node by path (depth-first). Implemented in two phases —
 /// locate the index path on an immutable walk, then descend mutably — to
 /// stay within what the borrow checker accepts for tree walks.
@@ -698,6 +756,13 @@ struct RemoteEdit {
     size: u64,
 }
 
+// [impl->req~remote-edit-staging-lifetime~1]
+fn remote_edit_uses_path(edits: &[RemoteEdit], session_id: u64, local: &std::path::Path) -> bool {
+    edits
+        .iter()
+        .any(|edit| edit.session_id == session_id && edit.local == local)
+}
+
 /// The pending "upload back to the device?" question for a modified temp
 /// copy.
 #[derive(Clone)]
@@ -789,6 +854,8 @@ pub struct RootView {
     /// The "sync back?" dialog state, one question at a time.
     edit_sync_ask: Option<EditSyncAsk>,
     last_edit_scan: std::time::Instant,
+    /// Last background refresh of the active session's visible directories.
+    last_tree_refresh: std::time::Instant,
     /// Which sidebar view is shown.
     sidebar_tab: SidebarTab,
     /// Current width of the sidebar, dragged via the splitter.
@@ -814,9 +881,9 @@ pub struct RootView {
     /// [`TempDownloadCache`]) so the `external_drag_payload` resolver can
     /// block on it while the drag is leaving the window; the
     /// `TempDownloadReady` event additionally drives status text and the
-    /// "Open in VS Code" flow. Entries are deleted (and their files removed)
-    /// when the drag ends inside the app, when the session disconnects or its
-    /// tab closes, and every staged file is purged on the next app launch.
+    /// "Open in VS Code" flow. Unused entries and files are removed when a
+    /// drag ends inside the app or its session goes away. Registered editor
+    /// copies survive; each process uses an isolated staging directory.
     temp_download_cache: TempDownloadCache,
     /// Instant local echo of printable keystrokes (the server's identical
     /// echo is deduplicated on arrival) — the fix for typing lag on
@@ -932,6 +999,7 @@ impl RootView {
             pending_editor_open: Vec::new(),
             edit_sync_ask: None,
             last_edit_scan: std::time::Instant::now(),
+            last_tree_refresh: std::time::Instant::now(),
             sidebar_tab: SidebarTab::Sessions,
             sidebar_width: px(260.),
             tree_details: TreeDetails::None,
@@ -950,9 +1018,9 @@ impl RootView {
             history: HistoryStore::load(),
             focus_handle: cx.focus_handle(),
         };
-        // Purge staging leftovers from previous runs (drag-out cancels,
-        // interrupted transfers). The directory is private to this app.
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aetherium"));
+        // Clean only this process's staging area. Other running instances may
+        // still have their own staged files open in external editors.
+        let _ = std::fs::remove_dir_all(crate::session::temp_staging_dir());
         view.spawn_repaint_loop(cx, terminal_wake_rx);
         view.spawn_event_loop(cx);
         view
@@ -1067,6 +1135,7 @@ impl RootView {
                     this.api_tick(cx);
                     this.log_view_upkeep(cx);
                     this.edit_scan(cx);
+                    this.tree_refresh();
                     if handled {
                         cx.notify();
                     }
@@ -1077,6 +1146,42 @@ impl RootView {
             }
         })
         .detach();
+    }
+
+    /// SFTP has no remote filesystem notifications. Re-list the active root
+    /// and visible expanded directories periodically, without loading collapsed
+    /// or inactive trees and without flickering their loading indicators.
+    // [impl->req~tree-live-refresh~1]
+    fn tree_refresh(&mut self) {
+        if self.last_tree_refresh.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_tree_refresh = std::time::Instant::now();
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.state != ConnState::Connected {
+            return;
+        }
+        let Some(session) = tab.session.clone() else {
+            return;
+        };
+        let session_id = tab.session_id;
+        let mut dirs = Vec::new();
+        if let Some(root) = tab.root_path.clone() {
+            if tab
+                .tree
+                .first()
+                .is_some_and(|node| node.entry.path == root && !node.loading)
+            {
+                dirs.push(root);
+            }
+        }
+        expanded_tree_dirs(&tab.tree, &mut dirs);
+        dirs.dedup();
+        for dir in dirs {
+            session.list_dir(session_id, dir);
+        }
     }
 
     /// Per-tick upkeep of the active log tab: follow pinning, applying
@@ -1176,18 +1281,11 @@ impl RootView {
                 if session_id != tab.session_id {
                     return;
                 }
-                let mut entries: Vec<TreeNode> = entries.into_iter().map(TreeNode::from_entry).collect();
-                // Directories first, then alphabetical.
-                entries.sort_by(|a, b| {
-                    b.entry
-                        .is_dir
-                        .cmp(&a.entry.is_dir)
-                        .then_with(|| a.entry.name.to_lowercase().cmp(&b.entry.name.to_lowercase()))
-                });
                 // A `..` navigation: the listed directory becomes the new
                 // tree root, keeping the previous root visible (expanded)
-                // inside it.
-                if tab.pending_tree_root.take().as_deref() == Some(path.as_path()) {
+                // inside it. Other in-flight listings must leave the pending
+                // re-root untouched.
+                if take_pending_tree_root(&mut tab.pending_tree_root, &path) {
                     let parent_entry = FileEntry {
                         name: path
                             .file_name()
@@ -1199,6 +1297,7 @@ impl RootView {
                         modified: None,
                         mode: None,
                     };
+                    let mut entries = merge_tree_entries(entries, None);
                     if let Some(old_root) = tab.tree.first().cloned() {
                         if let Some(slot) = entries
                             .iter_mut()
@@ -1217,9 +1316,13 @@ impl RootView {
                     return;
                 }
                 if let Some(node) = find_node(&mut tab.tree, &path) {
-                    node.children = Some(entries);
+                    let first_load = node.children.is_none();
+                    let previous = node.children.take();
+                    node.children = Some(merge_tree_entries(entries, previous));
                     node.loading = false;
-                    node.expanded = true;
+                    if first_load {
+                        node.expanded = true;
+                    }
                 }
             }
             SessionEvent::TransferStarted { label } => {
@@ -1296,17 +1399,15 @@ impl RootView {
                 );
             }
             SessionEvent::EntryDeleted { path } => {
-                // A staged temp copy of the deleted file is useless now;
-                // drop it like a drag that ended inside the app.
+                // Remove the cache entry; an open editor keeps its local copy
+                // so unsaved changes are not destroyed with the remote file.
                 let session_id = self.tabs[index].session_id;
                 if let Some(local) = self
                     .temp_download_cache
                     .lock()
                     .remove(&(session_id, path.clone()))
                 {
-                    if let Some(dir) = local.parent() {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
+                    self.remove_staged_copy(session_id, &local);
                 }
                 let tab = &mut self.tabs[index];
                 tab.status = format!("deleted {}", path.display());
@@ -1441,8 +1542,8 @@ impl RootView {
                 self.tree_dragging = None;
                 // Drop the old session's output; focus stays on the sidebar.
                 tab.terminal.reset();
-                // Drag-out staging for this session is useless now; delete
-                // the staged files (uuid dirs under the temp area).
+                // Drop this session's cache and unused drag-out copies. Local
+                // files registered in remote_edits remain open and recoverable.
                 self.purge_staged_for(session_id);
                 // The confirmation dialog (if up) outlived its session.
                 self.confirm_delete = None;
@@ -1496,20 +1597,12 @@ impl RootView {
                 remote,
                 local,
             } => {
-                let mut cache = self.temp_download_cache.lock();
-                if let Some(old) = cache.insert((session_id, remote.clone()), local.clone()) {
-                    // Superseded staging of the same file: drop the old copy
-                    // — but not when it's this same path; the backend now
-                    // publishes into the cache before this event arrives, so
-                    // `old == local` is the normal case, and deleting it
-                    // would remove the live staged file.
-                    if old != local {
-                        if let Some(dir) = old.parent() {
-                            let _ = std::fs::remove_dir_all(dir);
-                        }
-                    }
+                // The backend has already published the path in the cache.
+                // Never reinsert or delete superseded copies here: an earlier
+                // copy can still be open in an external editor.
+                if session_id != self.tabs[index].session_id {
+                    return;
                 }
-                drop(cache);
                 log::info!("drag-out: staged {} (session {session_id})", remote.display());
                 self.tabs[index].status = format!("staged {} for drag-out", remote.display());
                 // An editor request ("Edit locally" / "Open in VS Code") is
@@ -1535,6 +1628,16 @@ impl RootView {
                         cx,
                     );
                 }
+            }
+            SessionEvent::TempDownloadFailed {
+                session_id,
+                remote,
+                message,
+            } => {
+                self.pending_editor_open.retain(|pending| {
+                    pending.session_id != session_id || pending.remote != remote
+                });
+                self.handle_tab_event(index, SessionEvent::Error(message), cx);
             }
             SessionEvent::TailEnded { tab_id } => {
                 self.end_log_tab(tab_id, "tail ended");
@@ -2785,7 +2888,8 @@ impl RootView {
         tab.transfer = None;
         tab.transfer_cancel = None;
         tab.terminal_focus_pending = true;
-        // Drag-out staging belonged to the dead session.
+        // Forget the dead session's cache without deleting copies still open
+        // in editors; reconnecting stages a fresh copy when needed.
         self.purge_staged_for(old_session_id);
         let label = Self::tab_log_label(&self.tabs[self.active]);
         self.log(LogLevel::Info, format!("{label}: reconnecting"));
@@ -3154,45 +3258,60 @@ impl RootView {
             .as_ref()
             .map(|profile| profile.summary())
             .unwrap_or_default();
-        // Already staged (or waiting): just (re)open the editor.
-        if let Some(edit) = self
+        // Already staged: just (re)open the editor. If an external program or
+        // an older app instance removed the copy, discard the stale watch and
+        // stage it again instead of passing a nonexistent path to the shell.
+        // [impl->req~remote-edit-staging-lifetime~1]
+        let existing = self
             .remote_edits
             .iter()
             .find(|edit| edit.session_id == session_id && edit.remote == remote)
-        {
-            let local = edit.local.clone();
-            if self.launch_editor(editor, &local).is_ok() {
-                self.status = format!("editing {} — saves ask to sync back", remote.display());
-            } else {
-                self.status = "could not launch the editor".into();
+            .map(|edit| edit.local.clone());
+        if let Some(local) = existing {
+            if local.is_file() {
+                if self.launch_editor(editor, &local).is_ok() {
+                    self.status = format!("editing {} — saves ask to sync back", remote.display());
+                } else {
+                    self.status = "could not launch the editor".into();
+                }
+                cx.notify();
+                return;
             }
-            cx.notify();
+            self.remote_edits
+                .retain(|edit| edit.session_id != session_id || edit.remote != remote);
+        }
+        // A double-click while the first download is in flight must not start
+        // a competing download whose completion could replace its temp path.
+        if let Some(waiting) = self
+            .pending_editor_open
+            .iter_mut()
+            .find(|waiting| waiting.session_id == session_id && waiting.remote == remote)
+        {
+            waiting.editor = editor;
             return;
         }
-        let pending = PendingEditorOpen {
-            session_id,
-            remote: remote.clone(),
-            editor,
-        };
-        if !self
-            .pending_editor_open
-            .iter()
-            .any(|waiting| {
-                waiting.session_id == pending.session_id
-                    && waiting.remote == pending.remote
-                    && waiting.editor == pending.editor
-            })
-        {
-            self.pending_editor_open.push(pending);
-        }
-        // A previous staging (drag-out or an earlier edit) is reused.
+        // A previous staging (drag-out or an earlier edit) is reused only while
+        // the file still exists.
         let key = (session_id, remote.clone());
         let staged = self.temp_download_cache.lock().get(&key).cloned();
+        let staged = match staged {
+            Some(local) if local.is_file() => Some(local),
+            Some(_) => {
+                self.temp_download_cache.lock().remove(&key);
+                None
+            }
+            None => None,
+        };
         match (staged, session) {
             (Some(local), _) => {
                 self.begin_remote_edit(session_id, remote, local, target, editor, cx)
             }
             (None, Some(session)) => {
+                self.pending_editor_open.push(PendingEditorOpen {
+                    session_id,
+                    remote: remote.clone(),
+                    editor,
+                });
                 log::info!("edit: staging {}", remote.display());
                 session.download_to_temp(session_id, remote.clone(), self.temp_download_cache.clone());
                 self.status = format!("staging {}…", remote.display());
@@ -4009,14 +4128,25 @@ impl RootView {
         }
     }
 
-    /// Delete all drag-out staging files cached for `session_id` (the uuid
-    /// temp dirs) and drop their cache entries.
+    /// Delete an unused staged copy, but never pull a live edit out from under
+    /// its external editor. Cache entries can still be dropped on disconnect;
+    /// the `RemoteEdit` retains the local path and its write-back baseline.
+    // [impl->req~remote-edit-staging-lifetime~1]
+    fn remove_staged_copy(&self, session_id: u64, local: &std::path::Path) {
+        if remote_edit_uses_path(&self.remote_edits, session_id, local) {
+            return;
+        }
+        if let Some(dir) = local.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Delete unused drag-out staging files cached for `session_id` and drop
+    /// their cache entries.
     fn purge_staged_for(&self, session_id: u64) {
         self.temp_download_cache.lock().retain(|(sid, _), local| {
             if *sid == session_id {
-                if let Some(dir) = local.parent() {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
+                self.remove_staged_copy(session_id, local);
                 false
             } else {
                 true
@@ -4097,15 +4227,14 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         self.clear_tree_drag(cx);
-        // The drag ended inside the app, so the staged temp copy (files are
-        // pre-downloaded for drag-out when a drag starts) is dead weight.
+        // The drag ended inside the app, so its staging cache entry is dead
+        // weight. A copy registered for remote editing is still in use.
         if !dragged.is_dir {
             if let Some(tab) = self.active_tab() {
-                let key = (tab.session_id, dragged.path.clone());
+                let session_id = tab.session_id;
+                let key = (session_id, dragged.path.clone());
                 if let Some(local) = self.temp_download_cache.lock().remove(&key) {
-                    if let Some(dir) = local.parent() {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
+                    self.remove_staged_copy(session_id, &local);
                 }
             }
         }
@@ -8855,5 +8984,101 @@ mod tests {
                 PathBuf::from("/home/user/collapsed.txt"),
             ]
         );
+    }
+
+    fn tree_entry(name: &str, path: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: PathBuf::from(path),
+            is_dir,
+            size: 0,
+            modified: None,
+            mode: None,
+        }
+    }
+
+    // [utest->req~tree-parent-navigation~1]
+    #[test]
+    fn pending_tree_root_ignores_unrelated_listings() {
+        let mut pending = Some(PathBuf::from("/home"));
+        assert!(!take_pending_tree_root(
+            &mut pending,
+            std::path::Path::new("/home/root")
+        ));
+        assert_eq!(pending, Some(PathBuf::from("/home")));
+        assert!(take_pending_tree_root(
+            &mut pending,
+            std::path::Path::new("/home")
+        ));
+        assert_eq!(pending, None);
+    }
+
+    // [utest->req~tree-live-refresh~1]
+    #[test]
+    fn listing_refresh_preserves_expanded_descendants_and_adds_files() {
+        let mut nested = TreeNode::from_entry(tree_entry("root", "/home/root", true));
+        nested.expanded = true;
+        nested.children = Some(vec![TreeNode::from_entry(tree_entry(
+            "old.txt",
+            "/home/root/old.txt",
+            false,
+        ))]);
+        let mut home = TreeNode::from_entry(tree_entry("root", "/home", true));
+        home.expanded = true;
+        home.children = Some(vec![nested]);
+
+        let mut refreshed = merge_tree_entries(
+            vec![
+                tree_entry("new.txt", "/home/new.txt", false),
+                tree_entry("root", "/home", true),
+            ],
+            Some(vec![home]),
+        );
+        let home = find_node(&mut refreshed, std::path::Path::new("/home")).unwrap();
+        assert!(home.expanded);
+        let nested = find_node(&mut refreshed, std::path::Path::new("/home/root")).unwrap();
+        assert!(nested.expanded);
+        assert!(find_node(&mut refreshed, std::path::Path::new("/home/root/old.txt")).is_some());
+        assert!(find_node(&mut refreshed, std::path::Path::new("/home/new.txt")).is_some());
+    }
+
+    // [utest->req~tree-live-refresh~1]
+    #[test]
+    fn refresh_targets_only_idle_loaded_expanded_directories() {
+        let mut expanded = TreeNode::from_entry(tree_entry("expanded", "/home/expanded", true));
+        expanded.expanded = true;
+        expanded.children = Some(Vec::new());
+        let mut collapsed = TreeNode::from_entry(tree_entry("collapsed", "/home/collapsed", true));
+        collapsed.children = Some(Vec::new());
+        let mut loading = TreeNode::from_entry(tree_entry("loading", "/home/loading", true));
+        loading.expanded = true;
+        loading.loading = true;
+        loading.children = Some(Vec::new());
+        let tree = vec![expanded, collapsed, loading];
+
+        let mut dirs = Vec::new();
+        expanded_tree_dirs(&tree, &mut dirs);
+        assert_eq!(dirs, vec![PathBuf::from("/home/expanded")]);
+    }
+
+    // [utest->req~remote-edit-staging-lifetime~1]
+    #[test]
+    fn staged_cleanup_recognizes_live_editor_copies() {
+        let local = PathBuf::from("/tmp/aetherium-edit/config.toml");
+        let edits = vec![RemoteEdit {
+            session_id: 7,
+            remote: PathBuf::from("/etc/config.toml"),
+            local: local.clone(),
+            target: "device".into(),
+            mtime: std::time::UNIX_EPOCH,
+            size: 0,
+        }];
+        assert!(remote_edit_uses_path(&edits, 7, &local));
+        assert!(!remote_edit_uses_path(&edits, 8, &local));
+        assert!(!remote_edit_uses_path(
+            &edits,
+            7,
+            std::path::Path::new("/tmp/aetherium-edit/other.toml")
+        ));
     }
 }

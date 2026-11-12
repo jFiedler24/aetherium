@@ -24,10 +24,22 @@ terminal session.
 The file tree shall offer an "up one level" (`..`) row whenever the
 current root has a parent directory; activating it re-roots the tree at
 the parent, keeping the previous root visible and expanded inside it.
+Unrelated directory responses shall not consume a pending re-root.
 
 **Covers:** feat~file-tree~1
 
-**Needs:** impl
+**Needs:** impl, utest
+
+## req~tree-live-refresh~1
+
+The active session's current root and visible expanded directories shall
+be re-listed periodically so changes made directly on the device appear.
+Refreshes shall preserve matching directories' expansion state and loaded
+descendants.
+
+**Covers:** feat~file-tree~1
+
+**Needs:** impl, utest
 
 ## feat~transfer-progress~1
 
@@ -65,7 +77,17 @@ the changes back to the device.
 
 **Covers:** creq~edit-remote-files-with-local-editor~1
 
-**Needs:** impl
+**Needs:** req, impl
+
+## req~remote-edit-staging-lifetime~1
+
+A staged local copy registered for remote editing shall remain available
+across SSH disconnects, reconnects, repeated staging, and other running
+app instances. A missing cached copy shall be staged again before opening.
+
+**Covers:** feat~remote-edit-writeback~1
+
+**Needs:** impl, utest
 
 ## feat~folder-zip-download~1
 
