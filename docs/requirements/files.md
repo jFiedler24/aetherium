@@ -89,6 +89,17 @@ app instances. A missing cached copy shall be staged again before opening.
 
 **Needs:** impl, utest
 
+## req~remote-edit-diagnostics~1
+
+Staging, editor-launch, local-file-watch, and sync-back failures shall be
+written to the application diagnostic log, including the affected paths
+and underlying error where available. Failures handled by the UI shall
+also appear in the in-app tool log.
+
+**Covers:** feat~remote-edit-writeback~1
+
+**Needs:** impl
+
 ## feat~folder-zip-download~1
 
 Right-clicking a remote directory shall offer "Download as ZIP": the

@@ -39,6 +39,17 @@ existing SSH sessions — no hidden parallel connections.
 
 **Needs:** impl
 
+## req~api-posix-paths~1
+
+Remote paths crossing the REST API — the `path` of entries returned by
+`GET /files` and the paths accepted by the file endpoints — shall be
+POSIX-style (`/` separators) regardless of the client platform, so API
+consumers can reuse them verbatim without separator repair.
+
+**Covers:** feat~rest-api~1
+
+**Needs:** impl, utest
+
 ## feat~rest-log-collection~1
 
 `POST /logs/collect` shall gather the common Linux logs (kernel ring

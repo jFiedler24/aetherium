@@ -367,8 +367,11 @@ struct HostKeyFailure {
 }
 
 /// russh client handler. Verifies the server's host key against
-/// `~/.ssh/known_hosts`; unknown or mismatched keys are rejected rather than
-/// silently accepted, closing the "accept anything" hole from v1.
+/// `~/.ssh/known_hosts`: unknown keys are learned (trust-on-first-use),
+/// changed keys renew the stale entry in place — the typical cause is a
+/// re-flashed or swapped device behind the same address. Rejection remains
+/// for the cases that cannot be recovered (certificate-based keys, an
+/// unwritable known_hosts), closing the "accept anything" hole from v1.
 struct ClientHandler {
     host: String,
     port: u16,
@@ -377,7 +380,7 @@ struct ClientHandler {
     failure: Arc<Mutex<Option<HostKeyFailure>>>,
 }
 
-// [impl->req~known-hosts-verification~1]
+// [impl->req~known-hosts-verification~2]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -415,22 +418,49 @@ impl client::Handler for ClientHandler {
             }
             Err(err) => {
                 // [impl->req~connect-error-visibility~1]
-                let mut failure = HostKeyFailure {
+                if matches!(err, russh::keys::Error::KeyChanged { .. }) {
+                    // [impl->req~known-hosts-verification~2]
+                    // The recorded key differs from the presented one — the
+                    // usual cause is a re-flashed or swapped device behind
+                    // the same address, which makes the old entry worthless.
+                    // Renew it in place (the `ssh-keygen -R` plus
+                    // trust-on-first-use sequence, automated) and proceed,
+                    // so reconnects stay hands-free. When the entry cannot
+                    // be rewritten, reject and let the UI offer the
+                    // one-click accept flow.
+                    // [impl->req~accept-changed-host-key~1]
+                    let fingerprint =
+                        key.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+                    match renew_known_host(&self.host, self.port, key) {
+                        Ok(()) => {
+                            log::warn!(
+                                "host key for {}:{} changed ({fingerprint}); \
+                                 renewed the known_hosts entry automatically",
+                                self.host, self.port
+                            );
+                            return Ok(true);
+                        }
+                        Err(renew_err) => {
+                            record_failure(HostKeyFailure {
+                                message: format!(
+                                    "host key verification failed for {}:{}: {err} — \
+                                     and the stale entry could not be renewed automatically \
+                                     ({renew_err}); remove it from known_hosts and reconnect",
+                                    self.host, self.port
+                                ),
+                                changed_key: Some(fingerprint),
+                            });
+                            return Ok(false);
+                        }
+                    }
+                }
+                record_failure(HostKeyFailure {
                     message: format!(
                         "host key verification failed for {}:{}: {err}",
                         self.host, self.port
                     ),
                     changed_key: None,
-                };
-                if matches!(err, russh::keys::Error::KeyChanged { .. }) {
-                    // [impl->req~accept-changed-host-key~1]
-                    failure.changed_key =
-                        Some(key.fingerprint(russh::keys::HashAlg::Sha256).to_string());
-                    failure.message.push_str(
-                        " — the host's key differs from the recorded one; if the change is expected (host reinstalled or replaced), remove its stale entry from known_hosts and reconnect",
-                    );
-                }
-                record_failure(failure);
+                });
                 Ok(false)
             }
         }
@@ -516,6 +546,16 @@ fn forget_known_host(host: &str, port: u16) -> Result<()> {
     std::fs::write(&path, rewritten)
         .with_context(|| format!("rewriting {}", path.display()))?;
     Ok(())
+}
+
+/// Replace the recorded host key for `host:port` with the key the server
+/// actually presented: drop every stale entry, then learn the new one. The
+/// following connects verify against the renewed entry as usual.
+/// [impl->req~known-hosts-verification~2]
+fn renew_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) -> Result<()> {
+    forget_known_host(host, port)?;
+    russh::keys::known_hosts::learn_known_hosts(host, port, key)
+        .map_err(|err| anyhow!("recording the new host key: {err}"))
 }
 
 /// Connect, authenticate, open shell + SFTP channels, and serve commands
@@ -1455,11 +1495,15 @@ async fn download_to_temp(
 
 /// Upload one local file to an exact remote path for the REST API,
 /// replacing any existing file. Returns the byte count.
+// [impl->req~api-posix-paths~1]
 async fn api_upload(
     sftp: &russh_sftp::client::SftpSession,
     local: &std::path::Path,
     remote: &str,
 ) -> Result<u64, String> {
+    // Remote paths are POSIX; a consumer echoing a platform-rendered path
+    // back (backslashes on Windows) must not address a different file.
+    let remote = remote.replace('\\', "/");
     use std::io::Read as _;
     let mut local_file =
         std::fs::File::open(local).map_err(|err| format!("opening {}: {err}", local.display()))?;
@@ -1491,11 +1535,15 @@ async fn api_upload(
 
 /// Download a remote file to a fresh temp path for the REST API. Returns the
 /// local path and the byte count.
+// [impl->req~api-posix-paths~1]
 async fn api_download(
     sftp: &russh_sftp::client::SftpSession,
     remote: &str,
 ) -> Result<(PathBuf, u64), String> {
-    let name = std::path::Path::new(remote)
+    // Remote paths are POSIX; a consumer echoing a platform-rendered path
+    // back (backslashes on Windows) must not address a different file.
+    let remote = remote.replace('\\', "/");
+    let name = std::path::Path::new(&remote)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_string());

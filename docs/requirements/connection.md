@@ -22,11 +22,15 @@ encrypted at rest under the user's config directory.
 
 **Needs:** impl
 
-## req~known-hosts-verification~1
+## req~known-hosts-verification~2
 
 On connect, the server's host key shall be verified against the user's
-`known_hosts`; unknown keys are learned (trust-on-first-use), changed
-keys are rejected.
+`known_hosts`: unknown keys are learned (trust-on-first-use); a changed
+key renews the stale entry automatically — every recorded entry for that
+host is replaced with the presented key and the connect proceeds. Only
+when the stale entry cannot be replaced (e.g. `known_hosts` is not
+writable) is the changed key rejected, in which case the UI offers the
+one-click accept flow described below.
 
 **Covers:** feat~connection-profiles~1
 
@@ -47,10 +51,11 @@ reconnectable.
 
 ## req~accept-changed-host-key~1
 
-When verification fails because the recorded host key changed, the app
-shall show the new key's fingerprint and offer a one-click way to remove
-the stale known_hosts entry and reconnect — the `ssh-keygen -R` plus
-trust-on-first-use equivalent.
+When verification fails because the recorded host key changed and the
+stale entry could not be renewed automatically (e.g. `known_hosts` is
+not writable), the app shall show the new key's fingerprint and offer a
+one-click way to remove the stale known_hosts entry and reconnect — the
+`ssh-keygen -R` plus trust-on-first-use equivalent.
 
 **Covers:** feat~connection-profiles~1
 
@@ -115,6 +120,16 @@ shall be written to a log file because stderr is unavailable.
 **Covers:** feat~windows-parity~1
 
 **Needs:** impl
+
+## req~detailed-log-timestamps~1
+
+Every application diagnostic line, including each physical line of a
+multiline message, and every in-app tool-log entry shall begin with an
+ISO 8601 local timestamp including milliseconds and the UTC offset.
+
+**Covers:** feat~windows-parity~1
+
+**Needs:** impl, utest
 
 ## req~windows-drag-out~1
 

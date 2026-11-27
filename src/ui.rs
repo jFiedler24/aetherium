@@ -135,6 +135,15 @@ fn take_pending_tree_root(pending: &mut Option<PathBuf>, path: &std::path::Path)
     }
 }
 
+/// Render a remote path for display and API replies. Remote paths are
+/// always POSIX; `PathBuf::display()` renders them with the *local*
+/// separator (backslashes on Windows), which an API consumer reusing the
+/// path verbatim would read as a different, mangled path.
+// [impl->req~api-posix-paths~1]
+fn remote_path_string(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Loaded, expanded directories in the visible part of a tree that are not
 /// already waiting for another listing.
 // [impl->req~tree-live-refresh~1]
@@ -246,7 +255,7 @@ enum LogLevel {
 
 /// One line of the tool log shown in the Logs sidebar tab.
 struct LogEntry {
-    /// Local time of the entry, `HH:MM:SS`.
+    /// ISO 8601 local timestamp with milliseconds and UTC offset.
     time: String,
     level: LogLevel,
     message: String,
@@ -730,8 +739,7 @@ struct PendingApiLog {
 /// Which local editor to open a staged file with.
 #[derive(Clone, Copy, PartialEq)]
 enum EditorChoice {
-    /// The OS default editor (`open`, `xdg-open`, Explorer) or
-    /// `$AETHERIUM_EDITOR` when set.
+    /// The OS default handler or `$AETHERIUM_EDITOR` when set.
     Default,
     /// VS Code explicitly.
     VsCode,
@@ -754,6 +762,14 @@ struct RemoteEdit {
     target: String,
     mtime: std::time::SystemTime,
     size: u64,
+    watch_error_reported: bool,
+}
+
+fn remote_edit_metadata(
+    local: &std::path::Path,
+) -> std::io::Result<(std::time::SystemTime, u64)> {
+    let metadata = std::fs::metadata(local)?;
+    Ok((metadata.modified()?, metadata.len()))
 }
 
 // [impl->req~remote-edit-staging-lifetime~1]
@@ -951,7 +967,7 @@ impl UiSettings {
                 self.terminal_font_size, self.shell_coloring
             ),
         ) {
-            eprintln!("aetherium: saving ui settings: {err:#}");
+            log::warn!("aetherium: saving ui settings: {err:#}");
         }
     }
 }
@@ -968,7 +984,7 @@ impl RootView {
         let ui_settings = UiSettings::load();
         // Pre-select the first profile so Connect works with one click.
         let selected = (!store.profiles.is_empty()).then_some(0);
-        let view = Self {
+        let mut view = Self {
             store,
             selected,
             form: None,
@@ -1020,7 +1036,18 @@ impl RootView {
         };
         // Clean only this process's staging area. Other running instances may
         // still have their own staged files open in external editors.
-        let _ = std::fs::remove_dir_all(crate::session::temp_staging_dir());
+        let staging_dir = crate::session::temp_staging_dir();
+        if let Err(err) = std::fs::remove_dir_all(&staging_dir) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                view.edit_log(
+                    LogLevel::Warn,
+                    format!(
+                        "edit: cleaning staging directory {} failed: {err}",
+                        staging_dir.display()
+                    ),
+                );
+            }
+        }
         view.spawn_repaint_loop(cx, terminal_wake_rx);
         view.spawn_event_loop(cx);
         view
@@ -1263,7 +1290,7 @@ impl RootView {
                         connected_at_unix: now_unix(),
                     });
                     if let Err(err) = self.recents.save() {
-                        eprintln!("zedterm: failed to save recents: {err:#}");
+                        log::warn!("aetherium: failed to save recents: {err:#}");
                         self.log(LogLevel::Warn, format!("failed to save recents: {err:#}"));
                     }
                 }
@@ -1629,14 +1656,23 @@ impl RootView {
                     );
                 }
             }
+            // [impl->req~remote-edit-diagnostics~1]
             SessionEvent::TempDownloadFailed {
                 session_id,
                 remote,
                 message,
             } => {
+                let editor_requested = self.pending_editor_open.iter().any(|pending| {
+                    pending.session_id == session_id && pending.remote == remote
+                });
                 self.pending_editor_open.retain(|pending| {
                     pending.session_id != session_id || pending.remote != remote
                 });
+                let message = if editor_requested {
+                    format!("edit: staging {} failed: {message}", remote.display())
+                } else {
+                    message
+                };
                 self.handle_tab_event(index, SessionEvent::Error(message), cx);
             }
             SessionEvent::TailEnded { tab_id } => {
@@ -1684,7 +1720,7 @@ impl RootView {
                             "ok": true,
                             "entries": entries.iter().map(|entry| serde_json::json!({
                                 "name": entry.name,
-                                "path": entry.path.display().to_string(),
+                                "path": remote_path_string(&entry.path),
                                 "is_dir": entry.is_dir,
                                 "size": entry.size,
                                 "modified": entry.modified,
@@ -3238,6 +3274,7 @@ impl RootView {
     /// editor (MobaXterm-style remote editing). The temp copy is watched;
     /// every save pops a "sync back to the device?" dialog.
 // [impl->feat~remote-edit-writeback~1]
+// [impl->req~remote-edit-diagnostics~1]
     fn start_remote_edit(&mut self, remote: PathBuf, editor: EditorChoice, cx: &mut Context<Self>) {
         self.context_menu = None;
         let connected = self
@@ -3245,10 +3282,18 @@ impl RootView {
             .is_some_and(|tab| tab.state == ConnState::Connected);
         if !connected {
             self.status = "not connected".into();
+            self.edit_log(
+                LogLevel::Warn,
+                format!("edit: cannot open {}: not connected", remote.display()),
+            );
             cx.notify();
             return;
         }
         let Some(tab) = self.active_tab() else {
+            self.edit_log(
+                LogLevel::Error,
+                format!("edit: cannot open {}: no active session", remote.display()),
+            );
             return;
         };
         let session = tab.session.clone();
@@ -3269,14 +3314,33 @@ impl RootView {
             .map(|edit| edit.local.clone());
         if let Some(local) = existing {
             if local.is_file() {
-                if self.launch_editor(editor, &local).is_ok() {
-                    self.status = format!("editing {} — saves ask to sync back", remote.display());
-                } else {
-                    self.status = "could not launch the editor".into();
+                match self.launch_editor(editor, &local) {
+                    Ok(()) => {
+                        self.status = format!("editing {} — saves ask to sync back", remote.display());
+                    }
+                    Err(err) => {
+                        self.status = format!("editor: {err:#}");
+                        self.edit_log(
+                            LogLevel::Error,
+                            format!(
+                                "edit: launching editor for {} using {} failed: {err:#}",
+                                remote.display(),
+                                local.display()
+                            ),
+                        );
+                    }
                 }
                 cx.notify();
                 return;
             }
+            self.edit_log(
+                LogLevel::Warn,
+                format!(
+                    "edit: staged copy {} for {} is missing; staging it again",
+                    local.display(),
+                    remote.display()
+                ),
+            );
             self.remote_edits
                 .retain(|edit| edit.session_id != session_id || edit.remote != remote);
         }
@@ -3296,8 +3360,16 @@ impl RootView {
         let staged = self.temp_download_cache.lock().get(&key).cloned();
         let staged = match staged {
             Some(local) if local.is_file() => Some(local),
-            Some(_) => {
+            Some(local) => {
                 self.temp_download_cache.lock().remove(&key);
+                self.edit_log(
+                    LogLevel::Warn,
+                    format!(
+                        "edit: cached copy {} for {} is unavailable; staging it again",
+                        local.display(),
+                        remote.display()
+                    ),
+                );
                 None
             }
             None => None,
@@ -3312,16 +3384,29 @@ impl RootView {
                     remote: remote.clone(),
                     editor,
                 });
-                log::info!("edit: staging {}", remote.display());
+                self.edit_log(
+                    LogLevel::Info,
+                    format!("edit: staging {}", remote.display()),
+                );
                 session.download_to_temp(session_id, remote.clone(), self.temp_download_cache.clone());
                 self.status = format!("staging {}…", remote.display());
             }
-            (None, None) => self.status = "not connected".into(),
+            (None, None) => {
+                self.status = "not connected".into();
+                self.edit_log(
+                    LogLevel::Error,
+                    format!(
+                        "edit: cannot stage {}: the session backend is unavailable",
+                        remote.display()
+                    ),
+                );
+            }
         }
         cx.notify();
     }
 
     /// Register a staged temp file as a watched remote edit and open it.
+    // [impl->req~remote-edit-diagnostics~1]
     fn begin_remote_edit(
         &mut self,
         session_id: u64,
@@ -3331,14 +3416,20 @@ impl RootView {
         editor: EditorChoice,
         cx: &mut Context<Self>,
     ) {
-        let (mtime, size) = std::fs::metadata(&local)
-            .map(|metadata| {
-                (
-                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    metadata.len(),
-                )
-            })
-            .unwrap_or((std::time::UNIX_EPOCH, 0));
+        let (mtime, size, watch_error_reported) = match remote_edit_metadata(&local) {
+            Ok((mtime, size)) => (mtime, size, false),
+            Err(err) => {
+                self.edit_log(
+                    LogLevel::Error,
+                    format!(
+                        "edit: inspecting staged copy {} for {} failed: {err}",
+                        local.display(),
+                        remote.display()
+                    ),
+                );
+                (std::time::UNIX_EPOCH, 0, true)
+            }
+        };
         self.remote_edits.push(RemoteEdit {
             session_id,
             remote: remote.clone(),
@@ -3346,6 +3437,7 @@ impl RootView {
             target,
             mtime,
             size,
+            watch_error_reported,
         });
         match self.launch_editor(editor, &local) {
             Ok(()) => {
@@ -3353,6 +3445,14 @@ impl RootView {
             }
             Err(err) => {
                 self.status = format!("editor: {err:#}");
+                self.edit_log(
+                    LogLevel::Error,
+                    format!(
+                        "edit: launching editor for {} using {} failed: {err:#}",
+                        remote.display(),
+                        local.display()
+                    ),
+                );
             }
         }
         cx.notify();
@@ -3442,6 +3542,7 @@ impl RootView {
 
     /// Poll watched edits; a modified temp copy asks to sync back (one
     /// question at a time, like MobaXterm).
+    // [impl->req~remote-edit-diagnostics~1]
     fn edit_scan(&mut self, cx: &mut Context<Self>) {
         if self.last_edit_scan.elapsed() < Duration::from_millis(700) {
             return;
@@ -3451,12 +3552,30 @@ impl RootView {
             return;
         }
         for index in 0..self.remote_edits.len() {
-            let edit = &self.remote_edits[index];
-            let Ok(metadata) = std::fs::metadata(&edit.local) else {
-                continue;
+            let (remote, local) = {
+                let edit = &self.remote_edits[index];
+                (edit.remote.clone(), edit.local.clone())
             };
-            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-            if mtime != edit.mtime || metadata.len() != edit.size {
+            let (mtime, size) = match remote_edit_metadata(&local) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    if !self.remote_edits[index].watch_error_reported {
+                        self.remote_edits[index].watch_error_reported = true;
+                        self.edit_log(
+                            LogLevel::Error,
+                            format!(
+                                "edit: watching staged copy {} for {} failed: {err}",
+                                local.display(),
+                                remote.display()
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+            self.remote_edits[index].watch_error_reported = false;
+            let edit = &self.remote_edits[index];
+            if mtime != edit.mtime || size != edit.size {
                 self.edit_sync_ask = Some(EditSyncAsk {
                     session_id: edit.session_id,
                     remote: edit.remote.clone(),
@@ -3471,20 +3590,48 @@ impl RootView {
 
     /// Answer the sync dialog: `true` uploads back, `false` just resets the
     /// watch baseline.
+    // [impl->req~remote-edit-diagnostics~1]
     fn answer_edit_sync(&mut self, upload: bool, cx: &mut Context<Self>) {
         let Some(ask) = self.edit_sync_ask.take() else {
             return;
         };
         // Reset the baseline either way (to the file's current state).
+        let mut baseline_error = None;
         if let Some(edit) = self
             .remote_edits
             .iter_mut()
             .find(|edit| edit.session_id == ask.session_id && edit.remote == ask.remote)
         {
-            if let Ok(metadata) = std::fs::metadata(&ask.local) {
-                edit.mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-                edit.size = metadata.len();
+            match remote_edit_metadata(&ask.local) {
+                Ok((mtime, size)) => {
+                    edit.mtime = mtime;
+                    edit.size = size;
+                    edit.watch_error_reported = false;
+                }
+                Err(err) => {
+                    edit.watch_error_reported = true;
+                    baseline_error = Some(err);
+                }
             }
+        } else {
+            self.edit_log(
+                LogLevel::Error,
+                format!(
+                    "edit: cannot update the watch for {} using {}: the edit registration is gone",
+                    ask.remote.display(),
+                    ask.local.display()
+                ),
+            );
+        }
+        if let Some(err) = baseline_error {
+            self.edit_log(
+                LogLevel::Error,
+                format!(
+                    "edit: updating the watch for {} using {} failed: {err}",
+                    ask.remote.display(),
+                    ask.local.display()
+                ),
+            );
         }
         if upload {
             // Upload into the remote file's parent directory, keeping the
@@ -3494,22 +3641,41 @@ impl RootView {
                 .parent()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            if let Some(tab) = self.tabs.iter().find(|tab| {
-                !tab.is_log()
-                    && tab.session_id == ask.session_id
-                    && tab.state == ConnState::Connected
-            }) {
-                if let Some(session) = tab.session.as_ref() {
-                    session.send(SessionCommand::Upload {
-                        session_id: ask.session_id,
-                        local: ask.local.clone(),
-                        remote_dir: remote_dir.clone(),
-                        cancel: Arc::new(AtomicBool::new(false)),
-                    });
-                    self.status = format!("uploading {}…", ask.remote.display());
-                }
+            let session = self
+                .tabs
+                .iter()
+                .find(|tab| {
+                    !tab.is_log()
+                        && tab.session_id == ask.session_id
+                        && tab.state == ConnState::Connected
+                })
+                .and_then(|tab| tab.session.clone());
+            if let Some(session) = session {
+                session.send(SessionCommand::Upload {
+                    session_id: ask.session_id,
+                    local: ask.local.clone(),
+                    remote_dir,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                });
+                self.status = format!("uploading {}…", ask.remote.display());
+                self.edit_log(
+                    LogLevel::Info,
+                    format!(
+                        "edit: syncing {} back to {}",
+                        ask.local.display(),
+                        ask.remote.display()
+                    ),
+                );
             } else {
                 self.status = "session for that file is gone — sync skipped".into();
+                self.edit_log(
+                    LogLevel::Error,
+                    format!(
+                        "edit: syncing {} back to {} failed: no connected session",
+                        ask.local.display(),
+                        ask.remote.display()
+                    ),
+                );
             }
         }
         cx.notify();
@@ -4137,7 +4303,14 @@ impl RootView {
             return;
         }
         if let Some(dir) = local.parent() {
-            let _ = std::fs::remove_dir_all(dir);
+            if let Err(err) = std::fs::remove_dir_all(dir) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "edit: removing unused staged copy {} failed: {err}",
+                        local.display()
+                    );
+                }
+            }
         }
     }
 
@@ -4165,10 +4338,22 @@ impl RootView {
         }
     }
 
+    // [impl->req~remote-edit-diagnostics~1]
+    fn edit_log(&mut self, level: LogLevel, message: impl Into<String>) {
+        let message = message.into();
+        match level {
+            LogLevel::Info => log::info!("{message}"),
+            LogLevel::Warn => log::warn!("{message}"),
+            LogLevel::Error => log::error!("{message}"),
+        }
+        self.log(level, message);
+    }
+
     /// Append a line to the tool log (the Logs sidebar tab). Connection
     /// issues, transfer errors, move failures, etc. all land here.
+    // [impl->req~detailed-log-timestamps~1]
     fn log(&mut self, level: LogLevel, message: impl Into<String>) {
-        let time = chrono::Local::now().format("%H:%M:%S").to_string();
+        let time = crate::detailed_timestamp();
         self.logs.push(LogEntry {
             time,
             level,
@@ -9072,6 +9257,7 @@ mod tests {
             target: "device".into(),
             mtime: std::time::UNIX_EPOCH,
             size: 0,
+            watch_error_reported: false,
         }];
         assert!(remote_edit_uses_path(&edits, 7, &local));
         assert!(!remote_edit_uses_path(&edits, 8, &local));
@@ -9080,5 +9266,20 @@ mod tests {
             7,
             std::path::Path::new("/tmp/aetherium-edit/other.toml")
         ));
+    }
+
+    // [utest->req~api-posix-paths~1]
+    #[test]
+    fn remote_path_string_renders_posix_paths_on_any_platform() {
+        assert_eq!(
+            remote_path_string(std::path::Path::new("/home/root/sovd/config.toml")),
+            "/home/root/sovd/config.toml"
+        );
+        // What a Windows PathBuf parsed from a remote listing renders as;
+        // API consumers must receive the POSIX form they can reuse verbatim.
+        assert_eq!(
+            remote_path_string(std::path::Path::new("/home/root\\sovd\\config.toml")),
+            "/home/root/sovd/config.toml"
+        );
     }
 }

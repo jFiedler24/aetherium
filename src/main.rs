@@ -37,6 +37,25 @@ use crate::ui::{
     TreePageDown, TreePageUp, TreeRight, TreeUp,
 };
 
+const LOG_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f%:z";
+
+// [impl->req~detailed-log-timestamps~1]
+pub(crate) fn detailed_timestamp() -> String {
+    chrono::Local::now().format(LOG_TIMESTAMP_FORMAT).to_string()
+}
+
+// [impl->req~detailed-log-timestamps~1]
+fn format_log_lines(timestamp: &str, level: log::Level, message: &str) -> String {
+    message
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            format!("{timestamp} [{level}] {line}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Minimal stderr logger so gpui's warnings (font fallback, shaping, asset
 /// errors) are visible when running the binary directly. On Windows the
 /// binary is a GUI app without a console, so there the lines are appended to
@@ -48,7 +67,11 @@ impl log::Log for AppLogger {
         true
     }
     fn log(&self, record: &log::Record) {
-        let line = format!("[{}] {}", record.level(), record.args());
+        let line = format_log_lines(
+            &detailed_timestamp(),
+            record.level(),
+            &record.args().to_string(),
+        );
         #[cfg(windows)]
         {
             let path = crate::crypto::config_dir().join("aetherium.log");
@@ -166,4 +189,22 @@ fn main() {
         .expect("open main window");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // [utest->req~detailed-log-timestamps~1]
+    #[test]
+    fn every_diagnostic_line_has_the_same_detailed_timestamp() {
+        let formatted = super::format_log_lines(
+            "2026-11-12T20:23:45.123+01:00",
+            log::Level::Error,
+            "first line\r\nsecond line",
+        );
+        assert_eq!(
+            formatted,
+            "2026-11-12T20:23:45.123+01:00 [ERROR] first line\n\
+             2026-11-12T20:23:45.123+01:00 [ERROR] second line"
+        );
+    }
 }
